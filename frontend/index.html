@@ -1,0 +1,482 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AI Agent Console</title>
+<style>
+  :root {
+    --bg:#0f0f11;--bg2:#18181c;--bg3:#222228;--border:#2e2e38;--border2:#3e3e4e;
+    --text:#e8e8f0;--text2:#9898b0;
+    --purple:#8b5cf6;--purple2:#7c3aed;--purple3:#ede9fe;
+    --teal:#14b8a6;--amber:#f59e0b;--red:#ef4444;--green:#22c55e;
+    --radius:10px;--radius-sm:6px;
+    --font:'Inter',-apple-system,sans-serif;--mono:'JetBrains Mono','Fira Code',monospace;
+  }
+  *{margin:0;padding:0;box-sizing:border-box;}
+  body{background:var(--bg);color:var(--text);font-family:var(--font);font-size:14px;height:100vh;display:flex;overflow:hidden;}
+
+  .sidebar{width:256px;background:var(--bg2);border-right:1px solid var(--border);display:flex;flex-direction:column;flex-shrink:0;}
+  .sidebar-head{padding:18px 16px 12px;border-bottom:1px solid var(--border);}
+  .logo{font-size:15px;font-weight:600;display:flex;align-items:center;gap:8px;}
+  .logo-dot{width:8px;height:8px;border-radius:50%;background:var(--purple);box-shadow:0 0 8px var(--purple);}
+  .sidebar-section{padding:14px 16px 6px;font-size:10px;text-transform:uppercase;letter-spacing:.1em;color:var(--text2);}
+  .nav-item{display:flex;align-items:center;gap:10px;padding:9px 12px;border-radius:var(--radius-sm);cursor:pointer;color:var(--text2);font-size:13px;transition:all .15s;margin:1px 6px;}
+  .nav-item:hover{background:var(--bg3);color:var(--text);}
+  .nav-item.active{background:rgba(139,92,246,.14);color:var(--purple3);}
+  .nav-ico{width:15px;height:15px;flex-shrink:0;opacity:.8;}
+  .sidebar-footer{margin-top:auto;padding:12px;border-top:1px solid var(--border);}
+  .status-pill{display:flex;align-items:center;gap:7px;font-size:12px;color:var(--text2);padding:7px 11px;background:var(--bg3);border-radius:20px;}
+  .status-dot{width:6px;height:6px;border-radius:50%;background:var(--amber);}
+
+  .main{flex:1;display:flex;flex-direction:column;overflow:hidden;}
+  .topbar{height:52px;border-bottom:1px solid var(--border);display:flex;align-items:center;padding:0 20px;gap:10px;background:var(--bg2);flex-shrink:0;}
+  .topbar-title{font-weight:500;font-size:14px;}
+  .topbar-right{margin-left:auto;display:flex;align-items:center;gap:8px;}
+  .badge{font-size:11px;padding:2px 9px;border-radius:12px;background:var(--bg3);border:1px solid var(--border);color:var(--text2);}
+  .badge.ok{border-color:rgba(34,197,94,.4);color:var(--green);}
+  .icon-btn{background:none;border:1px solid var(--border);color:var(--text2);padding:4px 10px;border-radius:var(--radius-sm);font-size:11px;cursor:pointer;transition:all .15s;}
+  .icon-btn:hover{border-color:var(--border2);color:var(--text);}
+
+  .chat-area{flex:1;overflow-y:auto;padding:24px 0;scroll-behavior:smooth;}
+  .chat-area::-webkit-scrollbar{width:4px;}
+  .chat-area::-webkit-scrollbar-thumb{background:var(--border2);border-radius:2px;}
+
+  .msg-row{max-width:800px;margin:0 auto 16px;padding:0 24px;}
+  .msg-row.user{display:flex;justify-content:flex-end;}
+  .msg-row.agent{display:flex;flex-direction:column;}
+
+  .bubble{padding:11px 15px;border-radius:var(--radius);line-height:1.65;max-width:74%;}
+  .bubble.user{background:var(--purple2);color:#fff;border-bottom-right-radius:3px;font-size:14px;}
+  .bubble.agent{background:var(--bg2);border:1px solid var(--border);border-bottom-left-radius:3px;font-size:14px;color:var(--text);}
+  .bubble.agent pre{background:var(--bg);border:1px solid var(--border);border-radius:var(--radius-sm);padding:10px 12px;overflow-x:auto;font-family:var(--mono);font-size:12px;margin:8px 0;white-space:pre-wrap;}
+  .bubble.agent code{font-family:var(--mono);font-size:12px;background:rgba(255,255,255,.06);padding:1px 5px;border-radius:3px;}
+  .bubble.agent strong{color:var(--text);font-weight:500;}
+
+  .tool-row{max-width:800px;margin:0 auto 6px;padding:0 24px;}
+  .tool-card{background:var(--bg2);border:1px solid var(--border);border-radius:var(--radius-sm);padding:8px 13px;display:flex;align-items:center;gap:9px;font-size:12px;}
+  .tool-dot{width:7px;height:7px;border-radius:50%;flex-shrink:0;}
+  .tool-dot.run{background:var(--amber);box-shadow:0 0 5px var(--amber);}
+  .tool-dot.ok{background:var(--green);}
+  .tool-dot.err{background:var(--red);}
+  .tool-name{font-family:var(--mono);font-size:12px;font-weight:500;color:var(--text);}
+  .tool-info{color:var(--text2);margin-left:auto;}
+  .spinner{width:13px;height:13px;border:2px solid var(--border2);border-top-color:var(--amber);border-radius:50%;animation:spin .6s linear infinite;flex-shrink:0;}
+  @keyframes spin{to{transform:rotate(360deg);}}
+
+  .think-row{max-width:800px;margin:0 auto 6px;padding:0 24px;}
+  .think-inner{display:flex;align-items:center;gap:7px;color:var(--text2);font-size:12px;}
+  .dots span{display:inline-block;width:4px;height:4px;border-radius:50%;background:var(--text2);animation:blink 1.2s ease infinite;}
+  .dots span:nth-child(2){animation-delay:.2s;}
+  .dots span:nth-child(3){animation-delay:.4s;}
+  @keyframes blink{0%,80%,100%{opacity:.2}40%{opacity:1}}
+
+  .sys-row{max-width:800px;margin:0 auto 4px;padding:0 24px;display:flex;align-items:center;gap:8px;}
+  .sys-line{flex:1;height:1px;background:var(--border);}
+  .sys-label{font-size:11px;color:var(--text2);white-space:nowrap;}
+
+  .cp-row{max-width:800px;margin:0 auto 12px;padding:0 24px;}
+  .cp-card{background:rgba(245,158,11,.07);border:1px solid rgba(245,158,11,.28);border-radius:var(--radius);padding:14px 16px;}
+  .cp-title{color:var(--amber);font-weight:500;font-size:13px;margin-bottom:5px;}
+  .cp-body{font-size:12px;color:var(--text2);margin-bottom:11px;line-height:1.6;}
+  .cp-btns{display:flex;gap:8px;}
+  .btn{padding:6px 14px;border-radius:var(--radius-sm);font-size:12px;font-weight:500;cursor:pointer;border:none;transition:opacity .15s;}
+  .btn:hover{opacity:.82;}
+  .btn-ok{background:var(--green);color:#fff;}
+  .btn-no{background:var(--bg3);color:var(--text2);border:1px solid var(--border);}
+
+  .empty{flex:1;display:flex;align-items:center;justify-content:center;flex-direction:column;gap:12px;padding:40px;text-align:center;}
+  .empty-icon{width:52px;height:52px;border-radius:14px;background:var(--bg3);border:1px solid var(--border);display:flex;align-items:center;justify-content:center;font-size:22px;}
+  .empty-title{font-weight:500;font-size:15px;}
+  .empty-sub{font-size:13px;color:var(--text2);line-height:1.7;max-width:320px;}
+  .chips{display:flex;flex-wrap:wrap;gap:8px;justify-content:center;margin-top:6px;}
+  .chip{font-size:12px;padding:5px 12px;background:var(--bg3);border:1px solid var(--border);border-radius:14px;color:var(--text2);cursor:pointer;transition:all .15s;}
+  .chip:hover{border-color:var(--purple2);color:var(--purple3);}
+
+  .input-area{padding:14px 20px;border-top:1px solid var(--border);background:var(--bg2);flex-shrink:0;}
+  .input-wrap{max-width:800px;margin:0 auto;position:relative;}
+  .input-box{width:100%;background:var(--bg3);border:1px solid var(--border);border-radius:var(--radius);padding:11px 48px 11px 14px;color:var(--text);font-size:14px;font-family:var(--font);resize:none;outline:none;min-height:46px;max-height:160px;line-height:1.55;transition:border-color .15s;}
+  .input-box:focus{border-color:var(--purple2);}
+  .input-box::placeholder{color:var(--text2);}
+  .send-btn{position:absolute;right:9px;bottom:9px;width:30px;height:30px;border-radius:var(--radius-sm);background:var(--purple2);border:none;cursor:pointer;display:flex;align-items:center;justify-content:center;transition:background .15s;}
+  .send-btn:hover{background:var(--purple);}
+  .send-btn:disabled{background:var(--bg);opacity:.35;cursor:not-allowed;}
+  .send-btn svg{width:13px;height:13px;fill:white;}
+  .input-footer{max-width:800px;margin:8px auto 0;display:flex;gap:7px;align-items:center;}
+  .cnt{margin-left:auto;font-size:11px;color:var(--text2);}
+
+  .panel{width:290px;background:var(--bg2);border-left:1px solid var(--border);flex-shrink:0;display:none;flex-direction:column;}
+  .panel.open{display:flex;}
+  .panel-head{padding:13px 15px;border-bottom:1px solid var(--border);font-size:13px;font-weight:500;display:flex;align-items:center;justify-content:space-between;}
+  .panel-close{background:none;border:none;cursor:pointer;color:var(--text2);font-size:18px;line-height:1;}
+  .panel-body{flex:1;overflow-y:auto;padding:12px;}
+  .stat-row{display:flex;justify-content:space-between;align-items:baseline;padding:7px 0;border-bottom:1px solid var(--border);font-size:12px;}
+  .s-label{color:var(--text2);}
+  .s-val{font-family:var(--mono);color:var(--text);font-weight:500;}
+  .s-val.g{color:var(--green);}
+  .s-val.a{color:var(--amber);}
+  .s-val.r{color:var(--red);}
+  .panel-sec{font-size:10px;text-transform:uppercase;letter-spacing:.1em;color:var(--text2);padding:12px 0 7px;}
+
+  @media(max-width:680px){.sidebar{display:none;}.panel{display:none!important;}}
+</style>
+</head>
+<body>
+
+<aside class="sidebar">
+  <div class="sidebar-head">
+    <div class="logo"><div class="logo-dot"></div>AI Agent Console</div>
+  </div>
+  <div class="sidebar-section">对话</div>
+  <div class="nav-item active">
+    <svg class="nav-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+    新对话
+  </div>
+  <div class="sidebar-section">编排模式</div>
+  <div class="nav-item active" id="nav-react" onclick="setMode('react')">
+    <svg class="nav-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>
+    ReAct
+  </div>
+  <div class="nav-item" id="nav-plan" onclick="setMode('plan_execute')">
+    <svg class="nav-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></svg>
+    Plan-Execute
+  </div>
+  <div class="sidebar-section">工具</div>
+  <div class="nav-item" onclick="togglePanel()">
+    <svg class="nav-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
+    实时指标
+  </div>
+  <div class="nav-item" onclick="clearChat()">
+    <svg class="nav-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 .49-3.96"/></svg>
+    清空会话
+  </div>
+  <div class="sidebar-footer">
+    <div class="status-pill">
+      <div class="status-dot" id="conn-dot"></div>
+      <span id="conn-label">检测连接…</span>
+    </div>
+  </div>
+</aside>
+
+<div class="main">
+  <div class="topbar">
+    <span class="topbar-title">对话</span>
+    <div class="topbar-right">
+      <span class="badge" id="sess-badge">新会话</span>
+      <span class="badge" id="mode-badge">ReAct</span>
+      <span class="badge ok" id="status-badge">就绪</span>
+      <button class="icon-btn" onclick="togglePanel()">数据面板</button>
+    </div>
+  </div>
+
+  <div class="chat-area" id="chat">
+    <div class="empty" id="empty">
+      <div class="empty-icon">✦</div>
+      <div class="empty-title">AI Agent 已就绪</div>
+      <div class="empty-sub">工具调用 · RAG 检索 · 长短期记忆 · Human-in-the-loop · 成本控制</div>
+      <div class="chips">
+        <span class="chip" onclick="quick('搜索最新 AI 进展')">搜索 AI 新闻</span>
+        <span class="chip" onclick="quick('用 Python 计算前 10 个斐波那契数')">Python 代码</span>
+        <span class="chip" onclick="quick('介绍 Transformer 的注意力机制')">技术讲解</span>
+        <span class="chip" onclick="quick('计算 2 的 20 次方再除以 1024')">数学计算</span>
+      </div>
+    </div>
+  </div>
+
+  <div class="input-area">
+    <div class="input-wrap">
+      <textarea class="input-box" id="ibox" placeholder="输入消息… Enter 发送，Shift+Enter 换行"
+        rows="1" oninput="resize(this);cnt()" onkeydown="key(event)"></textarea>
+      <button class="send-btn" id="sbtn" onclick="send()" disabled>
+        <svg viewBox="0 0 24 24"><path d="M22 2L11 13M22 2l-7 20-4-9-9-4 20-7z"/></svg>
+      </button>
+    </div>
+    <div class="input-footer">
+      <span class="chip" onclick="clearChat()">清空</span>
+      <span class="chip" onclick="copyLast()">复制最后回答</span>
+      <span class="cnt" id="cnt">0</span>
+    </div>
+  </div>
+</div>
+
+<div class="panel" id="panel">
+  <div class="panel-head">
+    实时指标
+    <button class="panel-close" onclick="togglePanel()">×</button>
+  </div>
+  <div class="panel-body" id="pbody">
+    <div class="panel-sec">会话</div>
+    <div class="stat-row"><span class="s-label">调用次数</span><span class="s-val" id="p-calls">0</span></div>
+    <div class="stat-row"><span class="s-label">总 Tokens</span><span class="s-val" id="p-tokens">0</span></div>
+    <div class="stat-row"><span class="s-label">工具调用</span><span class="s-val" id="p-tools">0</span></div>
+    <div class="stat-row"><span class="s-label">当前模式</span><span class="s-val g" id="p-mode">ReAct</span></div>
+    <div class="panel-sec">API 模块</div>
+    <div id="p-modules" style="color:var(--text2);font-size:12px;">加载中…</div>
+  </div>
+</div>
+
+<script>
+const API = '';
+let sid = 'sess_' + Math.random().toString(36).slice(2,10);
+let uid = 'user_' + Math.random().toString(36).slice(2,6);
+let mode = 'react', busy = false, panelOpen = false;
+let totalTokens = 0, calls = 0, toolCalls = 0;
+let lastAnswer = '', lastBubbleId = null;
+
+// Connection
+async function ping(){
+  try {
+    const r = await fetch(API+'/v1/health');
+    if(r.ok){
+      set('conn-dot','style.background','var(--green)');
+      setText('conn-label','API 已连接');
+      loadModules(await r.json());
+    }
+  } catch {
+    set('conn-dot','style.background','var(--red)');
+    setText('conn-label','离线（Mock 模式）');
+    setText('p-modules','<div style="color:var(--red);font-size:12px;padding-top:6px;">API 未连接</div>');
+  }
+}
+function loadModules(d){
+  const mods = d.modules || {};
+  setText('p-modules', Object.entries(mods).map(([k,v])=>
+    `<div class="stat-row"><span class="s-label">${k}</span>
+     <span class="s-val ${v?'g':'r'}">${typeof v==='number'?v:(v?'✓':'—')}</span></div>`
+  ).join(''));
+}
+ping();
+
+// Mode
+function setMode(m){
+  mode = m;
+  setText('mode-badge', m==='react'?'ReAct':'Plan-Execute');
+  set2('nav-react','className','nav-item'+(m==='react'?' active':''));
+  set2('nav-plan', 'className','nav-item'+(m!=='react'?' active':''));
+  document.getElementById('p-mode').className = 's-val '+(m==='react'?'g':'a');
+  setText('p-mode', m==='react'?'ReAct':'Plan-Execute');
+}
+
+// Input
+function resize(el){ el.style.height='auto'; el.style.height=Math.min(el.scrollHeight,160)+'px'; }
+function cnt(){
+  const n = document.getElementById('ibox').value.length;
+  setText('cnt', n);
+  document.getElementById('sbtn').disabled = n===0 || busy;
+}
+function key(e){ if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();send();} }
+function quick(t){ document.getElementById('ibox').value=t; cnt(); send(); }
+
+// Render helpers
+const chat = ()=>document.getElementById('chat');
+function hideEmpty(){ const e=document.getElementById('empty'); if(e) e.remove(); }
+function scroll(){ const c=chat(); c.scrollTop=c.scrollHeight; }
+function esc(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+function md(t){
+  return t
+    .replace(/```[\w]*\n([\s\S]*?)```/g,'<pre><code>$1</code></pre>')
+    .replace(/`([^`]+)`/g,'<code>$1</code>')
+    .replace(/\*\*([^*]+)\*\*/g,'<strong>$1</strong>')
+    .replace(/\n/g,'<br>');
+}
+function setText(id,v){ const el=document.getElementById(id); if(el) el.innerHTML=v; }
+function set(id,prop,val){ const el=document.getElementById(id); if(el) el.style[prop.split('.')[1]]=val; }
+function set2(id,prop,val){ const el=document.getElementById(id); if(el) el[prop]=val; }
+
+function addUser(t){
+  hideEmpty();
+  chat().insertAdjacentHTML('beforeend',
+    `<div class="msg-row user"><div class="bubble user">${esc(t)}</div></div>`);
+  scroll();
+}
+function addBubble(id){
+  hideEmpty();
+  chat().insertAdjacentHTML('beforeend',
+    `<div class="msg-row agent" id="${id}"><div class="bubble agent" id="${id}-t"></div></div>`);
+  scroll();
+}
+function addThink(id){
+  chat().insertAdjacentHTML('beforeend',
+    `<div class="think-row" id="${id}"><div class="think-inner">
+      <div class="dots"><span></span><span></span><span></span></div>
+      <span>推理中…</span></div></div>`);
+  scroll();
+}
+function addTool(id, name, st){
+  const ex = document.getElementById('tc-'+id);
+  if(ex){
+    ex.querySelector('.tool-dot').className = `tool-dot ${st==='running'?'run':st==='done'?'ok':'err'}`;
+    ex.querySelector('.tool-info').textContent = st==='done'?'完成':st==='running'?'执行中':'失败';
+    const sp = ex.querySelector('.spinner'); if(sp&&st!=='running') sp.remove();
+    return;
+  }
+  chat().insertAdjacentHTML('beforeend',
+    `<div class="tool-row"><div class="tool-card" id="tc-${id}">
+      <div class="tool-dot run"></div>
+      <span class="tool-name">${esc(name)}</span>
+      <div class="spinner"></div>
+      <span class="tool-info">执行中</span>
+    </div></div>`);
+  scroll();
+}
+function addSys(t){
+  chat().insertAdjacentHTML('beforeend',
+    `<div class="sys-row"><div class="sys-line"></div>
+     <span class="sys-label">${esc(t)}</span>
+     <div class="sys-line"></div></div>`);
+  scroll();
+}
+function addCP(rid, tool, reason){
+  chat().insertAdjacentHTML('beforeend',
+    `<div class="cp-row" id="cp-${rid}"><div class="cp-card">
+      <div class="cp-title">⚠ 等待确认：${esc(tool)}</div>
+      <div class="cp-body">${esc(reason)}</div>
+      <div class="cp-btns">
+        <button class="btn btn-ok" onclick="resolveCP('${rid}',true)">批准执行</button>
+        <button class="btn btn-no" onclick="resolveCP('${rid}',false)">拒绝</button>
+      </div>
+    </div></div>`);
+  scroll();
+}
+function rm(id){ const el=document.getElementById(id); if(el) el.remove(); }
+
+// Send
+async function send(){
+  const box = document.getElementById('ibox');
+  const text = box.value.trim();
+  if(!text||busy) return;
+
+  busy = true; lastAnswer = '';
+  box.value=''; box.style.height='auto'; cnt();
+  document.getElementById('sbtn').disabled = true;
+  setText('status-badge','运行中');
+
+  addUser(text);
+  const tid = 'th-'+Date.now();
+  const bid = 'bb-'+Date.now();
+  addThink(tid);
+  lastBubbleId = bid;
+  let bubbleCreated = false;
+  let step = 0;
+
+  const handle = (e) => {
+    const t = e.type;
+    if(t==='thinking'){ step++; rm(tid); addThink('th-s'+step); }
+    else if(t==='step'){
+      rm('th-s'+step);
+      addTool('tc'+e.step+e.tool, e.tool, e.status);
+      if(e.status==='done'||e.status==='error') toolCalls++;
+    }
+    else if(t==='planning'){ rm(tid); addSys('正在规划任务…'); }
+    else if(t==='plan'){ addSys(`执行计划：${e.steps.length} 步`); }
+    else if(t==='step_start'){ addSys(`步骤 ${e.step}：${e.goal}`); }
+    else if(t==='step_done'){ addSys(`✓ 步骤 ${e.step} 完成`); }
+    else if(t==='checkpoint'){ rm(tid); addCP(e.request_id||'cp'+Date.now(), e.tool_name, e.reason); }
+    else if(t==='delta'){
+      rm(tid); rm('th-s'+step);
+      if(!bubbleCreated){ addBubble(bid); bubbleCreated=true; }
+      lastAnswer += e.text;
+      const el=document.getElementById(bid+'-t');
+      if(el){ el.innerHTML=md(lastAnswer); scroll(); }
+    }
+    else if(t==='done'){
+      calls++; totalTokens += e.usage?.total_tokens||0;
+      setText('p-calls',calls); setText('p-tokens',totalTokens.toLocaleString());
+      setText('p-tools',toolCalls);
+      setText('sess-badge','会话 …'+sid.slice(-4));
+    }
+    else if(t==='error'){
+      rm(tid);
+      if(!bubbleCreated){ addBubble(bid); bubbleCreated=true; }
+      const el=document.getElementById(bid+'-t');
+      if(el) el.innerHTML=`<span style="color:var(--red)">⚠ ${esc(e.message)}</span>`;
+    }
+  };
+
+  try {
+    const resp = await fetch(API+'/v1/agent/run',{
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({
+        user_id:uid, session_id:sid,
+        input:{text}, config:{stream:true, max_steps:20},
+      }),
+    });
+    rm(tid);
+    if(!resp.ok){ handle({type:'error',message:'HTTP '+resp.status}); return; }
+
+    const reader = resp.body.getReader();
+    const dec = new TextDecoder();
+    let buf='';
+    while(true){
+      const {value,done} = await reader.read();
+      if(done) break;
+      buf += dec.decode(value,{stream:true});
+      const lines = buf.split('\n'); buf=lines.pop();
+      for(const line of lines){
+        if(!line.startsWith('data:')) continue;
+        const raw=line.slice(5).trim();
+        if(raw==='[DONE]') break;
+        try{ handle(JSON.parse(raw)); }catch{}
+      }
+    }
+  } catch(err) {
+    rm(tid);
+    if(!bubbleCreated){ addBubble(bid); bubbleCreated=true; }
+    const el=document.getElementById(bid+'-t');
+    if(el) el.innerHTML=md(`**离线模式** — 后端未连接\n\n你说: "${text}"\n\n请运行 \`python main.py api\` 启动服务。`);
+  } finally {
+    busy=false;
+    document.getElementById('sbtn').disabled=false;
+    setText('status-badge','就绪');
+  }
+}
+
+// HITL
+async function resolveCP(rid, approved){
+  try {
+    await fetch(`${API}/v1/hitl/${rid}/resolve`,{
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({approved, feedback: approved?'Approved':'Rejected'}),
+    });
+  } catch{}
+  const el=document.getElementById('cp-'+rid);
+  if(el) el.innerHTML=`<div style="padding:10px 14px;font-size:12px;color:var(--text2)">
+    ${approved?'✓ 已批准':'✗ 已拒绝'}</div>`;
+}
+
+// Panel
+function togglePanel(){
+  panelOpen=!panelOpen;
+  document.getElementById('panel').classList.toggle('open',panelOpen);
+  if(panelOpen) ping();
+}
+
+// Misc
+function clearChat(){
+  document.getElementById('chat').innerHTML=`<div class="empty" id="empty">
+    <div class="empty-icon">✦</div>
+    <div class="empty-title">AI Agent 已就绪</div>
+    <div class="empty-sub">工具调用 · RAG 检索 · 长短期记忆 · Human-in-the-loop</div>
+    <div class="chips">
+      <span class="chip" onclick="quick('搜索最新 AI 进展')">搜索 AI 新闻</span>
+      <span class="chip" onclick="quick('用 Python 写快速排序')">Python 代码</span>
+      <span class="chip" onclick="quick('计算 1000 以内所有质数之和')">数学计算</span>
+    </div>
+  </div>`;
+  sid='sess_'+Math.random().toString(36).slice(2,10);
+  lastAnswer=''; calls=0; totalTokens=0; toolCalls=0;
+  setText('sess-badge','新会话');
+  setText('p-calls',0); setText('p-tokens',0); setText('p-tools',0);
+}
+function copyLast(){
+  if(!lastAnswer) return;
+  navigator.clipboard.writeText(lastAnswer).then(()=>{
+    const chips=document.querySelectorAll('.chip');
+    const btn=chips[1]; if(!btn) return;
+    const orig=btn.textContent; btn.textContent='已复制!';
+    setTimeout(()=>btn.textContent=orig,1500);
+  });
+}
+</script>
+</body>
+</html>
