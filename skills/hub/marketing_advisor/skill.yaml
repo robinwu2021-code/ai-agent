@@ -1,0 +1,43 @@
+# ClawHub Skill Manifest v1
+name: marketing_advisor
+version: "1.0.0"
+description: |
+  营销顾问工具，帮助商家制定营销活动方案。支持三个阶段：
+  1. analyze_needs — 分析已收集到的商家信息，识别缺口，返回下一个最重要的问题
+  2. suggest_activities — 根据完整的商家画像，从内置营销策略库中推荐具体活动
+  3. create_plan — 生成带时间轴、预算分配和执行步骤的完整营销方案
+
+  调用约定：
+  - 先通过自然对话收集基本信息
+  - 调用 analyze_needs 了解缺口，需 completeness >= 0.7 再继续
+  - 调用 suggest_activities 展示活动选项，让商家确认偏好
+  - 调用 create_plan 生成最终可执行方案
+author: "hub/local"
+tags: [marketing, business, campaign, advisor, sales]
+permission: read
+timeout_ms: 5000
+entrypoint: MarketingAdvisorSkill
+
+input_schema:
+  type: object
+  properties:
+    action:
+      type: string
+      enum: [analyze_needs, suggest_activities, create_plan]
+      description: "analyze_needs=分析信息缺口, suggest_activities=推荐营销活动, create_plan=生成完整方案"
+    profile:
+      type: object
+      description: |
+        商家画像，已收集到的信息字典，字段均为可选：
+        - business_type: 经营类型（如 餐饮/零售/电商/教育/美容健身）
+        - business_name: 店名/品牌名
+        - location: 地址或城市
+        - products: 主营产品/服务
+        - target_customers: 目标客群描述
+        - current_channels: 现有营销渠道（如 微信/抖音/线下）
+        - goal: 营销目标（如 引流/复购/品牌曝光/节假日促销）
+        - budget: 预算范围（如 5000元以内/1-3万）
+        - duration: 活动周期（如 1周/1个月）
+        - pain_points: 当前痛点（如 客流少/复购率低/新品推广难）
+        - confirmed_activities: 商家确认想要的活动列表（create_plan 时用）
+  required: [action, profile]

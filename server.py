@@ -47,6 +47,53 @@ app.add_middleware(
 _container = None   # 全局容器，startup 时初始化
 
 
+# ── 营销顾问系统提示词 ─────────────────────────────────────────────
+
+_MARKETING_SYSTEM_PROMPT = """你是一位专业的营销顾问，专门服务于中小商家。
+
+## 你的工作方式
+- 通过友善、专业的对话，逐步了解商家的经营情况和营销需求
+- 每次只问一个最关键的问题，避免让商家感到被"审问"
+- 收集到足够信息后，调用 analyze_needs 评估完整度
+- 完整度 >= 0.7 时，调用 suggest_activities 展示具体活动方案
+- 商家确认偏好后，调用 create_plan 生成完整可执行方案
+
+## 对话风格
+- 亲切、接地气，像朋友聊天而非填表格
+- 善用具体例子帮助商家理解方案
+- 方案要实用、可落地，给出具体步骤和预期效果
+
+## 重要提示
+- 先问候商家，了解基本情况（经营类型和营销目标最重要）
+- 不要一次性问很多问题
+- 根据 analyze_needs 返回的 next_question 来决定下一个问题
+- 展示活动建议时，用通俗易懂的语言说明每个活动的好处
+"""
+
+# ── 自定义上下文管理器（注入系统提示词前缀）────────────────────────
+
+class _PrefixedContextManager:
+    """包装 PriorityContextManager，将自定义系统提示词注入到 P0 消息前面。"""
+
+    def __init__(self, base, prefix: str):
+        self._base   = base
+        self._prefix = prefix
+
+    async def build(self, task, tools, long_term_memory, budget):
+        from core.models import Message, MessageRole
+        messages = await self._base.build(task, tools, long_term_memory, budget)
+        # 在第一条 SYSTEM 消息前插入自定义前缀
+        if messages and messages[0].role == MessageRole.SYSTEM:
+            original = messages[0].content or ""
+            messages[0] = Message(
+                role=MessageRole.SYSTEM,
+                content=f"{self._prefix}\n\n---\n\n{original}",
+            )
+        else:
+            messages.insert(0, Message(role=MessageRole.SYSTEM, content=self._prefix))
+        return messages
+
+
 # ── Request / Response 模型 ────────────────────────────────────────
 
 class ChatRequest(BaseModel):
@@ -57,6 +104,14 @@ class ChatRequest(BaseModel):
     skills:     list[str] | None = Field(
         None,
         description="限定本次请求可使用的 Skill 名称列表；为空则使用全部已注册 Skill",
+    )
+    mode:         str | None = Field(
+        None,
+        description="运行模式，\"marketing\" 启用营销顾问系统提示词",
+    )
+    system_prompt: str | None = Field(
+        None,
+        description="自定义系统提示词前缀；优先级高于 mode",
     )
 
 
@@ -161,21 +216,31 @@ def _build_container(engine_alias: str | None = None):
 
 # ── 核心：运行 Agent，收集事件 ─────────────────────────────────────
 
-def _get_container(skills: list[str] | None):
-    """返回适合本次请求的容器：若指定了 skills 则使用过滤后的注册表副本。"""
-    if not skills:
-        return _container
+def _get_container(skills: list[str] | None, system_prompt: str | None = None):
+    """返回适合本次请求的容器：若指定了 skills/system_prompt 则创建轻量副本。"""
     import dataclasses
-    from skills.loader import FilteredSkillRegistry
-    filtered = FilteredSkillRegistry(_container.skill_registry, set(skills))
-    return dataclasses.replace(_container, skill_registry=filtered)
+    replacements: dict = {}
+
+    if skills:
+        from skills.loader import FilteredSkillRegistry
+        replacements["skill_registry"] = FilteredSkillRegistry(
+            _container.skill_registry, set(skills)
+        )
+
+    if system_prompt:
+        replacements["context_manager"] = _PrefixedContextManager(
+            _container.context_manager, system_prompt
+        )
+
+    return dataclasses.replace(_container, **replacements) if replacements else _container
 
 
 async def _run_agent(req: ChatRequest):
     """返回 (session_id, reply, usage, steps) 四元组。"""
     from core.models import AgentConfig
 
-    container  = _get_container(req.skills)
+    prompt     = req.system_prompt or (_MARKETING_SYSTEM_PROMPT if req.mode == "marketing" else None)
+    container  = _get_container(req.skills, prompt)
     session_id = req.session_id or f"sess_{uuid.uuid4().hex[:8]}"
     config     = AgentConfig(stream=False, max_steps=req.max_steps)
 
@@ -213,7 +278,8 @@ async def _stream_agent(req: ChatRequest) -> AsyncIterator[str]:
     """生成 SSE 事件流。"""
     from core.models import AgentConfig
 
-    container  = _get_container(req.skills)
+    prompt     = req.system_prompt or (_MARKETING_SYSTEM_PROMPT if req.mode == "marketing" else None)
+    container  = _get_container(req.skills, prompt)
     session_id = req.session_id or f"sess_{uuid.uuid4().hex[:8]}"
     config     = AgentConfig(stream=True, max_steps=req.max_steps)
 
