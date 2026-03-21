@@ -9,6 +9,28 @@ export interface ToolCall {
   error?: string
 }
 
+/** DAG 中单个步骤 */
+export interface DagStep {
+  id: string
+  goal: string
+  status: 'pending' | 'running' | 'done' | 'error'
+  result?: string
+  error?: string
+  /** 同批并行执行的兄弟步骤 ids */
+  parallelGroup?: string[]
+}
+
+/** 多 Agent 中单个子任务 */
+export interface SubTaskInfo {
+  id: string
+  agent: string
+  goal: string
+  depends: string[]
+  status: 'pending' | 'running' | 'done' | 'error'
+  tokens?: number
+  error?: string
+}
+
 export interface WeatherData {
   city?: string
   temperature?: number
@@ -69,6 +91,10 @@ export interface Message {
   toolCalls: ToolCall[]
   isStreaming?: boolean
   structuredData?: StructuredData | null
+  /** DAG 步骤列表（orchestrator_type=dag 时填充） */
+  dagSteps?: DagStep[]
+  /** 多 Agent 子任务列表（orchestrator_type=multiagent 时填充） */
+  subTasks?: SubTaskInfo[]
 }
 
 export interface ChatRequest {
@@ -78,18 +104,38 @@ export interface ChatRequest {
   max_steps?: number
   skills?: string[]
   mode?: string
+  orchestrator_type?: 'react' | 'plan_execute' | 'dag' | 'multiagent'
+  agent_specs?: Array<{
+    name: string
+    description: string
+    skills: string[]
+    system_prompt: string
+    max_steps: number
+  }>
 }
 
 export type SSEEvent =
   | { type: 'thinking' }
   | { type: 'step'; tool: string; status: 'running' | 'done' | 'error'; step: number; error?: string }
+  // DAG events
   | { type: 'planning' }
-  | { type: 'plan'; steps: { goal: string }[] }
-  | { type: 'step_start'; step: number; goal: string }
-  | { type: 'step_done'; step: number }
+  | { type: 'plan'; steps: Array<{ id: string; goal: string; depends?: string[] }> }
+  | { type: 'parallel_start'; step_ids: string[]; goals: string[] }
+  | { type: 'step_start'; step_id: string; step: number; goal: string }
+  | { type: 'step_done'; step_id: string; result: string }
+  | { type: 'step_failed'; step_id: string; error: string }
+  // MultiAgent events
+  | { type: 'orchestrating'; agents: string[] }
+  | { type: 'subtask_assign'; agent: string; goal: string; depends: string[]; subtask_id: string }
+  | { type: 'agent_start'; agent: string; subtask_id: string }
+  | { type: 'agent_done'; agent: string; subtask_id: string; tokens: number }
+  | { type: 'agent_error'; agent: string; subtask_id: string; error: string }
+  | { type: 'agent_event'; agent: string; event: SSEEvent }
+  // Common
   | { type: 'delta'; text: string }
   | { type: 'done'; usage?: { total_tokens: number } }
   | { type: 'error'; message: string }
+  | { type: 'session'; session_id: string; workspace_id?: string; project_id?: string }
 
 export interface SkillInfo {
   name: string

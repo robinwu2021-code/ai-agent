@@ -1,6 +1,6 @@
 'use client'
 import { useState, useCallback, useRef } from 'react'
-import type { Message, SkillMode, SessionStats, ToolCall } from '@/types'
+import type { Message, SkillMode, SessionStats, ToolCall, DagStep, SubTaskInfo } from '@/types'
 import { streamChat } from '@/lib/api'
 import { genId, daysMidnightTs, todayMidnightTs } from '@/lib/utils'
 import { parseStructuredData } from '@/lib/parseStructuredData'
@@ -79,6 +79,8 @@ export function useChat() {
     try {
       let content = ''
       const toolMap = new Map<string, ToolCall>()
+      const dagStepMap = new Map<string, DagStep>()
+      const subTaskMap = new Map<string, SubTaskInfo>()
       let toolCallsCount = 0
 
       for await (const ev of streamChat(req)) {
@@ -100,6 +102,70 @@ export function useChat() {
               ? { ...m, toolCalls: Array.from(toolMap.values()) }
               : m
           ))
+
+        // ── DAG events ────────────────────────────────────────────
+        } else if (ev.type === 'plan') {
+          for (const s of ev.steps) {
+            dagStepMap.set(s.id, { id: s.id, goal: s.goal, status: 'pending' })
+          }
+          setMessages(prev => prev.map(m =>
+            m.id === asstId ? { ...m, dagSteps: Array.from(dagStepMap.values()) } : m
+          ))
+        } else if (ev.type === 'parallel_start') {
+          for (const sid of ev.step_ids) {
+            const s = dagStepMap.get(sid)
+            if (s) dagStepMap.set(sid, { ...s, status: 'running', parallelGroup: ev.step_ids })
+          }
+          setMessages(prev => prev.map(m =>
+            m.id === asstId ? { ...m, dagSteps: Array.from(dagStepMap.values()) } : m
+          ))
+        } else if (ev.type === 'step_start') {
+          const s = dagStepMap.get(ev.step_id)
+          if (s) dagStepMap.set(ev.step_id, { ...s, status: 'running' })
+          setMessages(prev => prev.map(m =>
+            m.id === asstId ? { ...m, dagSteps: Array.from(dagStepMap.values()) } : m
+          ))
+        } else if (ev.type === 'step_done') {
+          const s = dagStepMap.get(ev.step_id)
+          if (s) dagStepMap.set(ev.step_id, { ...s, status: 'done', result: ev.result })
+          setMessages(prev => prev.map(m =>
+            m.id === asstId ? { ...m, dagSteps: Array.from(dagStepMap.values()) } : m
+          ))
+        } else if (ev.type === 'step_failed') {
+          const s = dagStepMap.get(ev.step_id)
+          if (s) dagStepMap.set(ev.step_id, { ...s, status: 'error', error: ev.error })
+          setMessages(prev => prev.map(m =>
+            m.id === asstId ? { ...m, dagSteps: Array.from(dagStepMap.values()) } : m
+          ))
+
+        // ── MultiAgent events ─────────────────────────────────────
+        } else if (ev.type === 'subtask_assign') {
+          subTaskMap.set(ev.subtask_id, {
+            id: ev.subtask_id, agent: ev.agent, goal: ev.goal,
+            depends: ev.depends, status: 'pending',
+          })
+          setMessages(prev => prev.map(m =>
+            m.id === asstId ? { ...m, subTasks: Array.from(subTaskMap.values()) } : m
+          ))
+        } else if (ev.type === 'agent_start') {
+          const st = subTaskMap.get(ev.subtask_id)
+          if (st) subTaskMap.set(ev.subtask_id, { ...st, status: 'running' })
+          setMessages(prev => prev.map(m =>
+            m.id === asstId ? { ...m, subTasks: Array.from(subTaskMap.values()) } : m
+          ))
+        } else if (ev.type === 'agent_done') {
+          const st = subTaskMap.get(ev.subtask_id)
+          if (st) subTaskMap.set(ev.subtask_id, { ...st, status: 'done', tokens: ev.tokens })
+          setMessages(prev => prev.map(m =>
+            m.id === asstId ? { ...m, subTasks: Array.from(subTaskMap.values()) } : m
+          ))
+        } else if (ev.type === 'agent_error') {
+          const st = subTaskMap.get(ev.subtask_id)
+          if (st) subTaskMap.set(ev.subtask_id, { ...st, status: 'error', error: ev.error })
+          setMessages(prev => prev.map(m =>
+            m.id === asstId ? { ...m, subTasks: Array.from(subTaskMap.values()) } : m
+          ))
+
         } else if (ev.type === 'done') {
           const structured = parseStructuredData(content)
           setStats(s => ({

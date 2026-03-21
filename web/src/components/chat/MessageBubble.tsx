@@ -6,6 +6,8 @@ import ToolCallCards from './ToolCallCard'
 import WeatherCard from '../cards/WeatherCard'
 import BiReportCard from '../cards/BiReportCard'
 import MarketingPlanCard from '../cards/MarketingPlanCard'
+import DagPlanCard from '../cards/DagPlanCard'
+import MultiAgentCard from '../cards/MultiAgentCard'
 
 interface Props { message: Message }
 
@@ -31,6 +33,16 @@ export default function MessageBubble({ message }: Props) {
   return (
     <div className="animate-fade-in">
       <ToolCallCards toolCalls={message.toolCalls} />
+
+      {/* DAG plan card */}
+      {message.dagSteps && message.dagSteps.length > 0 && (
+        <DagPlanCard steps={message.dagSteps} />
+      )}
+
+      {/* Multi-Agent card */}
+      {message.subTasks && message.subTasks.length > 0 && (
+        <MultiAgentCard subTasks={message.subTasks} />
+      )}
 
       {/* Structured data cards */}
       {message.structuredData?.type === 'weather' && (

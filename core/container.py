@@ -52,6 +52,9 @@ class AgentContainer:
             return self.llm_router
         raise RuntimeError("Container: neither llm_router nor llm_engine is set")
 
+    # ── 多 Agent 编排专用字段 ─────────────────────────────────────
+    agent_specs:        Any = None   # list[AgentSpec]，用于 multiagent 模式
+
     def build(self) -> "AgentContainer":
         from memory.consolidation import MemoryConsolidator
         from orchestrator.engines import ReactOrchestrator, PlanExecuteOrchestrator
@@ -72,6 +75,16 @@ class AgentContainer:
             )
             if self.orchestrator_type == "plan_execute":
                 self.orchestrator = PlanExecuteOrchestrator(**kwargs)
+            elif self.orchestrator_type == "dag":
+                from orchestrator.dag import DAGOrchestrator
+                self.orchestrator = DAGOrchestrator(**kwargs)
+            elif self.orchestrator_type == "multiagent":
+                from multiagent.orchestrator import MultiAgentOrchestrator
+                specs = self.agent_specs or []
+                self.orchestrator = MultiAgentOrchestrator(
+                    container_components=kwargs,
+                    agent_specs=specs,
+                )
             else:
                 self.orchestrator = ReactOrchestrator(**kwargs)
 

@@ -122,6 +122,21 @@ class ChatRequest(BaseModel):
         None,
         description="项目 ID（必须属于 workspace_id 下的项目）；设置后启用项目级记忆",
     )
+    # ── Orchestrator 选择 ──────────────────────────────────────────
+    orchestrator_type: str | None = Field(
+        None,
+        description=(
+            "编排器类型：react（默认）| plan_execute | dag（DAG 并行任务拆分）"
+            " | multiagent（多 Agent 协作）"
+        ),
+    )
+    agent_specs: list[dict] | None = Field(
+        None,
+        description=(
+            "多 Agent 规格列表（仅 orchestrator_type=multiagent 时生效）。"
+            "每项格式：{name, description, skills, system_prompt, max_steps}"
+        ),
+    )
 
 
 class ChatResponse(BaseModel):
@@ -253,9 +268,11 @@ def _build_container(engine_alias: str | None = None):
 # ── 核心：运行 Agent，收集事件 ─────────────────────────────────────
 
 def _get_container(
-    skills:        list[str] | None,
-    system_prompt: str | None = None,
-    workspace_ctx: Any        = None,   # WorkspaceContext | None
+    skills:             list[str] | None,
+    system_prompt:      str | None = None,
+    workspace_ctx:      Any        = None,   # WorkspaceContext | None
+    orchestrator_type:  str | None = None,
+    agent_specs:        list[dict] | None = None,
 ):
     """
     返回适合本次请求的容器副本。
@@ -264,6 +281,8 @@ def _get_container(
       - 用工作区的 system_prompt（优先级：request.system_prompt > ws.system_prompt）
       - 用工作区的 allowed_skills（优先级：request.skills > ws.allowed_skills）
       - 使用 WorkspaceAwareLTM（若全局 LTM 支持）
+
+    orchestrator_type 存在且与容器当前类型不同时，动态替换 orchestrator。
     """
     import dataclasses
     replacements: dict = {}
@@ -288,6 +307,44 @@ def _get_container(
         replacements["context_manager"] = _PrefixedContextManager(
             _container.context_manager, effective_prompt
         )
+
+    # ── Orchestrator 动态替换 ──────────────────────────────────────
+    otype = orchestrator_type
+    if otype and otype != _container.orchestrator_type:
+        sr = replacements.get("skill_registry", _container.skill_registry)
+        kwargs = dict(
+            llm_engine      = _container._effective_router(),
+            skill_registry  = sr,
+            mcp_hub         = _container.mcp_hub,
+            context_manager = replacements.get("context_manager", _container.context_manager),
+            short_term_memory = _container.short_term_memory,
+            long_term_memory  = _container.long_term_memory,
+        )
+        if otype == "dag":
+            from orchestrator.dag import DAGOrchestrator
+            replacements["orchestrator"] = DAGOrchestrator(**kwargs)
+        elif otype == "multiagent":
+            from multiagent.orchestrator import MultiAgentOrchestrator, AgentSpec
+            specs: list[AgentSpec] = []
+            for s in (agent_specs or []):
+                specs.append(AgentSpec(
+                    name          = s.get("name", "agent"),
+                    description   = s.get("description", ""),
+                    skills        = s.get("skills", []),
+                    system_prompt = s.get("system_prompt", ""),
+                    max_steps     = s.get("max_steps", 8),
+                ))
+            replacements["orchestrator"] = MultiAgentOrchestrator(
+                container_components=kwargs,
+                agent_specs=specs,
+            )
+        elif otype == "plan_execute":
+            from orchestrator.engines import PlanExecuteOrchestrator
+            replacements["orchestrator"] = PlanExecuteOrchestrator(**kwargs)
+        else:  # react
+            from orchestrator.engines import ReactOrchestrator
+            replacements["orchestrator"] = ReactOrchestrator(**kwargs)
+        replacements["orchestrator_type"] = otype
 
     return dataclasses.replace(_container, **replacements) if replacements else _container
 
@@ -316,7 +373,8 @@ async def _run_agent(req: ChatRequest):
 
     prompt       = req.system_prompt or (_MARKETING_SYSTEM_PROMPT if req.mode == "marketing" else None)
     ws_ctx       = await _resolve_workspace_ctx(req)
-    container    = _get_container(req.skills, prompt, ws_ctx)
+    container    = _get_container(req.skills, prompt, ws_ctx,
+                                  req.orchestrator_type, req.agent_specs)
     session_id   = req.session_id or f"sess_{uuid.uuid4().hex[:8]}"
     max_steps    = req.max_steps
     if ws_ctx:
@@ -369,7 +427,8 @@ async def _stream_agent(req: ChatRequest) -> AsyncIterator[str]:
 
     prompt     = req.system_prompt or (_MARKETING_SYSTEM_PROMPT if req.mode == "marketing" else None)
     ws_ctx     = await _resolve_workspace_ctx(req)
-    container  = _get_container(req.skills, prompt, ws_ctx)
+    container  = _get_container(req.skills, prompt, ws_ctx,
+                                req.orchestrator_type, req.agent_specs)
     session_id = req.session_id or f"sess_{uuid.uuid4().hex[:8]}"
     max_steps  = req.max_steps
     if ws_ctx:
@@ -452,6 +511,17 @@ async def chat_stream(req: ChatRequest):
     - `{"type":"step","tool":"weather_current","status":"done"}` — 工具完成
     - `{"type":"delta","text":"..."}` — 回复文本片段
     - `{"type":"done","status":"done","usage":{...}}` — 全部完成
+    - `{"type":"planning"}` — DAG 编排器正在规划
+    - `{"type":"plan","steps":[...]}` — DAG 规划结果
+    - `{"type":"parallel_start","step_ids":[...],"goals":[...]}` — 并行步骤启动
+    - `{"type":"step_start","step_id":"...","goal":"..."}` — 单步启动
+    - `{"type":"step_done","step_id":"...","result":"..."}` — 单步完成
+    - `{"type":"step_failed","step_id":"...","error":"..."}` — 单步失败
+    - `{"type":"orchestrating","agents":[...]}` — 多 Agent 编排开始
+    - `{"type":"subtask_assign","agent":"...","goal":"...","depends":[...]}` — 子任务分配
+    - `{"type":"agent_start","agent":"...","subtask_id":"..."}` — 子 Agent 启动
+    - `{"type":"agent_done","agent":"...","subtask_id":"...","tokens":N}` — 子 Agent 完成
+    - `{"type":"agent_error","agent":"...","error":"..."}` — 子 Agent 失败
     """
     if _container is None:
         raise HTTPException(status_code=503, detail="服务未初始化")
