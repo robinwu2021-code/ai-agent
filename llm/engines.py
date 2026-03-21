@@ -1,8 +1,8 @@
 """
-llm/engines.py — LLM Engine 实现（完整可配置版）
+llm/engines.py — LLM Engine 实现
 
-所有连接信息、模型名均通过构造函数参数传入，
-由 utils/config.py 的 Settings.build_llm_engine() 统一注入。
+所有连接信息、模型名均通过构造函数参数传入，不读取任何全局变量或环境变量。
+通常由 utils/llm_config.py 的 LLMConfig.build_engine() 实例化。
 
 包含：
   AnthropicEngine   Claude 系列

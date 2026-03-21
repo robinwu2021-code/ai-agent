@@ -1,0 +1,335 @@
+"""
+utils/llm_config.py — LLM 引擎实例配置
+
+核心设计：
+  LLMConfig    描述一个具体的引擎实例（alias + sdk + 全部连接参数）
+  RouterConfig 描述任务路由规则
+
+设计原则：
+  - 以 alias（实例名）为唯一 key，而不是 provider 类型
+  - 同一厂商可注册多个实例（不同账号 / 地址 / 模型）互不干扰
+  - sdk 只有两个值：anthropic | openai_compatible
+  - 所有连接参数均为实例级，彻底消除"一个 key 管一个厂商"的限制
+
+──────────────────────────────────────────────────────────────────
+手工配置（直接实例化，适合代码内硬配置或测试）：
+
+    from utils.llm_config import LLMConfig, RouterConfig, VENDOR_BASE_URLS
+
+    configs = [
+        LLMConfig(
+            alias   = "opus-prod",
+            sdk     = "anthropic",
+            api_key = "sk-ant-111",
+            model   = "claude-opus-4-5",
+        ),
+        LLMConfig(
+            alias   = "haiku-backup",
+            sdk     = "anthropic",
+            api_key = "sk-ant-222",          # 不同账号，不同 key
+            model   = "claude-haiku-4-5-20251001",
+            http_proxy = "http://proxy:7890",
+        ),
+        LLMConfig(
+            alias    = "azure-east",
+            sdk      = "openai_compatible",
+            api_key  = "az-key-east",
+            base_url = "https://my-east.openai.azure.com/openai/deployments/gpt4o",
+            model    = "gpt-4o",
+            is_azure = True,
+            supports_embed = True,
+        ),
+        LLMConfig(
+            alias    = "deepseek-main",
+            sdk      = "openai_compatible",
+            api_key  = "ds-key",
+            base_url = VENDOR_BASE_URLS["deepseek"],
+            model    = "deepseek-chat",
+            cost_tier = 1,
+        ),
+    ]
+
+    router_cfg = RouterConfig(
+        default   = "opus-prod",
+        chat      = "opus-prod",
+        summarize = "haiku-backup",
+        embed     = "azure-east",
+        fallback  = ["haiku-backup", "azure-east"],
+    )
+
+──────────────────────────────────────────────────────────────────
+环境变量配置（每个实例独立前缀，ENGINE_ALIASES 声明列表）：
+
+    ENGINE_ALIASES=opus-prod,haiku-backup,azure-east,deepseek-main
+
+    OPUS_PROD_SDK=anthropic
+    OPUS_PROD_API_KEY=sk-ant-111
+    OPUS_PROD_MODEL=claude-opus-4-5
+    OPUS_PROD_COST_TIER=3
+
+    HAIKU_BACKUP_SDK=anthropic
+    HAIKU_BACKUP_API_KEY=sk-ant-222
+    HAIKU_BACKUP_MODEL=claude-haiku-4-5-20251001
+    HAIKU_BACKUP_HTTP_PROXY=http://proxy:7890
+
+    AZURE_EAST_SDK=openai_compatible
+    AZURE_EAST_API_KEY=az-key-east
+    AZURE_EAST_BASE_URL=https://my-east.openai.azure.com/openai/deployments/gpt4o
+    AZURE_EAST_MODEL=gpt-4o
+    AZURE_EAST_IS_AZURE=true
+    AZURE_EAST_SUPPORTS_EMBED=true
+
+    DEEPSEEK_MAIN_SDK=openai_compatible
+    DEEPSEEK_MAIN_API_KEY=ds-key
+    DEEPSEEK_MAIN_BASE_URL=https://api.deepseek.com/v1
+    DEEPSEEK_MAIN_MODEL=deepseek-chat
+    DEEPSEEK_MAIN_COST_TIER=1
+
+    ROUTER_DEFAULT=opus-prod
+    ROUTER_CHAT=opus-prod
+    ROUTER_SUMMARIZE=haiku-backup
+    ROUTER_EMBED=azure-east
+    ROUTER_FALLBACK=haiku-backup,azure-east
+
+──────────────────────────────────────────────────────────────────
+"""
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass, field
+from typing import Any, Literal
+
+import structlog
+
+log = structlog.get_logger(__name__)
+
+# ── SDK 类型 ──────────────────────────────────────────────────────
+SdkType = Literal["anthropic", "openai_compatible"]
+
+# ── SDK 级技术默认值（与厂商无关，仅在实例未指定 model 时回落）────
+SDK_DEFAULTS: dict[str, dict[str, str]] = {
+    "anthropic": {
+        "default_model":   "claude-sonnet-4-20250514",
+        "embedding_model": "",          # Anthropic 无原生 embedding API
+    },
+    "openai_compatible": {
+        "default_model":   "gpt-4o",
+        "embedding_model": "text-embedding-3-small",
+    },
+}
+
+# ── 知名厂商的 base_url（手工配置时可直接引用）────────────────────
+VENDOR_BASE_URLS: dict[str, str] = {
+    "openai":   "https://api.openai.com/v1",
+    "deepseek": "https://api.deepseek.com/v1",
+    "groq":     "https://api.groq.com/openai/v1",
+    "ollama":   "http://localhost:11434/v1",
+    # anthropic SDK 内置处理，不需要 base_url
+    # azure 每个部署地址不同，不在此预设
+}
+
+
+# ─────────────────────────────────────────────────────────────────
+# LLMConfig — 引擎实例配置
+# ─────────────────────────────────────────────────────────────────
+
+@dataclass
+class LLMConfig:
+    """
+    描述一个具体的 LLM 引擎实例。
+
+    alias  是全局唯一标识，在 ModelRegistry 和路由规则中引用。
+    sdk    决定使用哪个客户端库（anthropic 或 openai_compatible）。
+    其余均为实例级参数——同一厂商不同账号 / 地址 / 模型可各自独立配置。
+    """
+
+    # ── 必填 ──────────────────────────────────────────────────────
+    alias: str       # 唯一标识，如 "opus-prod", "haiku-backup", "azure-east"
+    sdk:   SdkType   # "anthropic" | "openai_compatible"
+
+    # ── 连接参数（实例级，同类实例互不干扰）──────────────────────
+    api_key:  str | None = None
+    base_url: str | None = None   # 留空则用 SDK 内置默认值
+
+    # ── 模型参数（实例级）────────────────────────────────────────
+    model:           str | None = None   # 主推理模型，留空回落 SDK_DEFAULTS
+    embedding_model: str | None = None   # Embedding 模型
+    summarize_model: str | None = None   # 摘要专用模型，留空同 model
+
+    # ── 请求参数 ─────────────────────────────────────────────────
+    max_tokens:  int   = 4096
+    timeout_sec: float = 120.0
+    max_retries: int   = 3
+    temperature: float = 0.7
+    http_proxy:  str | None = None
+
+    # ── Azure 专用 ────────────────────────────────────────────────
+    is_azure:          bool = False
+    azure_api_version: str  = "2024-02-01"
+
+    # ── 路由元信息（供 ModelRegistry 使用）──────────────────────
+    cost_tier:      int       = 2    # 1=最便宜 3=最贵，用于自动降级排序
+    supports_embed: bool      = False
+    supports_tools: bool      = True
+    tags:           list[str] = field(default_factory=list)
+
+    # ── 解析方法 ─────────────────────────────────────────────────
+
+    def resolved_model(self) -> str:
+        """返回最终推理模型名（实例设置 > SDK 默认值）。"""
+        return self.model or SDK_DEFAULTS.get(self.sdk, {}).get("default_model", "")
+
+    def resolved_embedding_model(self) -> str:
+        """返回最终 Embedding 模型名。"""
+        return self.embedding_model or SDK_DEFAULTS.get(self.sdk, {}).get("embedding_model", "")
+
+    def resolved_summarize_model(self) -> str:
+        """返回摘要专用模型（默认与推理模型相同）。"""
+        return self.summarize_model or self.resolved_model()
+
+    # ── 工厂方法 ─────────────────────────────────────────────────
+
+    def build_engine(self) -> Any:
+        """根据 sdk 类型实例化对应的 LLMEngine。"""
+        from llm.engines import AnthropicEngine, OpenAIEngine
+
+        log.info(
+            "llm_config.build_engine",
+            alias    = self.alias,
+            sdk      = self.sdk,
+            model    = self.resolved_model(),
+            base_url = self.base_url or "(sdk-default)",
+        )
+
+        if self.sdk == "anthropic":
+            return AnthropicEngine(
+                api_key         = self.api_key,
+                default_model   = self.resolved_model(),
+                summarize_model = self.resolved_summarize_model(),
+                max_tokens      = self.max_tokens,
+                timeout_sec     = self.timeout_sec,
+                max_retries     = self.max_retries,
+                http_proxy      = self.http_proxy,
+            )
+
+        if self.sdk == "openai_compatible":
+            return OpenAIEngine(
+                api_key           = self.api_key,
+                base_url          = self.base_url,
+                default_model     = self.resolved_model(),
+                embedding_model   = self.resolved_embedding_model(),
+                summarize_model   = self.resolved_summarize_model(),
+                max_tokens        = self.max_tokens,
+                timeout_sec       = self.timeout_sec,
+                max_retries       = self.max_retries,
+                http_proxy        = self.http_proxy,
+                is_azure          = self.is_azure,
+                azure_api_version = self.azure_api_version,
+            )
+
+        raise ValueError(
+            f"[{self.alias}] 未知 sdk 类型: {self.sdk!r}，"
+            f"支持: anthropic | openai_compatible"
+        )
+
+    @classmethod
+    def from_env(cls, alias: str) -> "LLMConfig":
+        """
+        从环境变量读取实例配置。
+        前缀规则：alias.upper().replace('-', '_')
+        示例：alias="opus-prod" → 读取 OPUS_PROD_SDK, OPUS_PROD_API_KEY, ...
+        """
+        prefix = alias.upper().replace("-", "_")
+
+        def _get(key: str, default: str = "") -> str:
+            return os.environ.get(f"{prefix}_{key}", default)
+
+        sdk_raw = _get("SDK") or "anthropic"
+        if sdk_raw not in ("anthropic", "openai_compatible"):
+            raise ValueError(
+                f"[{alias}] {prefix}_SDK 必须是 anthropic | openai_compatible，"
+                f"得到: {sdk_raw!r}"
+            )
+
+        return cls(
+            alias             = alias,
+            sdk               = sdk_raw,          # type: ignore[arg-type]
+            api_key           = _get("API_KEY") or None,
+            base_url          = _get("BASE_URL") or None,
+            model             = _get("MODEL") or None,
+            embedding_model   = _get("EMBEDDING_MODEL") or None,
+            summarize_model   = _get("SUMMARIZE_MODEL") or None,
+            max_tokens        = int(_get("MAX_TOKENS") or 4096),
+            timeout_sec       = float(_get("TIMEOUT_SEC") or 120.0),
+            max_retries       = int(_get("MAX_RETRIES") or 3),
+            temperature       = float(_get("TEMPERATURE") or 0.7),
+            http_proxy        = _get("HTTP_PROXY") or None,
+            is_azure          = _get("IS_AZURE", "").lower() == "true",
+            azure_api_version = _get("AZURE_API_VERSION") or "2024-02-01",
+            cost_tier         = int(_get("COST_TIER") or 2),
+            supports_embed    = _get("SUPPORTS_EMBED", "").lower() == "true",
+            supports_tools    = _get("SUPPORTS_TOOLS", "true").lower() != "false",
+            tags              = [t.strip() for t in _get("TAGS", "").split(",") if t.strip()],
+        )
+
+
+# ─────────────────────────────────────────────────────────────────
+# RouterConfig — 任务路由规则
+# ─────────────────────────────────────────────────────────────────
+
+@dataclass
+class RouterConfig:
+    """
+    多引擎路由规则。alias 值必须与已注册的 LLMConfig.alias 对应。
+
+    任务类型说明：
+      chat        主推理对话（ReAct 循环核心调用）
+      plan        Plan-Execute 规划阶段
+      summarize   文本摘要压缩（上下文裁剪、记忆固化）
+      consolidate 记忆提炼（可用便宜模型）
+      embed       向量化（RAG 检索、长期记忆）
+      rerank      RAG 重排序打分
+      eval        LLM-as-judge 打分
+      route       Multi-Agent 路由决策
+    """
+
+    default:     str = "default"   # 所有未覆盖任务的回落引擎
+
+    # ── 按任务类型路由（留 None 则回落 default）──────────────────
+    chat:        str | None = None
+    plan:        str | None = None
+    summarize:   str | None = None
+    consolidate: str | None = None
+    embed:       str | None = None
+    rerank:      str | None = None
+    eval:        str | None = None
+    route:       str | None = None
+
+    # ── 工作流节点级覆盖（粒度比任务类型更细）────────────────────
+    node_overrides: dict[str, str] = field(default_factory=dict)
+    # 示例：{"react_step_1": "haiku-backup", "react_final": "opus-prod"}
+
+    # ── Fallback 链（主引擎失败后按序尝试）──────────────────────
+    fallback: list[str] = field(default_factory=list)
+
+    @classmethod
+    def from_env(cls, default_alias: str) -> "RouterConfig":
+        """从 ROUTER_* 环境变量读取路由规则。"""
+        def _get(key: str) -> str | None:
+            return os.environ.get(f"ROUTER_{key}") or None
+
+        fallback_raw = _get("FALLBACK") or ""
+        fallback = [a.strip() for a in fallback_raw.split(",") if a.strip()]
+
+        return cls(
+            default     = _get("DEFAULT") or default_alias,
+            chat        = _get("CHAT"),
+            plan        = _get("PLAN"),
+            summarize   = _get("SUMMARIZE"),
+            consolidate = _get("CONSOLIDATE"),
+            embed       = _get("EMBED"),
+            rerank      = _get("RERANK"),
+            eval        = _get("EVAL"),
+            route       = _get("ROUTE"),
+            fallback    = fallback,
+        )

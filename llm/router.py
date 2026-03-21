@@ -2,9 +2,9 @@
 llm/router.py — 多模型路由层
 
 核心设计：
-  ModelRegistry   注册任意数量的 (provider, model) 组合，每个组合有唯一别名
-  TaskRouter      按任务类型（chat / summarize / embed / rerank / plan / eval）
-                  路由到不同的引擎别名
+  ModelRegistry   注册任意数量的引擎实例，每个实例有唯一 alias
+  TaskRouter      按任务类型（chat / summarize / embed / plan / eval 等）
+                  路由到不同的引擎 alias
   LLMRouter       统一入口，实现与单个 LLMEngine 相同的接口，
                   对所有调用方完全透明；内置 Fallback 链和熔断
 
@@ -14,22 +14,39 @@ llm/router.py — 多模型路由层
   3. 按模型别名    显式指定 AgentConfig.model_alias
   4. Fallback 链   主模型失败时按序尝试备选
 
-使用方式：
-    from llm.router import LLMRouter, ModelRegistry, TaskRouter, ModelSpec
+推荐配置方式（通过 utils/llm_config.py）：
 
+    from utils.llm_config import LLMConfig, RouterConfig, VENDOR_BASE_URLS
+    from llm.router import LLMRouter, ModelRegistry, TaskRouter
+
+    # 1. 手工定义实例（同一厂商可注册多个，互不干扰）
+    configs = [
+        LLMConfig(alias="opus-prod",    sdk="anthropic",
+                  api_key="sk-ant-111", model="claude-opus-4-5"),
+        LLMConfig(alias="haiku-backup", sdk="anthropic",
+                  api_key="sk-ant-222", model="claude-haiku-4-5-20251001"),
+        LLMConfig(alias="azure-east",   sdk="openai_compatible",
+                  api_key="az-key", base_url="https://east.azure.com/...",
+                  model="gpt-4o", is_azure=True, supports_embed=True),
+        LLMConfig(alias="deepseek",     sdk="openai_compatible",
+                  api_key="ds-key", base_url=VENDOR_BASE_URLS["deepseek"],
+                  model="deepseek-chat", cost_tier=1),
+    ]
+
+    # 2. 注册到 registry
     registry = ModelRegistry()
-    registry.register("claude-fast",   AnthropicEngine(..., default_model="claude-haiku-4-5-20251001"))
-    registry.register("claude-smart",  AnthropicEngine(..., default_model="claude-sonnet-4-20250514"))
-    registry.register("gpt-embed",     OpenAIEngine(...,    default_model="text-embedding-3-small"))
-    registry.register("deepseek-chat", OpenAIEngine(...,    base_url="https://api.deepseek.com/v1"))
+    for cfg in configs:
+        registry.register(cfg.alias, cfg.build_engine(),
+                          supports_embed=cfg.supports_embed,
+                          cost_tier=cfg.cost_tier)
 
+    # 3. 定义路由规则
     task_router = TaskRouter(
-        chat      = "claude-smart",   # 主推理
-        summarize = "claude-fast",    # 摘要/压缩用便宜模型
-        embed     = "gpt-embed",      # 向量化
-        plan      = "claude-smart",   # 规划
-        eval      = "claude-fast",    # 评估打分
-        fallback  = ["claude-fast", "deepseek-chat"],  # 全局兜底链
+        default   = "opus-prod",
+        chat      = "opus-prod",
+        summarize = "haiku-backup",
+        embed     = "azure-east",
+        fallback  = ["haiku-backup", "azure-east", "deepseek"],
     )
 
     router = LLMRouter(registry, task_router)
@@ -37,9 +54,11 @@ llm/router.py — 多模型路由层
     # 当作普通 LLMEngine 使用（所有调用方无需修改）
     resp = await router.chat(messages, tools, config)
 
-    # 也可在 AgentConfig 里指定节点级覆盖
-    config = AgentConfig(model_alias="deepseek-chat")
+    # 在 AgentConfig 里指定节点级覆盖
+    config = AgentConfig(model_alias="deepseek")
     resp   = await router.chat(messages, tools, config)
+
+环境变量方式见 utils/llm_config.py 文档。
 """
 from __future__ import annotations
 

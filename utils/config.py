@@ -1,159 +1,78 @@
 """
-utils/config.py — 完整 LLM 连接与模型配置
+utils/config.py — Agent 系统全局配置
 
-所有 LLM 连接信息和模型选择均通过环境变量或 .env 文件配置，
-代码中无任何硬编码的 API Key 或模型名。
+LLM 实例配置已迁移至 utils/llm_config.py（LLMConfig / RouterConfig）。
+本文件负责：
+  1. 系统级配置（存储后端、API 服务器、日志等）
+  2. 单引擎快捷配置（LLM_* 前缀，向后兼容旧版环境变量）
+  3. 多引擎路由配置（ENGINE_ALIASES + 各实例独立前缀）
 
 优先级：环境变量 > .env 文件 > 默认值
 
-支持的 LLM 提供商：
-  anthropic   Claude 系列（默认）
-  openai      OpenAI GPT 系列
-  azure       Azure OpenAI
-  deepseek    DeepSeek（OpenAI 兼容）
-  groq        Groq（OpenAI 兼容）
-  ollama      本地 Ollama（OpenAI 兼容）
-  custom      任意 OpenAI 兼容接口
+──────────────────────────────────────────────────────────────────
+单引擎模式（最简配置，向后兼容）：
+
+    LLM_SDK=anthropic               # 或 openai_compatible
+    LLM_API_KEY=sk-ant-xxx
+    LLM_MODEL=claude-sonnet-4-20250514
+
+  旧版 provider 风格也继续支持：
+    LLM_PROVIDER=anthropic          # 自动映射到 sdk 类型
+    ANTHROPIC_API_KEY=sk-ant-xxx
+
+──────────────────────────────────────────────────────────────────
+多引擎路由模式（详见 utils/llm_config.py 中的完整示例）：
+
+    ENGINE_ALIASES=opus-prod,haiku-backup,azure-east
+
+    OPUS_PROD_SDK=anthropic
+    OPUS_PROD_API_KEY=sk-ant-111
+    OPUS_PROD_MODEL=claude-opus-4-5
+
+    HAIKU_BACKUP_SDK=anthropic
+    HAIKU_BACKUP_API_KEY=sk-ant-222     # 不同账号
+    HAIKU_BACKUP_MODEL=claude-haiku-4-5-20251001
+
+    AZURE_EAST_SDK=openai_compatible
+    AZURE_EAST_API_KEY=az-key
+    AZURE_EAST_BASE_URL=https://my-east.openai.azure.com/...
+    AZURE_EAST_MODEL=gpt-4o
+    AZURE_EAST_IS_AZURE=true
+
+    ROUTER_DEFAULT=opus-prod
+    ROUTER_SUMMARIZE=haiku-backup
+    ROUTER_EMBED=azure-east
+    ROUTER_FALLBACK=haiku-backup,azure-east
 """
 from __future__ import annotations
 
 from typing import Any
 
-from pydantic import Field, field_validator
+from pydantic import Field
 from pydantic_settings import BaseSettings
 
 import structlog
+
 log = structlog.get_logger(__name__)
 
-
-# ── 已知提供商的默认端点 ─────────────────────────────────────────
-PROVIDER_DEFAULTS: dict[str, dict[str, str]] = {
-    "anthropic": {
-        "base_url":        "",   # SDK 自动处理，不需要手动设置
-        "default_model":   "claude-sonnet-4-20250514",
-        "embedding_model": "",   # Anthropic 暂无 embedding API
-    },
-    "openai": {
-        "base_url":        "https://api.openai.com/v1",
-        "default_model":   "gpt-4o",
-        "embedding_model": "text-embedding-3-small",
-    },
-    "azure": {
-        "base_url":        "",   # 由 AZURE_OPENAI_ENDPOINT 单独设置
-        "default_model":   "gpt-4o",
-        "embedding_model": "text-embedding-3-small",
-    },
-    "deepseek": {
-        "base_url":        "https://api.deepseek.com/v1",
-        "default_model":   "deepseek-chat",
-        "embedding_model": "",
-    },
-    "groq": {
-        "base_url":        "https://api.groq.com/openai/v1",
-        "default_model":   "llama-3.3-70b-versatile",
-        "embedding_model": "",
-    },
-    "ollama": {
-        "base_url":        "http://localhost:11434/v1",
-        "default_model":   "llama3.2",
-        "embedding_model": "nomic-embed-text",
-    },
-    "custom": {
-        "base_url":        "",
-        "default_model":   "",
-        "embedding_model": "",
-    },
+# ── 旧版 LLM_PROVIDER 到 sdk 类型的映射（向后兼容）──────────────
+_PROVIDER_TO_SDK: dict[str, str] = {
+    "anthropic": "anthropic",
+    "openai":    "openai_compatible",
+    "azure":     "openai_compatible",
+    "deepseek":  "openai_compatible",
+    "groq":      "openai_compatible",
+    "ollama":    "openai_compatible",
+    "custom":    "openai_compatible",
 }
 
-
-class LLMProviderConfig(BaseSettings):
-    """
-    单个 LLM 提供商的连接配置。
-    通过前缀环境变量读取，例如主提供商用 LLM_ 前缀。
-    """
-
-    # ── 提供商选择 ────────────────────────────────────────────────
-    provider:   str = Field("anthropic", description="提供商: anthropic|openai|azure|deepseek|groq|ollama|custom")
-
-    # ── 认证 ──────────────────────────────────────────────────────
-    api_key:    str | None = Field(None, description="API Key（也可通过 ANTHROPIC_API_KEY 或 OPENAI_API_KEY 设置）")
-
-    # ── 连接端点 ──────────────────────────────────────────────────
-    base_url:   str | None = Field(None, description="API Base URL，留空使用提供商默认值")
-
-    # Azure 专用
-    azure_endpoint:    str | None = Field(None, description="Azure OpenAI endpoint URL")
-    azure_api_version: str        = Field("2024-02-01", description="Azure API version")
-    azure_deployment:  str | None = Field(None, description="Azure deployment name")
-
-    # ── 模型选择 ──────────────────────────────────────────────────
-    model:           str | None = Field(None, description="推理模型名，留空使用提供商默认值")
-    embedding_model: str | None = Field(None, description="Embedding 模型名，留空使用提供商默认值")
-    summarize_model: str | None = Field(None, description="摘要专用模型（可使用更便宜的模型），留空同 model")
-
-    # ── 请求参数 ──────────────────────────────────────────────────
-    max_tokens:     int   = Field(4096,  description="单次最大输出 token 数")
-    timeout_sec:    float = Field(120.0, description="请求超时秒数")
-    max_retries:    int   = Field(3,     description="自动重试次数")
-    temperature:    float = Field(0.7,   description="采样温度 0-1")
-
-    # ── 代理 ─────────────────────────────────────────────────────
-    http_proxy:     str | None = Field(None, description="HTTP 代理，例如 http://127.0.0.1:7890")
-
-    @field_validator("provider")
-    @classmethod
-    def validate_provider(cls, v: str) -> str:
-        valid = set(PROVIDER_DEFAULTS.keys())
-        if v not in valid:
-            raise ValueError(f"provider 必须是 {valid} 之一，得到: {v!r}")
-        return v
-
-    def resolved_model(self) -> str:
-        """返回最终使用的推理模型名。"""
-        if self.model:
-            return self.model
-        return PROVIDER_DEFAULTS[self.provider]["default_model"]
-
-    def resolved_embedding_model(self) -> str:
-        """返回最终使用的 embedding 模型名。"""
-        if self.embedding_model:
-            return self.embedding_model
-        return PROVIDER_DEFAULTS[self.provider]["embedding_model"]
-
-    def resolved_summarize_model(self) -> str:
-        """返回摘要专用模型（默认与推理模型相同）。"""
-        return self.summarize_model or self.resolved_model()
-
-    def resolved_base_url(self) -> str | None:
-        """返回最终使用的 base URL。"""
-        if self.base_url:
-            return self.base_url
-        default = PROVIDER_DEFAULTS[self.provider]["base_url"]
-        return default or None
-
-    def resolved_api_key(self) -> str | None:
-        """
-        按优先级查找 API Key：
-          1. 本字段 api_key
-          2. 提供商专用环境变量（ANTHROPIC_API_KEY / OPENAI_API_KEY 等）
-        """
-        import os
-        if self.api_key:
-            return self.api_key
-        env_map = {
-            "anthropic": "ANTHROPIC_API_KEY",
-            "openai":    "OPENAI_API_KEY",
-            "azure":     "AZURE_OPENAI_API_KEY",
-            "deepseek":  "DEEPSEEK_API_KEY",
-            "groq":      "GROQ_API_KEY",
-            "ollama":    "",            # Ollama 本地无需 key
-            "custom":    "CUSTOM_LLM_API_KEY",
-        }
-        env_var = env_map.get(self.provider, "")
-        return os.environ.get(env_var) if env_var else None
-
-    model_config = {"env_file": ".env", "env_file_encoding": "utf-8",
-                    "populate_by_name": True, "extra": "ignore"}
+# 旧版 LLM_PROVIDER 对应的默认 base_url（azure 除外，由 base_url 指定）
+_PROVIDER_BASE_URLS: dict[str, str] = {
+    "openai":   "https://api.openai.com/v1",
+    "deepseek": "https://api.deepseek.com/v1",
+    "groq":     "https://api.groq.com/openai/v1",
+    "ollama":   "http://localhost:11434/v1",
+}
 
 
 class Settings(BaseSettings):
@@ -162,241 +81,186 @@ class Settings(BaseSettings):
     优先级：环境变量 > .env 文件 > 默认值
     """
 
-    # ── 主 LLM（必填） ────────────────────────────────────────────
-    llm_provider:          str        = Field("anthropic",                alias="LLM_PROVIDER")
-    llm_api_key:           str | None = Field(None,                       alias="LLM_API_KEY")
-    llm_base_url:          str | None = Field(None,                       alias="LLM_BASE_URL")
-    llm_model:             str | None = Field(None,                       alias="LLM_MODEL")
-    llm_embedding_model:   str | None = Field(None,                       alias="LLM_EMBEDDING_MODEL")
-    llm_summarize_model:   str | None = Field(None,                       alias="LLM_SUMMARIZE_MODEL")
-    llm_max_tokens:        int        = Field(4096,                       alias="LLM_MAX_TOKENS")
-    llm_timeout_sec:       float      = Field(120.0,                      alias="LLM_TIMEOUT_SEC")
-    llm_max_retries:       int        = Field(3,                          alias="LLM_MAX_RETRIES")
-    llm_temperature:       float      = Field(0.7,                        alias="LLM_TEMPERATURE")
-    llm_http_proxy:        str | None = Field(None,                       alias="LLM_HTTP_PROXY")
+    # ── 单引擎快捷配置（alias="default"，向后兼容）────────────────
+    # 新：LLM_SDK=anthropic|openai_compatible
+    llm_sdk:               str        = Field("anthropic",  alias="LLM_SDK")
+    # 旧：LLM_PROVIDER=anthropic|openai|azure|deepseek|groq|ollama|custom
+    llm_provider:          str | None = Field(None,         alias="LLM_PROVIDER")
 
-    # Azure 专用
-    azure_endpoint:        str | None = Field(None,                       alias="AZURE_OPENAI_ENDPOINT")
-    azure_api_version:     str        = Field("2024-02-01",               alias="AZURE_OPENAI_API_VERSION")
-    azure_deployment:      str | None = Field(None,                       alias="AZURE_OPENAI_DEPLOYMENT")
+    llm_api_key:           str | None = Field(None,         alias="LLM_API_KEY")
+    llm_base_url:          str | None = Field(None,         alias="LLM_BASE_URL")
+    llm_model:             str | None = Field(None,         alias="LLM_MODEL")
+    llm_embedding_model:   str | None = Field(None,         alias="LLM_EMBEDDING_MODEL")
+    llm_summarize_model:   str | None = Field(None,         alias="LLM_SUMMARIZE_MODEL")
+    llm_max_tokens:        int        = Field(4096,         alias="LLM_MAX_TOKENS")
+    llm_timeout_sec:       float      = Field(120.0,        alias="LLM_TIMEOUT_SEC")
+    llm_max_retries:       int        = Field(3,            alias="LLM_MAX_RETRIES")
+    llm_temperature:       float      = Field(0.7,          alias="LLM_TEMPERATURE")
+    llm_http_proxy:        str | None = Field(None,         alias="LLM_HTTP_PROXY")
+    llm_is_azure:          bool       = Field(False,        alias="LLM_IS_AZURE")
+    llm_azure_api_version: str        = Field("2024-02-01", alias="LLM_AZURE_API_VERSION")
 
-    # 兼容旧版环境变量（自动回退读取）
-    anthropic_api_key:     str | None = Field(None,                       alias="ANTHROPIC_API_KEY")
-    openai_api_key:        str | None = Field(None,                       alias="OPENAI_API_KEY")
-    openai_base_url:       str | None = Field(None,                       alias="OPENAI_BASE_URL")
+    # 兼容旧版厂商专用环境变量
+    anthropic_api_key:     str | None = Field(None, alias="ANTHROPIC_API_KEY")
+    openai_api_key:        str | None = Field(None, alias="OPENAI_API_KEY")
+    openai_base_url:       str | None = Field(None, alias="OPENAI_BASE_URL")
+
+    # ── 多引擎路由配置 ────────────────────────────────────────────
+    # 逗号分隔的实例别名列表，如 "opus-prod,haiku-backup,azure-east"
+    # 每个 alias 对应 {ALIAS}_SDK / {ALIAS}_API_KEY / ... 环境变量
+    engine_aliases: str | None = Field(None, alias="ENGINE_ALIASES")
+
+    # 任务路由（alias 必须在 engine_aliases 中声明）
+    router_default:     str | None = Field(None, alias="ROUTER_DEFAULT")
+    router_chat:        str | None = Field(None, alias="ROUTER_CHAT")
+    router_plan:        str | None = Field(None, alias="ROUTER_PLAN")
+    router_summarize:   str | None = Field(None, alias="ROUTER_SUMMARIZE")
+    router_consolidate: str | None = Field(None, alias="ROUTER_CONSOLIDATE")
+    router_embed:       str | None = Field(None, alias="ROUTER_EMBED")
+    router_eval:        str | None = Field(None, alias="ROUTER_EVAL")
+    router_route:       str | None = Field(None, alias="ROUTER_ROUTE")
+    router_fallback:    str | None = Field(None, alias="ROUTER_FALLBACK")
 
     # ── 存储后端 ─────────────────────────────────────────────────
-    redis_url:             str        = Field("redis://localhost:6379",   alias="REDIS_URL")
-    qdrant_url:            str        = Field("http://localhost:6333",    alias="QDRANT_URL")
-    use_redis:             bool       = Field(False,                      alias="USE_REDIS")
-    use_qdrant:            bool       = Field(False,                      alias="USE_QDRANT")
+    redis_url:  str  = Field("redis://localhost:6379", alias="REDIS_URL")
+    qdrant_url: str  = Field("http://localhost:6333",  alias="QDRANT_URL")
+    use_redis:  bool = Field(False,                    alias="USE_REDIS")
+    use_qdrant: bool = Field(False,                    alias="USE_QDRANT")
 
     # ── API 服务器 ────────────────────────────────────────────────
-    api_host:              str        = Field("0.0.0.0",                  alias="API_HOST")
-    api_port:              int        = Field(8000,                       alias="API_PORT")
+    api_host: str = Field("0.0.0.0", alias="API_HOST")
+    api_port: int = Field(8000,      alias="API_PORT")
 
     # ── Agent 运行参数 ─────────────────────────────────────────────
-    orchestrator_type:     str        = Field("react",                    alias="ORCHESTRATOR_TYPE")
-    max_steps:             int        = Field(20,                         alias="MAX_STEPS")
-    token_budget:          int        = Field(12000,                      alias="TOKEN_BUDGET")
+    orchestrator_type: str = Field("react", alias="ORCHESTRATOR_TYPE")
+    max_steps:         int = Field(20,      alias="MAX_STEPS")
+    token_budget:      int = Field(12000,   alias="TOKEN_BUDGET")
 
     # ── 日志 ─────────────────────────────────────────────────────
-    log_level:             str        = Field("INFO",                     alias="LOG_LEVEL")
-    json_logs:             bool       = Field(False,                      alias="JSON_LOGS")
+    log_level: str  = Field("INFO",  alias="LOG_LEVEL")
+    json_logs: bool = Field(False,   alias="JSON_LOGS")
 
-    model_config = {"env_file": ".env", "env_file_encoding": "utf-8",
-                    "populate_by_name": True, "extra": "ignore"}
+    model_config = {
+        "env_file":          ".env",
+        "env_file_encoding": "utf-8",
+        "populate_by_name":  True,
+        "extra":             "ignore",
+    }
 
-    # ── 派生方法 ──────────────────────────────────────────────────
+    # ── 单引擎 LLMConfig 构建 ─────────────────────────────────────
 
-    def llm_config(self) -> LLMProviderConfig:
-        """将扁平环境变量组装为 LLMProviderConfig 对象。"""
-        return LLMProviderConfig(
-            provider=self.llm_provider,
-            api_key=self.llm_api_key,
-            base_url=self.llm_base_url,
-            model=self.llm_model,
-            embedding_model=self.llm_embedding_model,
-            summarize_model=self.llm_summarize_model,
-            max_tokens=self.llm_max_tokens,
-            timeout_sec=self.llm_timeout_sec,
-            max_retries=self.llm_max_retries,
-            temperature=self.llm_temperature,
-            http_proxy=self.llm_http_proxy,
-            azure_endpoint=self.azure_endpoint,
-            azure_api_version=self.azure_api_version,
-            azure_deployment=self.azure_deployment,
+    def default_llm_config(self) -> "LLMConfig":
+        """
+        将 LLM_* 环境变量组装为 alias='default' 的 LLMConfig。
+
+        SDK 类型解析优先级：LLM_SDK > LLM_PROVIDER 映射 > 默认 anthropic
+        API Key 解析优先级：LLM_API_KEY > ANTHROPIC_API_KEY / OPENAI_API_KEY
+        Base URL 解析优先级：LLM_BASE_URL > OPENAI_BASE_URL > LLM_PROVIDER 默认值
+        """
+        from utils.llm_config import LLMConfig
+
+        # 解析 sdk 类型
+        sdk = self.llm_sdk
+        if self.llm_provider and self.llm_provider in _PROVIDER_TO_SDK:
+            # LLM_PROVIDER 覆盖 LLM_SDK（旧版兼容优先）
+            sdk = _PROVIDER_TO_SDK[self.llm_provider]
+
+        # 解析 API Key
+        api_key = self.llm_api_key
+        if not api_key:
+            api_key = (
+                self.anthropic_api_key
+                if sdk == "anthropic"
+                else self.openai_api_key
+            )
+
+        # 解析 base_url
+        base_url = self.llm_base_url
+        if not base_url and sdk == "openai_compatible":
+            # OPENAI_BASE_URL 兼容
+            base_url = self.openai_base_url
+        if not base_url and self.llm_provider in _PROVIDER_BASE_URLS:
+            # LLM_PROVIDER 对应的厂商默认地址
+            base_url = _PROVIDER_BASE_URLS[self.llm_provider]
+
+        # Azure 模式：LLM_PROVIDER=azure 隐式启用
+        is_azure = self.llm_is_azure or self.llm_provider == "azure"
+
+        return LLMConfig(
+            alias             = "default",
+            sdk               = sdk,          # type: ignore[arg-type]
+            api_key           = api_key,
+            base_url          = base_url,
+            model             = self.llm_model,
+            embedding_model   = self.llm_embedding_model,
+            summarize_model   = self.llm_summarize_model,
+            max_tokens        = self.llm_max_tokens,
+            timeout_sec       = self.llm_timeout_sec,
+            max_retries       = self.llm_max_retries,
+            temperature       = self.llm_temperature,
+            http_proxy        = self.llm_http_proxy,
+            is_azure          = is_azure,
+            azure_api_version = self.llm_azure_api_version,
+            supports_embed    = True,
         )
 
-    def effective_api_key(self) -> str | None:
-        """
-        按优先级解析最终使用的 API Key：
-          LLM_API_KEY > ANTHROPIC_API_KEY / OPENAI_API_KEY > 无
-        """
-        if self.llm_api_key:
-            return self.llm_api_key
-        if self.llm_provider == "anthropic":
-            return self.anthropic_api_key
-        if self.llm_provider in ("openai", "azure", "deepseek", "groq", "custom"):
-            return self.openai_api_key
-        return None
+    def build_llm_engine(self) -> Any:
+        """构建单引擎实例（无 ENGINE_ALIASES 时使用）。"""
+        return self.default_llm_config().build_engine()
 
-    def effective_base_url(self) -> str | None:
-        """按优先级解析 base URL：LLM_BASE_URL > OPENAI_BASE_URL > 提供商默认值。"""
-        if self.llm_base_url:
-            return self.llm_base_url
-        if self.openai_base_url and self.llm_provider != "anthropic":
-            return self.openai_base_url
-        return PROVIDER_DEFAULTS.get(self.llm_provider, {}).get("base_url") or None
-
-    def effective_model(self) -> str:
-        """解析最终推理模型名。"""
-        if self.llm_model:
-            return self.llm_model
-        return PROVIDER_DEFAULTS.get(self.llm_provider, {}).get("default_model", "")
-
-    # ── 多模型路由配置 ────────────────────────────────────────────
-    # 引擎别名列表，逗号分隔，如 "claude-smart,claude-fast,gpt-embed"
-    router_engines:      str | None = Field(None, alias="ROUTER_ENGINES")
-
-    # 任务路由映射（别名必须在 router_engines 中注册）
-    router_chat:         str | None = Field(None, alias="ROUTER_CHAT")
-    router_plan:         str | None = Field(None, alias="ROUTER_PLAN")
-    router_summarize:    str | None = Field(None, alias="ROUTER_SUMMARIZE")
-    router_consolidate:  str | None = Field(None, alias="ROUTER_CONSOLIDATE")
-    router_embed:        str | None = Field(None, alias="ROUTER_EMBED")
-    router_eval:         str | None = Field(None, alias="ROUTER_EVAL")
-    router_route:        str | None = Field(None, alias="ROUTER_ROUTE")
-    router_fallback:     str | None = Field(None, alias="ROUTER_FALLBACK")
+    # ── 多引擎路由构建 ────────────────────────────────────────────
 
     def build_router(self) -> Any:
         """
-        从配置构建 LLMRouter。
-        如果未配置 ROUTER_ENGINES，退化为单引擎 Router（向后兼容）。
+        构建 LLMRouter。
+          - 有 ENGINE_ALIASES → 多引擎路由模式，每个 alias 读取独立前缀
+          - 无 ENGINE_ALIASES → 单引擎兼容模式，包装 default 引擎
         """
-        from llm.router import (
-            LLMRouter, ModelRegistry, TaskRouter, single_engine_router
-        )
+        from llm.router import LLMRouter, ModelRegistry, TaskRouter, single_engine_router
+        from utils.llm_config import LLMConfig
 
-        if not self.router_engines:
-            # 单引擎模式：包装成 Router
+        if not self.engine_aliases:
             engine = self.build_llm_engine()
             return single_engine_router(engine, alias="default")
 
-        # 多引擎模式
-        engine_aliases = [a.strip() for a in self.router_engines.split(",") if a.strip()]
+        # ── 多引擎：逐 alias 从环境变量构建实例 ──────────────────
+        aliases  = [a.strip() for a in self.engine_aliases.split(",") if a.strip()]
         registry = ModelRegistry()
 
-        for alias in engine_aliases:
-            prefix  = alias.upper().replace("-", "_")
-            import os
-            provider = os.environ.get(f"{prefix}_PROVIDER") or self.llm_provider
-            api_key  = os.environ.get(f"{prefix}_API_KEY")  or self.effective_api_key()
-            base_url = os.environ.get(f"{prefix}_BASE_URL")
-            model    = os.environ.get(f"{prefix}_MODEL")
-            sup_embed = os.environ.get(f"{prefix}_EMBED", "").lower() == "true"
-
-            # 构造一个临时 Settings 只为该引擎
-            engine_settings = Settings(
-                LLM_PROVIDER=provider,
-                LLM_API_KEY=api_key,
-                LLM_BASE_URL=base_url,
-                LLM_MODEL=model,
-            )
-            engine = engine_settings.build_llm_engine()
+        for alias in aliases:
+            cfg    = LLMConfig.from_env(alias)
+            engine = cfg.build_engine()
             registry.register(
-                alias=alias,
-                engine=engine,
-                provider=provider,
-                model=model or engine_settings.effective_model(),
-                supports_embed=sup_embed,
+                alias          = alias,
+                engine         = engine,
+                provider       = cfg.sdk,
+                model          = cfg.resolved_model(),
+                supports_embed = cfg.supports_embed,
+                supports_tools = cfg.supports_tools,
+                cost_tier      = cfg.cost_tier,
+                tags           = cfg.tags,
             )
 
-        fallback_chain = (
-            [a.strip() for a in self.router_fallback.split(",") if a.strip()]
-            if self.router_fallback else []
-        )
-
+        fallback = [
+            a.strip()
+            for a in (self.router_fallback or "").split(",")
+            if a.strip()
+        ]
         task_router = TaskRouter(
-            default=engine_aliases[0],
-            chat=self.router_chat,
-            plan=self.router_plan,
-            summarize=self.router_summarize,
-            consolidate=self.router_consolidate,
-            embed=self.router_embed,
-            eval=self.router_eval,
-            route=self.router_route,
-            fallback=fallback_chain,
+            default     = self.router_default or aliases[0],
+            chat        = self.router_chat,
+            plan        = self.router_plan,
+            summarize   = self.router_summarize,
+            consolidate = self.router_consolidate,
+            embed       = self.router_embed,
+            eval        = self.router_eval,
+            route       = self.router_route,
+            fallback    = fallback,
         )
 
         router = LLMRouter(registry, task_router)
-        import structlog
-        structlog.get_logger(__name__).info(
-            "router.built",
-            engines=engine_aliases,
-            fallback=fallback_chain,
-        )
+        log.info("router.built", engines=aliases, fallback=fallback)
         return router
-
-    def build_llm_engine(self) -> Any:
-        """根据 LLM_PROVIDER 实例化对应的 LLMEngine。"""
-        from llm.engines import AnthropicEngine, OpenAIEngine, MockLLMEngine
-
-        cfg = self.llm_config()
-        api_key  = self.effective_api_key() or cfg.resolved_api_key()
-        base_url = self.effective_base_url()
-        model    = self.effective_model()
-        emb_model = cfg.resolved_embedding_model()
-        sum_model = cfg.resolved_summarize_model()
-
-        log.info("llm.engine.init",
-                 provider=self.llm_provider,
-                 model=model,
-                 base_url=base_url or "(default)",
-                 embedding_model=emb_model or "(none)")
-
-        if self.llm_provider == "anthropic":
-            return AnthropicEngine(
-                api_key=api_key,
-                default_model=model,
-                summarize_model=sum_model,
-                max_tokens=cfg.max_tokens,
-                timeout_sec=cfg.timeout_sec,
-                max_retries=cfg.max_retries,
-                http_proxy=cfg.http_proxy,
-            )
-
-        if self.llm_provider == "azure":
-            return OpenAIEngine(
-                api_key=api_key,
-                base_url=cfg.azure_endpoint,
-                default_model=cfg.azure_deployment or model,
-                embedding_model=emb_model,
-                summarize_model=sum_model,
-                max_tokens=cfg.max_tokens,
-                timeout_sec=cfg.timeout_sec,
-                max_retries=cfg.max_retries,
-                http_proxy=cfg.http_proxy,
-                azure_api_version=cfg.azure_api_version,
-                is_azure=True,
-            )
-
-        if self.llm_provider in ("openai", "deepseek", "groq", "ollama", "custom"):
-            return OpenAIEngine(
-                api_key=api_key,
-                base_url=base_url,
-                default_model=model,
-                embedding_model=emb_model,
-                summarize_model=sum_model,
-                max_tokens=cfg.max_tokens,
-                timeout_sec=cfg.timeout_sec,
-                max_retries=cfg.max_retries,
-                http_proxy=cfg.http_proxy,
-            )
-
-        # fallback
-        log.warning("llm.engine.unknown_provider", provider=self.llm_provider)
-        return MockLLMEngine()
 
     def build_container(self):
         """根据配置自动装配 AgentContainer。"""
@@ -437,29 +301,29 @@ class Settings(BaseSettings):
         from prompt_mgr.manager import PromptRegistry, ABTestRouter, PromptRenderer
         from utils.cost import CostTracker, QuotaManager, ModelDowngrader
 
-        cost_tracker    = CostTracker()
-        quota_manager   = QuotaManager(cost_tracker)
+        cost_tracker     = CostTracker()
+        quota_manager    = QuotaManager(cost_tracker)
         model_downgrader = ModelDowngrader(quota_manager)
-        registry_pm     = PromptRegistry()
-        ab_router       = ABTestRouter(registry_pm)
-        prompt_renderer = PromptRenderer(registry_pm, ab_router)
+        registry_pm      = PromptRegistry()
+        ab_router        = ABTestRouter(registry_pm)
+        prompt_renderer  = PromptRenderer(registry_pm, ab_router)
 
         c = AgentContainer(
-            llm_engine=llm,
-            short_term_memory=stm,
-            long_term_memory=ltm,
-            skill_registry=registry,
-            mcp_hub=DefaultMCPHub(),
-            context_manager=PriorityContextManager(llm_engine=llm),
-            orchestrator_type=self.orchestrator_type,
-            security_manager=SecurityManager(),
-            cost_tracker=cost_tracker,
-            quota_manager=quota_manager,
-            model_downgrader=model_downgrader,
-            feedback_store=FeedbackStore(),
-            tenant_manager=TenantManager(),
-            task_queue=TaskQueue(),
-            prompt_renderer=prompt_renderer,
+            llm_engine        = llm,
+            short_term_memory = stm,
+            long_term_memory  = ltm,
+            skill_registry    = registry,
+            mcp_hub           = DefaultMCPHub(),
+            context_manager   = PriorityContextManager(llm_engine=llm),
+            orchestrator_type = self.orchestrator_type,
+            security_manager  = SecurityManager(),
+            cost_tracker      = cost_tracker,
+            quota_manager     = quota_manager,
+            model_downgrader  = model_downgrader,
+            feedback_store    = FeedbackStore(),
+            tenant_manager    = TenantManager(),
+            task_queue        = TaskQueue(),
+            prompt_renderer   = prompt_renderer,
         )
         return c.build()
 
@@ -467,8 +331,13 @@ class Settings(BaseSettings):
 # ── 单例 ──────────────────────────────────────────────────────────
 _settings: Settings | None = None
 
+
 def get_settings() -> Settings:
     global _settings
     if _settings is None:
         _settings = Settings()
     return _settings
+
+
+# ── 类型别名（方便外部 import）────────────────────────────────────
+from utils.llm_config import LLMConfig, RouterConfig, SDK_DEFAULTS, VENDOR_BASE_URLS  # noqa: E402, F401
