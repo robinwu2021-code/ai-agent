@@ -1,0 +1,57 @@
+# ClawHub Skill Manifest v1
+name: agent_bi
+version: "1.0.0"
+description: |
+  门店 BI 数据查询工具，调用 /v1/report/agent_bi 接口获取门店经营指标数据。
+  支持查询销售额、订单量、客单价、会员数、退款、支付方式等 25+ 项指标。
+
+  使用说明：
+  - store_id: 门店 ID（可选，不传则查所有门店汇总）
+  - metrics: 要查询的指标名列表，为空则默认返回常用核心指标
+  - aggregation: 统计方式 SUM/AVG/MAX/MIN/COUNT，默认 SUM
+  - date_start / date_end: 日期字符串（如 "2024-03-01" 或 "today" "yesterday"
+    "last_7_days" "this_month" "last_month"），Skill 自动转为毫秒时间戳
+author: "hub/local"
+tags: [bi, report, analytics, sales, store, metrics]
+permission: read
+timeout_ms: 10000
+entrypoint: AgentBISkill
+
+input_schema:
+  type: object
+  properties:
+    store_id:
+      type: string
+      description: "门店 ID（braId），不传则查询所有门店汇总"
+    metrics:
+      type: array
+      items:
+        type: string
+      description: |
+        要查询的指标列表，可选值：
+        turnover, actual_income, actual_income_no_tips, tips_amount,
+        order_quantity, average_order_price, customer_number,
+        dining_room_amount, togo_amount, store_delivery_amount,
+        discount_amount, discount_ratio,
+        member_quantity, new_member_number, first_member_number,
+        second_member_number, regular_member_number,
+        refund_amount, refunded_quantity,
+        pay_by_cash, pay_by_card, pay_by_online, pay_by_savings, pos_amount,
+        amount_not_taxed, vat
+        为空时默认返回：turnover, order_quantity, average_order_price, customer_number
+    aggregation:
+      type: string
+      enum: [SUM, AVG, MAX, MIN, COUNT]
+      description: "聚合函数，默认 SUM"
+    date_start:
+      type: string
+      description: |
+        查询开始日期，支持：
+        - ISO 日期字符串，如 "2024-03-01"
+        - 快捷词：today, yesterday, last_7_days, last_30_days, this_month, last_month
+    date_end:
+      type: string
+      description: |
+        查询结束日期（含当天），支持格式同 date_start。
+        省略时默认与 date_start 相同（查单天）
+  required: []
