@@ -1,11 +1,14 @@
 """
 tests/test_ollama_qwen3.py — ollama-qwen3 配置验证测试
 
+所有连接参数（base_url、model、max_tokens 等）均从 llm.yaml 读取，
+测试代码中不硬编码任何配置值。
+
 分两层：
-  TestOllamaConfig     单元测试：解析 llm.yaml，验证字段正确，不发网络请求
-  TestOllamaLive       集成测试：真实调用 Ollama，验证服务可达且模型可用
-                        默认跳过，需要 --run-live 参数才执行：
-                          pytest tests/test_ollama_qwen3.py --run-live -v
+  TestOllamaConfig  单元测试：解析 llm.yaml，验证字段结构与类型，不发网络请求
+  TestOllamaLive    集成测试：真实调用 Ollama，验证服务可达且模型可用
+                    默认跳过，需要 --run-live 参数才执行：
+                      pytest tests/test_ollama_qwen3.py --run-live -v
 """
 from __future__ import annotations
 
@@ -13,12 +16,34 @@ import pathlib
 import pytest
 from core.models import AgentConfig, Message, MessageRole
 
-# llm.yaml 路径：项目根目录
 YAML_PATH = pathlib.Path(__file__).parent.parent / "llm.yaml"
+ALIAS     = "ollama-qwen3"
+
+
+# ── 共享 fixtures ─────────────────────────────────────────────────
 
 @pytest.fixture(scope="session")
 def run_live(request):
     return request.config.getoption("--run-live", default=False)
+
+
+@pytest.fixture(scope="session")
+def ollama_cfg():
+    """从 llm.yaml 加载 ollama-qwen3 的 LLMConfig，整个 session 只解析一次。"""
+    from utils.llm_config import load_from_yaml
+    configs, _ = load_from_yaml(YAML_PATH)
+    cfg = next((c for c in configs if c.alias == ALIAS), None)
+    assert cfg is not None, (
+        f"llm.yaml 中未找到 alias='{ALIAS}'，"
+        f"当前 aliases: {[c.alias for c in configs]}"
+    )
+    return cfg
+
+
+@pytest.fixture(scope="session")
+def engine(ollama_cfg):
+    """基于 llm.yaml 中的配置构建引擎实例。"""
+    return ollama_cfg.build_engine()
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -27,42 +52,34 @@ def run_live(request):
 
 class TestOllamaConfig:
 
-    @pytest.fixture(scope="class")
-    def ollama_cfg(self):
-        from utils.llm_config import load_from_yaml
-        configs, router_cfg = load_from_yaml(YAML_PATH)
-        match = next((c for c in configs if c.alias == "ollama-qwen3"), None)
-        assert match is not None, (
-            f"llm.yaml 中未找到 alias='ollama-qwen3'，"
-            f"当前 aliases: {[c.alias for c in configs]}"
-        )
-        return match
-
     def test_yaml_exists(self):
         assert YAML_PATH.exists(), f"llm.yaml 不存在: {YAML_PATH}"
 
-    def test_alias(self, ollama_cfg):
-        assert ollama_cfg.alias == "ollama-qwen3"
+    def test_alias_found(self, ollama_cfg):
+        assert ollama_cfg.alias == ALIAS
 
     def test_sdk_is_openai_compatible(self, ollama_cfg):
         assert ollama_cfg.sdk == "openai_compatible"
 
-    def test_base_url(self, ollama_cfg):
-        assert ollama_cfg.base_url == "http://192.168.0.222:11434/v1"
+    def test_base_url_is_set(self, ollama_cfg):
+        assert ollama_cfg.base_url, "base_url 不能为空"
+        assert ollama_cfg.base_url.startswith("http"), "base_url 应以 http 开头"
 
-    def test_model(self, ollama_cfg):
-        assert ollama_cfg.model == "qwen3.5:35b-a3b"
+    def test_model_is_set(self, ollama_cfg):
+        assert ollama_cfg.model, "model 不能为空"
+        assert ollama_cfg.resolved_model() == ollama_cfg.model
 
-    def test_resolved_model(self, ollama_cfg):
-        assert ollama_cfg.resolved_model() == "qwen3.5:35b-a3b"
+    def test_max_tokens_positive(self, ollama_cfg):
+        assert ollama_cfg.max_tokens > 0
 
-    def test_max_tokens(self, ollama_cfg):
-        assert ollama_cfg.max_tokens == 8192
+    def test_timeout_sufficient_for_large_model(self, ollama_cfg):
+        # 大模型推理慢，超时至少应 >= 60s
+        assert ollama_cfg.timeout_sec >= 60.0, (
+            f"timeout_sec={ollama_cfg.timeout_sec} 对本地大模型过短，建议 >= 60s"
+        )
 
-    def test_timeout(self, ollama_cfg):
-        assert ollama_cfg.timeout_sec == 300.0
-
-    def test_cost_tier(self, ollama_cfg):
+    def test_cost_tier_is_local(self, ollama_cfg):
+        # 本地模型 cost_tier 应为 0
         assert ollama_cfg.cost_tier == 0
 
     def test_supports_tools(self, ollama_cfg):
@@ -70,19 +87,17 @@ class TestOllamaConfig:
 
     def test_tags_contain_local(self, ollama_cfg):
         assert "local" in ollama_cfg.tags
-        assert "qwen" in ollama_cfg.tags
 
     def test_no_api_key_required(self, ollama_cfg):
         # Ollama 本地服务不需要 api_key
-        assert ollama_cfg.api_key is None
+        assert not ollama_cfg.api_key, "Ollama 本地服务不应配置 api_key"
 
     def test_is_not_azure(self, ollama_cfg):
         assert ollama_cfg.is_azure is False
 
     def test_build_engine_returns_openai_engine(self, ollama_cfg):
         from llm.engines import OpenAIEngine
-        engine = ollama_cfg.build_engine()
-        assert isinstance(engine, OpenAIEngine)
+        assert isinstance(ollama_cfg.build_engine(), OpenAIEngine)
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -91,40 +106,43 @@ class TestOllamaConfig:
 
 class TestOllamaLive:
 
-    @pytest.fixture(scope="class")
-    def engine(self):
-        from utils.llm_config import load_from_yaml
-        configs, _ = load_from_yaml(YAML_PATH)
-        cfg = next(c for c in configs if c.alias == "ollama-qwen3")
-        return cfg.build_engine()
-
     @pytest.mark.anyio
-    async def test_service_reachable(self, engine, run_live):
+    async def test_service_reachable(self, ollama_cfg, run_live):
+        """验证 Ollama 服务可达（地址来自 llm.yaml）。"""
         if not run_live:
             pytest.skip("跳过集成测试，需加 --run-live 参数")
 
         import httpx
+        # base_url 形如 http://host:port/v1，取 host:port 部分拼 /api/tags
+        origin = ollama_cfg.base_url.rstrip("/").rsplit("/v1", 1)[0]
+        tags_url = f"{origin}/api/tags"
+
         async with httpx.AsyncClient(timeout=10.0) as client:
             try:
-                resp = await client.get("http://192.168.0.222:11434/api/tags")
+                resp = await client.get(tags_url)
                 assert resp.status_code == 200, f"Ollama 服务响应异常: {resp.status_code}"
             except httpx.ConnectError:
-                pytest.fail("无法连接 Ollama 服务 http://192.168.0.222:11434，请确认服务已启动")
+                pytest.fail(f"无法连接 Ollama 服务 {origin}，请确认服务已启动")
 
     @pytest.mark.anyio
-    async def test_model_loaded(self, run_live):
-        """验证 qwen3.5:35b-a3b 已在 Ollama 中加载。"""
+    async def test_model_loaded(self, ollama_cfg, run_live):
+        """验证 llm.yaml 中配置的模型已在 Ollama 中加载。"""
         if not run_live:
             pytest.skip("跳过集成测试，需加 --run-live 参数")
 
         import httpx
+        origin   = ollama_cfg.base_url.rstrip("/").rsplit("/v1", 1)[0]
+        tags_url = f"{origin}/api/tags"
+        model    = ollama_cfg.resolved_model()
+
         async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.get("http://192.168.0.222:11434/api/tags")
+            resp   = await client.get(tags_url)
             models = [m["name"] for m in resp.json().get("models", [])]
-            assert any("qwen3.5" in m for m in models), (
-                f"模型 qwen3.5:35b-a3b 未在 Ollama 中找到，"
+            # 模型名前缀匹配（如 "qwen3.5:35b-a3b" 匹配 "qwen3.5:35b-a3b:latest"）
+            assert any(m.startswith(model.split(":")[0]) for m in models), (
+                f"模型 {model!r} 未在 Ollama 中找到\n"
                 f"已加载模型: {models}\n"
-                f"请先运行: ollama pull qwen3.5:35b-a3b"
+                f"请先运行: ollama pull {model}"
             )
 
     @pytest.mark.anyio
@@ -134,9 +152,7 @@ class TestOllamaLive:
             pytest.skip("跳过集成测试，需加 --run-live 参数")
 
         messages = [Message(role=MessageRole.USER, content="用一个词回答：天空是什么颜色？")]
-        config   = AgentConfig()
-
-        resp = await engine.chat(messages, [], config)
+        resp = await engine.chat(messages, [], AgentConfig())
 
         assert resp.content, "响应内容不能为空"
         assert len(resp.content.strip()) > 0
@@ -150,23 +166,21 @@ class TestOllamaLive:
             pytest.skip("跳过集成测试，需加 --run-live 参数")
 
         messages = [Message(role=MessageRole.USER, content="Hi")]
-        config   = AgentConfig()
-
-        resp = await engine.chat(messages, [], config)
+        resp = await engine.chat(messages, [], AgentConfig())
         assert resp.model, "响应中 model 字段不能为空"
 
     @pytest.mark.anyio
-    async def test_chat_respects_max_tokens(self, engine, run_live):
-        """验证 max_tokens 限制生效（completion_tokens 不超过配置值）。"""
+    async def test_chat_respects_max_tokens(self, ollama_cfg, engine, run_live):
+        """验证 completion_tokens 不超过 llm.yaml 中配置的 max_tokens。"""
         if not run_live:
             pytest.skip("跳过集成测试，需加 --run-live 参数")
 
         messages = [Message(role=MessageRole.USER, content="写一首很长的诗")]
-        config   = AgentConfig()
-
-        resp = await engine.chat(messages, [], config)
+        resp = await engine.chat(messages, [], AgentConfig())
         completion = resp.usage.get("completion_tokens", 0)
-        assert completion <= 8192, f"completion_tokens={completion} 超过 max_tokens=8192"
+        assert completion <= ollama_cfg.max_tokens, (
+            f"completion_tokens={completion} 超过 max_tokens={ollama_cfg.max_tokens}"
+        )
 
     @pytest.mark.anyio
     async def test_stream_chat(self, engine, run_live):
@@ -175,12 +189,9 @@ class TestOllamaLive:
             pytest.skip("跳过集成测试，需加 --run-live 参数")
 
         messages = [Message(role=MessageRole.USER, content="说一个数字")]
-        config   = AgentConfig()
-
         chunks = []
-        async for chunk in engine.stream_chat(messages, [], config):
+        async for chunk in engine.stream_chat(messages, [], AgentConfig()):
             chunks.append(chunk)
 
         assert len(chunks) > 0, "流式输出应至少返回一个 chunk"
-        full_text = "".join(chunks)
-        assert len(full_text.strip()) > 0, "流式输出内容不能为空"
+        assert len("".join(chunks).strip()) > 0, "流式输出内容不能为空"
