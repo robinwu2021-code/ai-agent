@@ -54,6 +54,10 @@ class ChatRequest(BaseModel):
     user_id:    str   = Field("default_user", description="用户 ID")
     session_id: str | None = Field(None, description="会话 ID，为空则自动生成")
     max_steps:  int   = Field(10, description="最大工具调用步数")
+    skills:     list[str] | None = Field(
+        None,
+        description="限定本次请求可使用的 Skill 名称列表；为空则使用全部已注册 Skill",
+    )
 
 
 class ChatResponse(BaseModel):
@@ -121,20 +125,28 @@ def _build_container(engine_alias: str | None = None):
     )
     llm_router = LLMRouter(registry=registry, task_router=task_router)
 
-    # Skill 注册表
+    # Skill 注册表：内置 Skill
+    from skills.loader import SkillLoader
     skill_registry = LocalSkillRegistry()
-    skill_registry.register(WeatherCurrentSkill(provider="wttr.in"))
-    skill_registry.register(WeatherForecastSkill(provider="wttr.in"))
-    skill_registry.register(CalculatorSkill())
-    skill_registry.register(HttpRequestSkill())
-    try:
-        skill_registry.register(PythonExecutorSkill())
-    except Exception:
-        pass
-    try:
-        skill_registry.register(WebSearchSkill())
-    except Exception:
-        pass
+    for builtin in [
+        WeatherCurrentSkill(provider="wttr.in"),
+        WeatherForecastSkill(provider="wttr.in"),
+        CalculatorSkill(),
+        HttpRequestSkill(),
+    ]:
+        skill_registry.register(builtin)
+    for optional_cls in [PythonExecutorSkill, WebSearchSkill]:
+        try:
+            skill_registry.register(optional_cls())
+        except Exception:
+            pass
+
+    # Hub Skill：自动发现并加载 skills/hub/ 下的所有 Skill 包
+    for hub_skill in SkillLoader.load_all():
+        try:
+            skill_registry.register(hub_skill)
+        except Exception as e:
+            log.warning("server.hub_skill_skip", name=getattr(hub_skill, "descriptor", None) and hub_skill.descriptor.name, error=str(e))
 
     container = AgentContainer(
         llm_router        = llm_router,
@@ -149,10 +161,21 @@ def _build_container(engine_alias: str | None = None):
 
 # ── 核心：运行 Agent，收集事件 ─────────────────────────────────────
 
+def _get_container(skills: list[str] | None):
+    """返回适合本次请求的容器：若指定了 skills 则使用过滤后的注册表副本。"""
+    if not skills:
+        return _container
+    import dataclasses
+    from skills.loader import FilteredSkillRegistry
+    filtered = FilteredSkillRegistry(_container.skill_registry, set(skills))
+    return dataclasses.replace(_container, skill_registry=filtered)
+
+
 async def _run_agent(req: ChatRequest):
-    """返回 (reply, usage, steps) 三元组。"""
+    """返回 (session_id, reply, usage, steps) 四元组。"""
     from core.models import AgentConfig
 
+    container  = _get_container(req.skills)
     session_id = req.session_id or f"sess_{uuid.uuid4().hex[:8]}"
     config     = AgentConfig(stream=False, max_steps=req.max_steps)
 
@@ -160,7 +183,7 @@ async def _run_agent(req: ChatRequest):
     steps:       list[dict] = []
     usage:       dict       = {}
 
-    async for ev in _container.agent().run(
+    async for ev in container.agent().run(
         user_id    = req.user_id,
         session_id = session_id,
         text       = req.text,
@@ -190,13 +213,13 @@ async def _stream_agent(req: ChatRequest) -> AsyncIterator[str]:
     """生成 SSE 事件流。"""
     from core.models import AgentConfig
 
+    container  = _get_container(req.skills)
     session_id = req.session_id or f"sess_{uuid.uuid4().hex[:8]}"
     config     = AgentConfig(stream=True, max_steps=req.max_steps)
 
-    # 首先推送 session_id
     yield f"data: {json.dumps({'type': 'session', 'session_id': session_id}, ensure_ascii=False)}\n\n"
 
-    async for ev in _container.agent().run(
+    async for ev in container.agent().run(
         user_id    = req.user_id,
         session_id = session_id,
         text       = req.text,
@@ -277,15 +300,20 @@ async def chat_stream(req: ChatRequest):
 
 @app.get("/skills", summary="列出已注册的 Skill")
 async def list_skills():
-    """返回当前已注册的所有 Skill 列表。"""
+    """返回当前已注册的所有 Skill 列表（含 hub 扩展 Skill）。"""
     if _container is None:
         raise HTTPException(status_code=503, detail="服务未初始化")
+    from skills.loader import SkillLoader, HUB_DIR
+    hub_names = set()
+    for m in SkillLoader.manifests():
+        hub_names.add(m.get("name", ""))
     return {
         "skills": [
             {
                 "name":        d.name,
                 "description": d.description,
                 "tags":        d.tags,
+                "source":      "hub" if d.name in hub_names else "builtin",
             }
             for d in _container.skill_registry.list_descriptors()
         ]
@@ -320,14 +348,20 @@ def main():
     print("正在初始化 Agent 容器（加载 llm.yaml）…")
     _container = _build_container(args.engine)
 
-    skills = [d.name for d in _container.skill_registry.list_descriptors()]
-    print(f"  已注册 Skill: {skills}")
+    from skills.loader import SkillLoader
+    hub_names  = {m.get("name") for m in SkillLoader.manifests()}
+    all_skills = _container.skill_registry.list_descriptors()
+    builtin    = [d.name for d in all_skills if d.name not in hub_names]
+    hub        = [d.name for d in all_skills if d.name in hub_names]
+    print(f"  内置 Skill ({len(builtin)}): {builtin}")
+    print(f"  Hub  Skill ({len(hub)}):  {hub}")
     print(f"\n服务地址:")
-    print(f"  普通请求:  http://{args.host}:{args.port}/chat")
-    print(f"  流式请求:  http://{args.host}:{args.port}/chat/stream")
-    print(f"  Skill 列表: http://{args.host}:{args.port}/skills")
-    print(f"  健康检查:  http://{args.host}:{args.port}/health")
-    print(f"  API 文档:  http://{args.host}:{args.port}/docs\n")
+    print(f"  普通请求(POST): http://{args.host}:{args.port}/chat")
+    print(f"  普通请求(GET):  http://{args.host}:{args.port}/chat?text=你好")
+    print(f"  流式请求:       http://{args.host}:{args.port}/chat/stream")
+    print(f"  Skill 列表:     http://{args.host}:{args.port}/skills")
+    print(f"  健康检查:       http://{args.host}:{args.port}/health")
+    print(f"  API 文档:       http://{args.host}:{args.port}/docs\n")
 
     uvicorn.run(
         app,

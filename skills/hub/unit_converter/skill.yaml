@@ -1,0 +1,25 @@
+# ClawHub Skill Manifest v1
+name: unit_converter
+version: "1.0.0"
+description: |
+  单位换算工具。支持长度、重量、温度、面积、体积、速度六大类别。
+  无需网络，本地计算。
+author: "hub/local"
+tags: [unit, convert, math, measurement]
+permission: read
+timeout_ms: 1000
+entrypoint: UnitConverterSkill
+
+input_schema:
+  type: object
+  properties:
+    value:
+      type: number
+      description: "要换算的数值"
+    from_unit:
+      type: string
+      description: "源单位，如 km、kg、celsius、m2、liter、kmh"
+    to_unit:
+      type: string
+      description: "目标单位，如 mile、lb、fahrenheit、ft2、gallon、mph"
+  required: [value, from_unit, to_unit]

@@ -1,0 +1,25 @@
+# ClawHub Skill Manifest v1
+name: text_translate
+version: "1.0.0"
+description: |
+  文本翻译工具。调用 MyMemory 免费翻译 API，支持中英日韩法德西等主流语言互译。
+  source_lang 留空时自动检测源语言。
+author: "hub/local"
+tags: [translate, language, text, nlp]
+permission: read
+timeout_ms: 15000
+entrypoint: TextTranslateSkill
+
+input_schema:
+  type: object
+  properties:
+    text:
+      type: string
+      description: "要翻译的文本"
+    target_lang:
+      type: string
+      description: "目标语言代码，如 zh（中文）、en（英文）、ja（日文）、ko（韩文）、fr（法文）、de（德文）、es（西班牙文）"
+    source_lang:
+      type: string
+      description: "源语言代码，留空自动检测"
+  required: [text, target_lang]

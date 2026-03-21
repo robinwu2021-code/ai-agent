@@ -1,0 +1,24 @@
+# ClawHub Skill Manifest v1
+name: stock_price
+version: "1.0.0"
+description: |
+  查询股票/ETF 实时或当日行情。数据来源：Yahoo Finance（免费，无需 API Key）。
+  A 股代码加后缀：上交所 .SS（如 600036.SS），深交所 .SZ（如 000001.SZ）。
+  港股后缀 .HK，美股直接写代码（如 AAPL、TSLA）。
+author: "hub/local"
+tags: [stock, finance, market, price]
+permission: read
+timeout_ms: 15000
+entrypoint: StockPriceSkill
+
+input_schema:
+  type: object
+  properties:
+    symbol:
+      type: string
+      description: "股票代码，如 AAPL、TSLA、0700.HK、600036.SS、000001.SZ"
+    info:
+      type: string
+      enum: [price, detail]
+      description: "price=仅价格（快速），detail=详细信息，默认 price"
+  required: [symbol]

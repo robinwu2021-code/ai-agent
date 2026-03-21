@@ -1,0 +1,25 @@
+# ClawHub Skill Manifest v1
+name: currency_exchange
+version: "1.0.0"
+description: |
+  查询实时汇率并进行货币换算。数据来源：Frankfurter API（欧洲央行汇率，每日更新）。
+  支持 USD、EUR、CNY、JPY、GBP、HKD、KRW 等主流货币。
+author: "hub/local"
+tags: [currency, exchange, finance, money]
+permission: read
+timeout_ms: 10000
+entrypoint: CurrencyExchangeSkill
+
+input_schema:
+  type: object
+  properties:
+    amount:
+      type: number
+      description: "要换算的金额，默认 1"
+    from_currency:
+      type: string
+      description: "源货币代码，如 USD、EUR、CNY"
+    to_currency:
+      type: string
+      description: "目标货币代码，如 CNY、USD，支持逗号分隔多个（如 CNY,JPY,EUR）"
+  required: [from_currency, to_currency]

@@ -1,0 +1,35 @@
+# ClawHub Skill Manifest v1
+name: datetime_tool
+version: "1.0.0"
+description: |
+  查询当前日期时间、进行日期加减运算、计算两个日期之差、查询某天是星期几。
+  支持时区转换，默认使用 Asia/Shanghai。
+author: "hub/local"
+tags: [datetime, time, timezone, date]
+permission: read
+timeout_ms: 3000
+entrypoint: DatetimeSkill
+
+input_schema:
+  type: object
+  properties:
+    action:
+      type: string
+      enum: [now, diff, add, weekday]
+      description: "now=当前时间, diff=两日期相差天数, add=日期加减, weekday=查询星期"
+    timezone:
+      type: string
+      description: "IANA 时区名称，如 Asia/Shanghai、UTC、America/New_York，默认 Asia/Shanghai"
+    date1:
+      type: string
+      description: "日期字符串 YYYY-MM-DD（diff/weekday 时使用）"
+    date2:
+      type: string
+      description: "第二个日期字符串 YYYY-MM-DD（diff 时使用）"
+    days:
+      type: integer
+      description: "要加减的天数（add 时使用，负数为减）"
+    base_date:
+      type: string
+      description: "基准日期 YYYY-MM-DD（add 时使用，默认今天）"
+  required: [action]
