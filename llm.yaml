@@ -1,0 +1,111 @@
+# llm.yaml — LLM 引擎实例配置
+#
+# 优先级：llm.yaml > 环境变量(ENGINE_ALIASES) > LLM_* 单引擎变量
+#
+# 值支持 ${ENV_VAR} 语法做环境变量插值，api_key 等敏感信息建议通过此方式引入，
+# 不要将真实密钥直接写入此文件。
+#
+# 将此文件复制为 llm.yaml 并按需修改，或通过 LLM_CONFIG_FILE 指定其他路径。
+# ----------------------------------------------------------------------
+
+engines:
+
+  # ── Anthropic Claude（主账号，旗舰模型）─────────────────────────
+  - alias: claude-smart
+    sdk: anthropic
+    api_key: ${ANTHROPIC_API_KEY}
+    model: claude-sonnet-4-20250514
+    max_tokens: 8192
+    cost_tier: 2
+    supports_tools: true
+    tags: [primary, reasoning]
+
+  # ── Anthropic Claude（快速/低成本模型）──────────────────────────
+  - alias: claude-fast
+    sdk: anthropic
+    api_key: ${ANTHROPIC_API_KEY}          # 同账号不同模型，共享同一 key
+    model: claude-haiku-4-5-20251001
+    max_tokens: 4096
+    cost_tier: 1
+    tags: [fast, summarize]
+
+  # ── Anthropic Claude（备用账号，用于容灾或隔离配额）────────────
+  # - alias: claude-backup
+  #   sdk: anthropic
+  #   api_key: ${ANTHROPIC_API_KEY_BACKUP}  # 不同账号，不同 key
+  #   model: claude-sonnet-4-20250514
+  #   cost_tier: 2
+  #   tags: [backup]
+
+  # ── Azure OpenAI（东区部署，支持 Embedding）────────────────────
+  # - alias: azure-east
+  #   sdk: openai_compatible
+  #   api_key: ${AZURE_API_KEY_EAST}
+  #   base_url: https://my-east.openai.azure.com/openai/deployments/gpt4o
+  #   model: gpt-4o
+  #   is_azure: true
+  #   azure_api_version: "2024-02-01"
+  #   supports_embed: true
+  #   cost_tier: 2
+  #   tags: [azure, embed]
+
+  # ── Azure OpenAI（西区备用部署，不同 key 和地址）──────────────
+  # - alias: azure-west
+  #   sdk: openai_compatible
+  #   api_key: ${AZURE_API_KEY_WEST}        # 不同账号/订阅，不同 key
+  #   base_url: https://my-west.openai.azure.com/openai/deployments/gpt4o-mini
+  #   model: gpt-4o-mini
+  #   is_azure: true
+  #   cost_tier: 1
+  #   tags: [azure, backup]
+
+  # ── DeepSeek（OpenAI 兼容接口）─────────────────────────────────
+  # - alias: deepseek-chat
+  #   sdk: openai_compatible
+  #   api_key: ${DEEPSEEK_API_KEY}
+  #   base_url: https://api.deepseek.com/v1
+  #   model: deepseek-chat
+  #   cost_tier: 1
+  #   tags: [cheap, fallback]
+
+  # ── Groq（超快推理）────────────────────────────────────────────
+  # - alias: groq-fast
+  #   sdk: openai_compatible
+  #   api_key: ${GROQ_API_KEY}
+  #   base_url: https://api.groq.com/openai/v1
+  #   model: llama-3.3-70b-versatile
+  #   cost_tier: 1
+  #   tags: [fast, fallback]
+
+  # ── 本地 Ollama（无需 key）────────────────────────────────────
+  # - alias: ollama-local
+  #   sdk: openai_compatible
+  #   base_url: http://localhost:11434/v1
+  #   model: llama3.2
+  #   cost_tier: 0
+  #   tags: [local, offline]
+
+
+router:
+  # 所有未覆盖任务类型的回落引擎
+  default: claude-smart
+
+  # ── 按任务类型路由（留空则回落 default）──────────────────────
+  chat: claude-smart          # 主推理对话（ReAct 循环）
+  plan: claude-smart          # Plan-Execute 规划阶段
+  summarize: claude-fast      # 文本摘要/上下文裁剪（用便宜模型）
+  consolidate: claude-fast    # 记忆固化提炼
+  # embed: azure-east         # 向量化（需要支持 embedding 的引擎）
+  # eval: claude-fast         # LLM-as-judge 打分
+  # route: claude-fast        # Multi-Agent 路由决策
+
+  # ── Fallback 链（主引擎失败后按序尝试）──────────────────────
+  fallback:
+    - claude-fast
+    # - deepseek-chat
+    # - groq-fast
+
+  # ── 工作流节点级覆盖（比任务类型更细粒度，可选）─────────────
+  # node_overrides:
+  #   react_final: claude-smart     # 最后一步用旗舰模型
+  #   plan_generate: claude-smart   # 生成计划用旗舰模型

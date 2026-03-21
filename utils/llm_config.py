@@ -96,7 +96,9 @@ utils/llm_config.py — LLM 引擎实例配置
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Literal
 
 import structlog
@@ -233,6 +235,43 @@ class LLMConfig:
         )
 
     @classmethod
+    def from_dict(cls, data: dict) -> "LLMConfig":
+        """
+        从字典构建实例配置（通常来自 llm.yaml 解析结果）。
+        字典中的字符串值若包含 ${ENV_VAR}，会自动替换为对应环境变量值。
+        """
+        d = {k: _expand_env(v) for k, v in data.items()}
+
+        alias   = d.get("alias", "")
+        sdk_raw = d.get("sdk", "anthropic")
+        if sdk_raw not in ("anthropic", "openai_compatible"):
+            raise ValueError(
+                f"[{alias}] sdk 必须是 anthropic | openai_compatible，"
+                f"得到: {sdk_raw!r}"
+            )
+
+        return cls(
+            alias             = alias,
+            sdk               = sdk_raw,              # type: ignore[arg-type]
+            api_key           = d.get("api_key") or None,
+            base_url          = d.get("base_url") or None,
+            model             = d.get("model") or None,
+            embedding_model   = d.get("embedding_model") or None,
+            summarize_model   = d.get("summarize_model") or None,
+            max_tokens        = int(d.get("max_tokens", 4096)),
+            timeout_sec       = float(d.get("timeout_sec", 120.0)),
+            max_retries       = int(d.get("max_retries", 3)),
+            temperature       = float(d.get("temperature", 0.7)),
+            http_proxy        = d.get("http_proxy") or None,
+            is_azure          = bool(d.get("is_azure", False)),
+            azure_api_version = d.get("azure_api_version", "2024-02-01"),
+            cost_tier         = int(d.get("cost_tier", 2)),
+            supports_embed    = bool(d.get("supports_embed", False)),
+            supports_tools    = bool(d.get("supports_tools", True)),
+            tags              = list(d.get("tags", [])),
+        )
+
+    @classmethod
     def from_env(cls, alias: str) -> "LLMConfig":
         """
         从环境变量读取实例配置。
@@ -313,6 +352,32 @@ class RouterConfig:
     fallback: list[str] = field(default_factory=list)
 
     @classmethod
+    def from_dict(cls, data: dict, default_alias: str) -> "RouterConfig":
+        """从字典构建路由规则（通常来自 llm.yaml 的 router 节）。"""
+        d = {k: _expand_env(v) if isinstance(v, str) else v for k, v in data.items()}
+
+        fallback_raw = d.get("fallback", [])
+        fallback = (
+            [a.strip() for a in fallback_raw.split(",") if a.strip()]
+            if isinstance(fallback_raw, str)
+            else list(fallback_raw)
+        )
+
+        return cls(
+            default        = d.get("default", default_alias),
+            chat           = d.get("chat"),
+            plan           = d.get("plan"),
+            summarize      = d.get("summarize"),
+            consolidate    = d.get("consolidate"),
+            embed          = d.get("embed"),
+            rerank         = d.get("rerank"),
+            eval           = d.get("eval"),
+            route          = d.get("route"),
+            node_overrides = dict(d.get("node_overrides") or {}),
+            fallback       = fallback,
+        )
+
+    @classmethod
     def from_env(cls, default_alias: str) -> "RouterConfig":
         """从 ROUTER_* 环境变量读取路由规则。"""
         def _get(key: str) -> str | None:
@@ -333,3 +398,83 @@ class RouterConfig:
             route       = _get("ROUTE"),
             fallback    = fallback,
         )
+
+
+# ─────────────────────────────────────────────────────────────────
+# 工具函数
+# ─────────────────────────────────────────────────────────────────
+
+_ENV_VAR_RE = re.compile(r"\$\{([^}]+)\}")
+
+
+def _expand_env(value: Any) -> Any:
+    """
+    将字符串中的 ${VAR_NAME} 替换为对应的环境变量值。
+    非字符串值原样返回。未定义的环境变量保留原始占位符并打印警告。
+    """
+    if not isinstance(value, str):
+        return value
+
+    def _replace(m: re.Match) -> str:
+        var = m.group(1)
+        val = os.environ.get(var)
+        if val is None:
+            log.warning("llm_config.env_var_missing", var=var)
+            return m.group(0)   # 保留占位符，不崩溃
+        return val
+
+    return _ENV_VAR_RE.sub(_replace, value)
+
+
+# ─────────────────────────────────────────────────────────────────
+# YAML 加载入口
+# ─────────────────────────────────────────────────────────────────
+
+def load_from_yaml(
+    path: str | Path = "llm.yaml",
+) -> tuple[list[LLMConfig], RouterConfig]:
+    """
+    从 YAML 文件加载引擎实例列表和路由规则。
+
+    返回 (engines, router_cfg)。
+    YAML 格式见项目根目录的 llm.yaml 示例。
+
+    异常：
+      FileNotFoundError  文件不存在
+      ValueError         yaml 结构不符合预期
+    """
+    try:
+        import yaml
+    except ImportError:
+        raise RuntimeError("请安装 pyyaml：pip install pyyaml")
+
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"llm 配置文件不存在: {p.resolve()}")
+
+    with p.open(encoding="utf-8") as f:
+        raw = yaml.safe_load(f)
+
+    if not isinstance(raw, dict):
+        raise ValueError(f"{p} 解析结果不是 dict，请检查 YAML 格式")
+
+    # ── 解析 engines ─────────────────────────────────────────────
+    engine_list: list[dict] = raw.get("engines") or []
+    if not engine_list:
+        raise ValueError(f"{p} 中未找到 engines 列表")
+
+    configs = [LLMConfig.from_dict(e) for e in engine_list]
+    default_alias = configs[0].alias
+
+    # ── 解析 router ───────────────────────────────────────────────
+    router_raw: dict = raw.get("router") or {}
+    router_cfg = RouterConfig.from_dict(router_raw, default_alias)
+
+    log.info(
+        "llm_config.yaml_loaded",
+        path      = str(p.resolve()),
+        engines   = [c.alias for c in configs],
+        default   = router_cfg.default,
+        fallback  = router_cfg.fallback,
+    )
+    return configs, router_cfg

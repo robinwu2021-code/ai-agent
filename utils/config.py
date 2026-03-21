@@ -105,7 +105,11 @@ class Settings(BaseSettings):
     openai_api_key:        str | None = Field(None, alias="OPENAI_API_KEY")
     openai_base_url:       str | None = Field(None, alias="OPENAI_BASE_URL")
 
-    # ── 多引擎路由配置 ────────────────────────────────────────────
+    # ── YAML 配置文件路径（最高优先级）──────────────────────────
+    # 默认读取工作目录下的 llm.yaml；设为空字符串可强制禁用 YAML 加载
+    llm_config_file: str = Field("llm.yaml", alias="LLM_CONFIG_FILE")
+
+    # ── 多引擎路由配置（YAML 不存在时生效）──────────────────────
     # 逗号分隔的实例别名列表，如 "opus-prod,haiku-backup,azure-east"
     # 每个 alias 对应 {ALIAS}_SDK / {ALIAS}_API_KEY / ... 环境变量
     engine_aliases: str | None = Field(None, alias="ENGINE_ALIASES")
@@ -212,26 +216,67 @@ class Settings(BaseSettings):
 
     def build_router(self) -> Any:
         """
-        构建 LLMRouter。
-          - 有 ENGINE_ALIASES → 多引擎路由模式，每个 alias 读取独立前缀
-          - 无 ENGINE_ALIASES → 单引擎兼容模式，包装 default 引擎
+        构建 LLMRouter，配置来源优先级：
+          1. llm.yaml（LLM_CONFIG_FILE，默认 "llm.yaml"）
+          2. ENGINE_ALIASES + {ALIAS}_* 环境变量
+          3. LLM_* 单引擎环境变量（包装为单引擎 Router，向后兼容）
         """
         from llm.router import LLMRouter, ModelRegistry, TaskRouter, single_engine_router
-        from utils.llm_config import LLMConfig
+        from utils.llm_config import LLMConfig, load_from_yaml
 
-        if not self.engine_aliases:
-            engine = self.build_llm_engine()
-            return single_engine_router(engine, alias="default")
+        # ── 优先级 1：YAML 文件 ───────────────────────────────────
+        if self.llm_config_file:
+            from pathlib import Path
+            yaml_path = Path(self.llm_config_file)
+            if yaml_path.exists():
+                configs, router_cfg = load_from_yaml(yaml_path)
+                return self._build_router_from_configs(configs, router_cfg)
+            else:
+                log.debug("router.yaml_not_found",
+                          path=str(yaml_path), fallback="env_vars")
 
-        # ── 多引擎：逐 alias 从环境变量构建实例 ──────────────────
-        aliases  = [a.strip() for a in self.engine_aliases.split(",") if a.strip()]
+        # ── 优先级 2：ENGINE_ALIASES 环境变量 ─────────────────────
+        if self.engine_aliases:
+            aliases = [a.strip() for a in self.engine_aliases.split(",") if a.strip()]
+            configs = [LLMConfig.from_env(alias) for alias in aliases]
+            fallback = [
+                a.strip()
+                for a in (self.router_fallback or "").split(",")
+                if a.strip()
+            ]
+            router_cfg_cls = __import__(
+                "utils.llm_config", fromlist=["RouterConfig"]
+            ).RouterConfig
+            router_cfg = router_cfg_cls(
+                default     = self.router_default or aliases[0],
+                chat        = self.router_chat,
+                plan        = self.router_plan,
+                summarize   = self.router_summarize,
+                consolidate = self.router_consolidate,
+                embed       = self.router_embed,
+                eval        = self.router_eval,
+                route       = self.router_route,
+                fallback    = fallback,
+            )
+            return self._build_router_from_configs(configs, router_cfg)
+
+        # ── 优先级 3：LLM_* 单引擎（向后兼容）────────────────────
+        engine = self.build_llm_engine()
+        return single_engine_router(engine, alias="default")
+
+    def _build_router_from_configs(
+        self,
+        configs: list,
+        router_cfg: Any,
+    ) -> Any:
+        """将 LLMConfig 列表 + RouterConfig 组装成 LLMRouter。"""
+        from llm.router import LLMRouter, ModelRegistry, TaskRouter
+
         registry = ModelRegistry()
-
-        for alias in aliases:
-            cfg    = LLMConfig.from_env(alias)
+        for cfg in configs:
             engine = cfg.build_engine()
             registry.register(
-                alias          = alias,
+                alias          = cfg.alias,
                 engine         = engine,
                 provider       = cfg.sdk,
                 model          = cfg.resolved_model(),
@@ -241,25 +286,27 @@ class Settings(BaseSettings):
                 tags           = cfg.tags,
             )
 
-        fallback = [
-            a.strip()
-            for a in (self.router_fallback or "").split(",")
-            if a.strip()
-        ]
         task_router = TaskRouter(
-            default     = self.router_default or aliases[0],
-            chat        = self.router_chat,
-            plan        = self.router_plan,
-            summarize   = self.router_summarize,
-            consolidate = self.router_consolidate,
-            embed       = self.router_embed,
-            eval        = self.router_eval,
-            route       = self.router_route,
-            fallback    = fallback,
+            default        = router_cfg.default,
+            chat           = router_cfg.chat,
+            plan           = router_cfg.plan,
+            summarize      = router_cfg.summarize,
+            consolidate    = router_cfg.consolidate,
+            embed          = router_cfg.embed,
+            rerank         = router_cfg.rerank,
+            eval           = router_cfg.eval,
+            route          = router_cfg.route,
+            node_overrides = router_cfg.node_overrides,
+            fallback       = router_cfg.fallback,
         )
 
         router = LLMRouter(registry, task_router)
-        log.info("router.built", engines=aliases, fallback=fallback)
+        log.info(
+            "router.built",
+            engines  = [c.alias for c in configs],
+            default  = router_cfg.default,
+            fallback = router_cfg.fallback,
+        )
         return router
 
     def build_container(self):
