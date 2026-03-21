@@ -77,13 +77,28 @@ engines:
   #   cost_tier: 1
   #   tags: [fast, fallback]
 
-  # ── 本地 Ollama（无需 key）────────────────────────────────────
-  # - alias: ollama-local
-  #   sdk: openai_compatible
-  #   base_url: http://localhost:11434/v1
-  #   model: llama3.2
-  #   cost_tier: 0
-  #   tags: [local, offline]
+  # ── Ollama 本地（qwen3.5:35b-b，无需 key）───────────────────
+  - alias: ollama-qwen3
+    sdk: openai_compatible
+    base_url: http://localhost:11434/v1
+    model: qwen3.5:35b-b
+    max_tokens: 8192
+    timeout_sec: 300.0               # 本地大模型推理较慢，适当放大超时
+    cost_tier: 0
+    supports_tools: true
+    tags: [local, offline, qwen]
+
+  # ── vLLM 本地（qwen3.5:35b-b，OpenAI 兼容接口）─────────────
+  - alias: vllm-qwen3
+    sdk: openai_compatible
+    base_url: http://localhost:8000/v1
+    model: qwen3.5:35b-b             # 与 vLLM --served-model-name 保持一致
+    api_key: EMPTY                   # vLLM 默认不校验 key，填占位符即可
+    max_tokens: 8192
+    timeout_sec: 300.0
+    cost_tier: 0
+    supports_tools: true
+    tags: [local, vllm, qwen]
 
 
 router:
