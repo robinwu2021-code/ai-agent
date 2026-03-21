@@ -230,6 +230,29 @@ async def chat(req: ChatRequest):
     )
 
 
+@app.get("/chat", response_model=ChatResponse, summary="发送消息并等待完整回复（GET）")
+async def chat_get(
+    text:       str,
+    user_id:    str   = "default_user",
+    session_id: str | None = None,
+    max_steps:  int   = 10,
+):
+    """
+    GET 版本的 /chat，通过 Query 参数传入文本。
+
+    示例：
+    ```
+    GET /chat?text=今天成都的天气怎么样？
+    ```
+    """
+    if _container is None:
+        raise HTTPException(status_code=503, detail="服务未初始化")
+    req = ChatRequest(text=text, user_id=user_id,
+                      session_id=session_id, max_steps=max_steps)
+    sid, reply, usage, steps = await _run_agent(req)
+    return ChatResponse(session_id=sid, reply=reply, usage=usage, steps=steps)
+
+
 @app.post("/chat/stream", summary="发送消息并以 SSE 流式接收回复")
 async def chat_stream(req: ChatRequest):
     """
