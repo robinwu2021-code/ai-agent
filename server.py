@@ -253,14 +253,48 @@ def _build_container(engine_alias: str | None = None):
     workspace_ltm     = WorkspaceAwareLTM(ws_store)
     workspace_manager = WorkspaceManager(ws_store)
 
+    # ── 知识图谱存储 & 构建器（与 workspace.db 同库）───────────────
+    kg_store     = None
+    graph_builder = None
+    try:
+        from rag.graph.store import SQLiteKGStore
+        from rag.graph.extractor import TripleExtractor
+        from rag.graph.resolver import EntityResolver
+        from rag.graph.builder import GraphBuilder
+
+        kg_db_url = os.environ.get("KG_STORE_URL", "sqlite:///workspace.db")
+        kg_store  = SQLiteKGStore(kg_db_url.replace("sqlite:///", ""))
+        try:
+            loop2 = asyncio.get_event_loop()
+            if loop2.is_running():
+                import concurrent.futures as _cf
+                with _cf.ThreadPoolExecutor() as pool:
+                    pool.submit(asyncio.run, kg_store.initialize()).result(timeout=10)
+            else:
+                loop2.run_until_complete(kg_store.initialize())
+        except Exception as exc:
+            log.warning("server.kg_store_init_failed", error=str(exc))
+
+        # embed_fn 从 llm_router 借用
+        _embed_fn = lambda text: llm_router.embed(text)  # noqa: E731
+
+        extractor     = TripleExtractor(llm_router)
+        resolver      = EntityResolver(kg_store, _embed_fn)
+        graph_builder = GraphBuilder(kg_store, extractor, resolver, _embed_fn)
+        log.info("server.kg_ready")
+    except Exception as exc:
+        log.warning("server.kg_init_failed", error=str(exc))
+
     container = AgentContainer(
         llm_router        = llm_router,
         short_term_memory = InMemoryShortTermMemory(),
-        long_term_memory  = workspace_ltm,     # 替换为 workspace 感知 LTM
+        long_term_memory  = workspace_ltm,
         skill_registry    = skill_registry,
         mcp_hub           = DefaultMCPHub(),
         context_manager   = PriorityContextManager(),
         workspace_manager = workspace_manager,
+        kg_store          = kg_store,
+        graph_builder     = graph_builder,
     )
     return container.build()
 
@@ -719,6 +753,414 @@ async def share_memory(req: _ShareMemoryReq):
         note=req.note,
     )
     return {"shared": len(shares), "entry_id": req.entry_id}
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Knowledge Graph REST API  /kg/*
+# ══════════════════════════════════════════════════════════════════════
+
+from fastapi import UploadFile, File as _File, BackgroundTasks
+import tempfile, os as _os
+
+class _KGBuildTextReq(_BM):
+    text:   str
+    kb_id:  str  = "global"
+    doc_id: str  = ""
+    source: str  = "inline"
+
+class _KGQueryReq(_BM):
+    query:  str
+    kb_id:  str  = "global"
+    mode:   str  = "local"   # local | global | path
+    hops:   int  = 2
+
+class _KGSubgraphReq(_BM):
+    node_id: str
+    kb_id:   str = "global"
+    hops:    int = 2
+
+class _KGPathReq(_BM):
+    query:   str
+    kb_id:   str = "global"
+
+class _KGEntityPatchReq(_BM):
+    name:        str | None = None
+    description: str | None = None
+    node_type:   str | None = None
+
+class _KGAddEdgeReq(_BM):
+    kb_id:    str
+    src_name: str
+    relation: str
+    dst_name: str
+    context:  str = ""
+    weight:   float = 1.0
+
+
+def _kg():
+    """获取 kg_store，未初始化时抛 503。"""
+    if _container is None:
+        raise HTTPException(status_code=503, detail="服务未初始化")
+    store = getattr(_container, "kg_store", None)
+    if not store:
+        raise HTTPException(status_code=501, detail="知识图谱功能未启用（kg_store 未配置）")
+    return store
+
+def _gb():
+    """获取 graph_builder，未初始化时抛 503。"""
+    if _container is None:
+        raise HTTPException(status_code=503, detail="服务未初始化")
+    gb = getattr(_container, "graph_builder", None)
+    if not gb:
+        raise HTTPException(status_code=501, detail="GraphBuilder 未配置")
+    return gb
+
+def _gr():
+    """懒建 GraphRetriever（按需）。"""
+    store = _kg()
+    router = _container._effective_router()
+    embed_fn = lambda t: router.embed(t)  # noqa: E731
+    from rag.graph.retriever import GraphRetriever
+    return GraphRetriever(store=store, embed_fn=embed_fn, llm_engine=router)
+
+
+# ── 文档入库 / 构建 ────────────────────────────────────────────────
+
+@app.post("/kg/build/text", summary="从文本构建图谱", tags=["KnowledgeGraph"])
+async def kg_build_text(req: _KGBuildTextReq, background_tasks: BackgroundTasks):
+    """将纯文本内容异步构建为知识图谱，返回 job_id 供查询进度。"""
+    gb = _gb()
+    import uuid as _uuid
+    doc_id = req.doc_id or f"doc_{_uuid.uuid4().hex[:8]}"
+    job_id = gb.start_build_text_job(
+        text=req.text, kb_id=req.kb_id,
+        doc_id=doc_id, source=req.source,
+    )
+    return {"job_id": job_id, "doc_id": doc_id, "kb_id": req.kb_id}
+
+
+@app.post("/kg/build/file", summary="上传文件并构建图谱", tags=["KnowledgeGraph"])
+async def kg_build_file(
+    kb_id: str = "global",
+    file: UploadFile = _File(...),
+):
+    """上传文档（PDF/TXT/MD/DOCX/HTML），后台异步提取知识图谱。"""
+    gb = _gb()
+    suffix = _os.path.splitext(file.filename or "doc.txt")[1]
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+        tmp.write(await file.read())
+        tmp_path = tmp.name
+    try:
+        from rag.knowledge_base import DocumentIngester, TextChunker
+        ingester = DocumentIngester()
+        chunker  = TextChunker()
+        doc      = ingester.ingest_file(tmp_path)
+        doc.metadata["original_filename"] = file.filename
+        chunks   = chunker.chunk(doc)
+    finally:
+        _os.unlink(tmp_path)
+
+    chunk_dicts = [
+        {"text": c.text, "doc_id": doc.id, "chunk_id": c.id}
+        for c in chunks
+    ]
+    job_id = gb.start_build_job(
+        chunks=chunk_dicts,
+        kb_id=kb_id, doc_id=doc.id,
+    )
+    return {
+        "job_id": job_id, "doc_id": doc.id,
+        "kb_id": kb_id, "chunks": len(chunks),
+        "filename": file.filename,
+    }
+
+
+@app.get("/kg/build/status/{job_id}", summary="查询构建任务状态", tags=["KnowledgeGraph"])
+async def kg_build_status(job_id: str):
+    """查询后台图谱构建任务的进度和结果。"""
+    gb = _gb()
+    status = gb.get_job_status(job_id)
+    if status is None:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    return status
+
+
+@app.get("/kg/build/jobs", summary="列出所有构建任务", tags=["KnowledgeGraph"])
+async def kg_build_jobs():
+    """列出所有图谱构建任务（含状态）。"""
+    gb = _gb()
+    return {"jobs": gb.list_jobs()}
+
+
+# ── 社区摘要 ────────────────────────────────────────────────────────
+
+@app.post("/kg/communities/rebuild", summary="重建社区摘要", tags=["KnowledgeGraph"])
+async def kg_rebuild_communities(kb_id: str = "global"):
+    """对指定知识库重新执行社区检测并用 LLM 生成摘要（后台任务）。"""
+    gb = _gb()
+    router = _container._effective_router()
+    embed_fn = lambda t: router.embed(t)  # noqa: E731
+    import asyncio as _aio
+    _aio.create_task(_async_rebuild(gb, kb_id, router))
+    return {"ok": True, "kb_id": kb_id, "message": "社区摘要重建已启动"}
+
+async def _async_rebuild(gb, kb_id, llm_engine):
+    try:
+        result = await gb.rebuild_communities(kb_id=kb_id, llm_engine=llm_engine)
+        log.info("kg.communities_rebuilt", **result)
+    except Exception as exc:
+        log.error("kg.communities_rebuild_failed", error=str(exc))
+
+
+# ── 图谱查询 ────────────────────────────────────────────────────────
+
+@app.post("/kg/query", summary="知识图谱问答", tags=["KnowledgeGraph"])
+async def kg_query(req: _KGQueryReq):
+    """
+    基于知识图谱的问答接口，返回答案上下文 + 实体 + 关系 + 推理链。
+
+    mode:
+    - local  — 实体链接 + 子图展开（默认，适合具体问题）
+    - global — 社区摘要召回（适合宏观概括性问题）
+    - path   — 两实体路径推理（适合"A和B有什么关系"）
+    """
+    gr = _gr()
+    if req.mode == "global":
+        subgraph = await gr.global_search(req.query, req.kb_id)
+    elif req.mode == "path":
+        subgraph = await gr.path_search(req.query, req.kb_id)
+    else:
+        subgraph = await gr.local_search(req.query, req.kb_id, hops=req.hops)
+
+    from rag.graph.retriever import GraphRetriever
+    context = GraphRetriever.format_for_prompt(subgraph)
+    return {
+        "context":        context,
+        "subgraph":       subgraph.to_dict(),
+        "mode":           req.mode,
+        "nodes_found":    len(subgraph.nodes),
+        "edges_found":    len(subgraph.edges),
+    }
+
+
+@app.post("/kg/search/entities", summary="实体语义搜索", tags=["KnowledgeGraph"])
+async def kg_search_entities(query: str, kb_id: str = "global", limit: int = 20):
+    """在知识图谱中搜索与查询相关的实体节点（文本 + 向量双路）。"""
+    store = _kg()
+    router = _container._effective_router()
+
+    text_hits = await store.search_nodes_by_text(query, kb_id, limit=limit)
+    try:
+        emb  = await router.embed(query)
+        vec_hits = await store.search_nodes_by_embedding(emb, kb_id, limit=limit)
+    except Exception:
+        vec_hits = []
+
+    # 合并去重
+    seen: set[str] = set()
+    merged = []
+    for n in text_hits + vec_hits:
+        if n.id not in seen:
+            seen.add(n.id)
+            merged.append(n)
+
+    return {"entities": [
+        {"id": n.id, "name": n.name, "type": n.node_type.value,
+         "description": n.description, "degree": n.degree}
+        for n in merged[:limit]
+    ]}
+
+
+@app.post("/kg/subgraph", summary="获取实体子图", tags=["KnowledgeGraph"])
+async def kg_subgraph(req: _KGSubgraphReq):
+    """获取指定实体节点的 N 跳邻居子图（用于前端可视化）。"""
+    store = _kg()
+    nodes, edges = await store.get_neighbors(req.node_id, req.kb_id, hops=req.hops)
+    center = await store.get_node(req.node_id)
+    if center and center not in nodes:
+        nodes.insert(0, center)
+    return {
+        "nodes": [{"id": n.id, "name": n.name, "type": n.node_type.value,
+                   "description": n.description, "degree": n.degree} for n in nodes],
+        "edges": [{"id": e.id, "src_id": e.src_id, "dst_id": e.dst_id,
+                   "relation": e.relation, "weight": e.weight, "context": e.context}
+                  for e in edges],
+    }
+
+
+@app.post("/kg/path", summary="两实体路径查询", tags=["KnowledgeGraph"])
+async def kg_path(req: _KGPathReq):
+    """在图谱中查找两个实体间的最短路径，返回推理链。"""
+    gr = _gr()
+    subgraph = await gr.path_search(req.query, req.kb_id)
+    return {
+        "subgraph":        subgraph.to_dict(),
+        "reasoning_chain": subgraph.reasoning_chain,
+        "context":         subgraph.context_text,
+    }
+
+
+# ── 实体 / 边 CRUD ─────────────────────────────────────────────────
+
+@app.get("/kg/entities", summary="列出实体", tags=["KnowledgeGraph"])
+async def kg_list_entities(
+    kb_id:     str        = "global",
+    node_type: str | None = None,
+    limit:     int        = 100,
+    offset:    int        = 0,
+):
+    """列出知识图谱中的实体节点，支持类型过滤和分页。"""
+    store = _kg()
+    from rag.graph.models import NodeType
+    nt = NodeType(node_type) if node_type else None
+    nodes = await store.list_nodes(kb_id, node_type=nt, limit=limit, offset=offset)
+    return {"entities": [
+        {"id": n.id, "name": n.name, "type": n.node_type.value,
+         "description": n.description, "degree": n.degree, "aliases": n.aliases}
+        for n in nodes
+    ], "total": len(nodes)}
+
+
+@app.get("/kg/entities/{entity_id}", summary="实体详情", tags=["KnowledgeGraph"])
+async def kg_get_entity(entity_id: str):
+    """获取单个实体详情，含所有关联边。"""
+    store = _kg()
+    node = await store.get_node(entity_id)
+    if not node:
+        raise HTTPException(status_code=404, detail="实体不存在")
+    edges = await store.list_edges(node.kb_id, src_id=entity_id)
+    edges += await store.list_edges(node.kb_id, dst_id=entity_id)
+    return {
+        "id": node.id, "name": node.name, "type": node.node_type.value,
+        "description": node.description, "aliases": node.aliases,
+        "doc_ids": node.doc_ids, "degree": node.degree,
+        "edges": [
+            {"id": e.id, "src_id": e.src_id, "dst_id": e.dst_id,
+             "relation": e.relation, "weight": e.weight, "context": e.context}
+            for e in edges
+        ],
+    }
+
+
+@app.patch("/kg/entities/{entity_id}", summary="修正实体", tags=["KnowledgeGraph"])
+async def kg_patch_entity(entity_id: str, req: _KGEntityPatchReq):
+    """人工修正实体名称、描述或类型。"""
+    store = _kg()
+    node = await store.get_node(entity_id)
+    if not node:
+        raise HTTPException(status_code=404, detail="实体不存在")
+    from rag.graph.models import NodeType
+    if req.name:        node.name = req.name
+    if req.description: node.description = req.description
+    if req.node_type:   node.node_type = NodeType(req.node_type)
+    await store.upsert_node(node)
+    return {"ok": True, "id": node.id, "name": node.name}
+
+
+@app.delete("/kg/entities/{entity_id}", summary="删除实体", tags=["KnowledgeGraph"])
+async def kg_delete_entity(entity_id: str):
+    """删除实体及其所有关联边。"""
+    store = _kg()
+    await store.delete_node(entity_id)
+    return {"ok": True}
+
+
+@app.post("/kg/edges", summary="手动添加关系边", tags=["KnowledgeGraph"])
+async def kg_add_edge(req: _KGAddEdgeReq):
+    """手动在两个实体之间添加关系边（实体不存在时自动创建）。"""
+    store = _kg()
+    import uuid as _uuid, time as _time
+    from rag.graph.models import Node, Edge, NodeType
+
+    async def _get_or_create(name: str) -> Node:
+        n = await store.get_node_by_name(name, req.kb_id)
+        if not n:
+            n = Node(
+                id=f"n_{_uuid.uuid4().hex[:12]}",
+                kb_id=req.kb_id, name=name,
+                node_type=NodeType.OTHER,
+                created_at=_time.time(),
+            )
+            await store.upsert_node(n)
+        return n
+
+    src_node = await _get_or_create(req.src_name)
+    dst_node = await _get_or_create(req.dst_name)
+    edge = Edge(
+        id=f"e_{_uuid.uuid4().hex[:12]}",
+        kb_id=req.kb_id,
+        src_id=src_node.id,
+        dst_id=dst_node.id,
+        relation=req.relation,
+        weight=req.weight,
+        context=req.context,
+        created_at=_time.time(),
+    )
+    await store.upsert_edge(edge)
+    return {
+        "ok": True, "edge_id": edge.id,
+        "src": src_node.name, "dst": dst_node.name, "relation": req.relation,
+    }
+
+
+@app.delete("/kg/edges/{edge_id}", summary="删除关系边", tags=["KnowledgeGraph"])
+async def kg_delete_edge(edge_id: str, kb_id: str = "global"):
+    """删除指定关系边。"""
+    store = _kg()
+    await store.delete_edge(edge_id)
+    return {"ok": True}
+
+
+# ── 可视化数据 ─────────────────────────────────────────────────────
+
+@app.get("/kg/graph", summary="获取完整图谱数据", tags=["KnowledgeGraph"])
+async def kg_full_graph(kb_id: str = "global", limit: int = 500):
+    """
+    获取完整图谱的节点和边（用于前端可视化）。
+    limit 控制最大节点数（按 degree 降序取前 N 个）。
+    """
+    store = _kg()
+    nodes, edges = await store.get_full_graph(kb_id, limit=limit)
+    node_ids = {n.id for n in nodes}
+    # 过滤掉引用了不在节点集中的悬空边
+    edges = [e for e in edges if e.src_id in node_ids and e.dst_id in node_ids]
+    return {
+        "nodes": [
+            {"id": n.id, "name": n.name, "type": n.node_type.value,
+             "description": n.description, "degree": n.degree}
+            for n in nodes
+        ],
+        "edges": [
+            {"id": e.id, "src_id": e.src_id, "dst_id": e.dst_id,
+             "relation": e.relation, "weight": e.weight}
+            for e in edges
+        ],
+        "kb_id": kb_id,
+    }
+
+
+@app.get("/kg/stats", summary="图谱统计信息", tags=["KnowledgeGraph"])
+async def kg_stats(kb_id: str = "global"):
+    """返回知识图谱的节点数、边数、社区数等统计信息。"""
+    store = _kg()
+    stats = await store.get_stats(kb_id)
+    return {"kb_id": kb_id, **stats}
+
+
+@app.delete("/kg/documents/{doc_id}", summary="删除文档图谱数据", tags=["KnowledgeGraph"])
+async def kg_delete_document(doc_id: str, kb_id: str = "global"):
+    """删除指定文档产生的所有节点和边（节点若被其他文档共享则保留）。"""
+    store = _kg()
+    await store.delete_by_doc(doc_id, kb_id)
+    return {"ok": True, "doc_id": doc_id}
+
+
+@app.post("/kg/reindex/{doc_id}", summary="重建文档图谱", tags=["KnowledgeGraph"])
+async def kg_reindex_document(doc_id: str, kb_id: str = "global"):
+    """先删除文档旧图谱数据，再触发重建（需要原始文本仍在 KnowledgeBase 中）。"""
+    store = _kg()
+    await store.delete_by_doc(doc_id, kb_id)
+    return {"ok": True, "message": "旧数据已清除，请重新调用 /kg/build/text 或 /kg/build/file 触发构建"}
 
 
 @app.get("/health", summary="健康检查")

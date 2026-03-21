@@ -1,4 +1,4 @@
-export type SkillMode = 'general' | 'weather' | 'report' | 'marketing'
+export type SkillMode = 'general' | 'weather' | 'report' | 'marketing' | 'graph'
 
 export type MessageRole = 'user' | 'assistant'
 

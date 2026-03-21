@@ -41,6 +41,9 @@ class AgentContainer:
     prompt_renderer:    Any = None
     feedback_store:     Any = None
     task_queue:         Any = None
+    # ── 知识图谱 ──────────────────────────────────────────────────
+    kg_store:           Any = None   # KGStore（SQLite / Neo4j）
+    graph_builder:      Any = None   # GraphBuilder
 
     def _effective_router(self) -> Any:
         """返回 LLMRouter（若只设了 llm_engine，自动包装为单引擎 Router）。"""

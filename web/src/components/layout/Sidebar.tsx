@@ -2,21 +2,24 @@
 import type { SkillMode, SessionStats } from '@/types'
 import { cn } from '@/lib/utils'
 import { useEffect, useState } from 'react'
+import { useRouter, usePathname } from 'next/navigation'
 import { fetchHealth } from '@/lib/api'
 
 interface NavItem {
-  id: SkillMode
+  id: SkillMode | 'graph'
   icon: string
   label: string
   sub: string
   color: string
+  href?: string
 }
 
 const NAV_ITEMS: NavItem[] = [
-  { id: 'general', icon: '✦', label: '通用对话', sub: '全能助手', color: '#a78bfa' },
-  { id: 'weather', icon: '🌤', label: '天气预报', sub: '实时气象查询', color: '#38bdf8' },
-  { id: 'report', icon: '📊', label: '智能报表', sub: '销售数据分析', color: '#34d399' },
+  { id: 'general',   icon: '✦',  label: '通用对话', sub: '全能助手',   color: '#a78bfa' },
+  { id: 'weather',   icon: '🌤', label: '天气预报', sub: '实时气象查询', color: '#38bdf8' },
+  { id: 'report',    icon: '📊', label: '智能报表', sub: '销售数据分析', color: '#34d399' },
   { id: 'marketing', icon: '📢', label: '营销方案', sub: '商家营销顾问', color: '#fb923c' },
+  { id: 'graph',     icon: '🕸', label: '知识图谱', sub: '实体关系探索', color: '#06b6d4', href: '/graph' },
 ]
 
 interface Props {
@@ -31,12 +34,33 @@ interface Props {
 
 export default function Sidebar({ mode, setMode, stats, sessionId, open, onClear }: Props) {
   const [connected, setConnected] = useState<boolean | null>(null)
+  const router = useRouter()
+  const pathname = usePathname()
 
   useEffect(() => {
     fetchHealth()
       .then(() => setConnected(true))
       .catch(() => setConnected(false))
   }, [])
+
+  function handleNavClick(item: NavItem) {
+    if (item.href) {
+      router.push(item.href)
+    } else {
+      // If we're on a sub-route, navigate back to home first
+      if (pathname !== '/') {
+        router.push('/')
+      }
+      setMode(item.id as SkillMode)
+    }
+  }
+
+  function isItemActive(item: NavItem): boolean {
+    if (item.href) {
+      return pathname === item.href || pathname.startsWith(item.href + '/')
+    }
+    return pathname === '/' && mode === item.id
+  }
 
   return (
     <aside className={cn(
@@ -64,31 +88,32 @@ export default function Sidebar({ mode, setMode, stats, sessionId, open, onClear
           对话模式
         </div>
         <div className="space-y-0.5">
-          {NAV_ITEMS.map(item => (
-            <button
-              key={item.id}
-              onClick={() => setMode(item.id)}
-              className={cn(
-                'w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-left transition-all duration-150',
-                mode === item.id
-                  ? 'text-white'
-                  : 'hover:bg-white/5'
-              )}
-              style={mode === item.id ? {
-                background: `${item.color}22`,
-                border: `1px solid ${item.color}44`,
-              } : { border: '1px solid transparent' }}
-            >
-              <span className="text-base leading-none">{item.icon}</span>
-              <div className="min-w-0">
-                <div className="text-sm font-medium truncate"
-                  style={{ color: mode === item.id ? item.color : '#cbd5e1' }}>
-                  {item.label}
+          {NAV_ITEMS.map(item => {
+            const active = isItemActive(item)
+            return (
+              <button
+                key={item.id}
+                onClick={() => handleNavClick(item)}
+                className={cn(
+                  'w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-left transition-all duration-150',
+                  active ? 'text-white' : 'hover:bg-white/5'
+                )}
+                style={active ? {
+                  background: `${item.color}22`,
+                  border: `1px solid ${item.color}44`,
+                } : { border: '1px solid transparent' }}
+              >
+                <span className="text-base leading-none">{item.icon}</span>
+                <div className="min-w-0">
+                  <div className="text-sm font-medium truncate"
+                    style={{ color: active ? item.color : '#cbd5e1' }}>
+                    {item.label}
+                  </div>
+                  <div className="text-xs truncate" style={{ color: 'var(--muted)' }}>{item.sub}</div>
                 </div>
-                <div className="text-xs truncate" style={{ color: 'var(--muted)' }}>{item.sub}</div>
-              </div>
-            </button>
-          ))}
+              </button>
+            )
+          })}
         </div>
 
         {/* Stats */}
