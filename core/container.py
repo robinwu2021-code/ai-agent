@@ -37,6 +37,7 @@ class AgentContainer:
     quota_manager:      Any = None
     model_downgrader:   Any = None
     tenant_manager:     Any = None
+    workspace_manager:  Any = None   # WorkspaceManager（多用户工作区）
     prompt_renderer:    Any = None
     feedback_store:     Any = None
     task_queue:         Any = None

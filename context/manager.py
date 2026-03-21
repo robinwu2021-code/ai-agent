@@ -71,33 +71,70 @@ class PriorityContextManager:
         tools: list[ToolDescriptor],
         long_term_memory: Any,
         budget: int,
+        # workspace 感知参数（可选）
+        workspace_id: str | None = None,
+        project_id:   str | None = None,
+        system_prompt_override: str | None = None,
     ) -> list[Message]:
         used = 0
         messages: list[Message] = []
 
         # ── P0: System Prompt ─────────────────────────
-        profile   = await long_term_memory.get_profile(task.user_id)
-        sys_text  = SYSTEM_PROMPT_TEMPLATE.format(
-            user_id=task.user_id,
-            task_summary=self._task_summary(task),
-            profile=self._format_profile(profile),
-        )
+        get_profile_fn = getattr(long_term_memory, "get_profile", None)
+        if get_profile_fn:
+            try:
+                profile = await get_profile_fn(task.user_id, workspace_id or "")
+            except TypeError:
+                profile = await get_profile_fn(task.user_id)
+        else:
+            profile = {}
+
+        if system_prompt_override:
+            # 工作区/项目自定义 system prompt 直接替换
+            sys_text = system_prompt_override + f"\n\n用户 ID: {task.user_id}"
+        else:
+            sys_text = SYSTEM_PROMPT_TEMPLATE.format(
+                user_id=task.user_id,
+                task_summary=self._task_summary(task),
+                profile=self._format_profile(profile),
+            )
         sys_tokens = _estimate_tokens(sys_text)
         if used + sys_tokens <= budget:
             messages.append(Message(role=MessageRole.SYSTEM, content=sys_text))
             used += sys_tokens
 
-        # ── P2: 长期记忆 ──────────────────────────────
-        mem_budget = min(2000, budget // 6)
-        memories   = await long_term_memory.search(
-            user_id=task.user_id, query=task.input.text, top_k=5
-        )
-        if memories:
-            mem_text = "## 相关记忆\n" + "\n".join(f"- {m.text}" for m in memories)
-            if _estimate_tokens(mem_text) > mem_budget:
-                mem_text = mem_text[:mem_budget * 3]  # 简单截断
-            messages.append(Message(role=MessageRole.SYSTEM, content=mem_text))
-            used += _estimate_tokens(mem_text)
+        # ── P2: 长期记忆（workspace 感知 4 层混合 / 旧版纯个人）──
+        mem_budget = min(2400, budget // 5)
+        is_workspace_ltm = hasattr(long_term_memory, "search_mixed")
+
+        if is_workspace_ltm and (workspace_id or project_id):
+            # workspace 模式：4 层混合召回，带来源标注
+            from workspace.memory import WorkspaceAwareLTM
+            ranked = await long_term_memory.search_mixed(
+                query=task.input.text,
+                user_id=task.user_id,
+                workspace_id=workspace_id,
+                project_id=project_id,
+                top_k=10,
+            )
+            if ranked:
+                mem_lines = WorkspaceAwareLTM.format_for_context(ranked, max_chars=mem_budget * 3)
+                mem_text  = "## 相关记忆\n" + mem_lines
+                messages.append(Message(role=MessageRole.SYSTEM, content=mem_text))
+                used += _estimate_tokens(mem_text)
+        else:
+            # 旧版：纯个人记忆
+            memories = await long_term_memory.search(
+                user_id=task.user_id, query=task.input.text, top_k=5
+            )
+            if memories:
+                mem_text = "## 相关记忆\n" + "\n".join(
+                    f"- {getattr(m, 'text', str(m))}" for m in memories
+                )
+                if _estimate_tokens(mem_text) > mem_budget:
+                    mem_text = mem_text[:mem_budget * 3]
+                messages.append(Message(role=MessageRole.SYSTEM, content=mem_text))
+                used += _estimate_tokens(mem_text)
 
         # ── P3: 对话历史（滑动窗口）─────────────────
         history_budget = min(4000, budget - used - 2000)
