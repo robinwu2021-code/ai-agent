@@ -6,7 +6,7 @@ import { useRouter, usePathname } from 'next/navigation'
 import { fetchHealth } from '@/lib/api'
 
 interface NavItem {
-  id: SkillMode | 'graph'
+  id: SkillMode | 'graph' | 'knowledge'
   icon: string
   label: string
   sub: string
@@ -20,6 +20,7 @@ const NAV_ITEMS: NavItem[] = [
   { id: 'report',    icon: '📊', label: '智能报表', sub: '销售数据分析', color: '#34d399' },
   { id: 'marketing', icon: '📢', label: '营销方案', sub: '商家营销顾问', color: '#fb923c' },
   { id: 'graph',     icon: '🕸', label: '知识图谱', sub: '实体关系探索', color: '#06b6d4', href: '/graph' },
+  { id: 'knowledge', icon: '📚', label: '知识库',   sub: '文档问答检索', color: '#8b5cf6', href: '/knowledge' },
 ]
 
 interface Props {

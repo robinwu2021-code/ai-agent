@@ -285,6 +285,38 @@ def _build_container(engine_alias: str | None = None):
     except Exception as exc:
         log.warning("server.kg_init_failed", error=str(exc))
 
+    # ── 持久化知识库（与 workspace.db 同库）──────────────────────────
+    pkb = None
+    try:
+        from rag.store import SQLiteKBStore
+        from rag.persistent_kb import PersistentKnowledgeBase
+        kb_store = SQLiteKBStore(ws_db_url.replace("sqlite:///", ""))
+        # 同步初始化（建表）
+        try:
+            loop3 = asyncio.get_event_loop()
+            if loop3.is_running():
+                import concurrent.futures as _cf3
+                with _cf3.ThreadPoolExecutor() as pool:
+                    pool.submit(asyncio.run, kb_store.initialize()).result(timeout=10)
+            else:
+                loop3.run_until_complete(kb_store.initialize())
+        except Exception as exc:
+            log.warning("server.kb_store_init_failed", error=str(exc))
+        _embed_fn2 = lambda text: llm_router.embed(text)  # noqa: E731
+        pkb = PersistentKnowledgeBase(
+            store=kb_store, embed_fn=_embed_fn2, kb_id="global"
+        )
+        # 启动时尝试恢复索引（若事件循环尚未运行则跳过，由首次查询时懒加载）
+        try:
+            loop4 = asyncio.get_event_loop()
+            if not loop4.is_running():
+                loop4.run_until_complete(pkb.initialize())
+        except Exception:
+            pass  # 在 FastAPI startup 事件中恢复
+        log.info("server.pkb_ready")
+    except Exception as exc:
+        log.warning("server.pkb_init_failed", error=str(exc))
+
     container = AgentContainer(
         llm_router        = llm_router,
         short_term_memory = InMemoryShortTermMemory(),
@@ -295,6 +327,7 @@ def _build_container(engine_alias: str | None = None):
         workspace_manager = workspace_manager,
         kg_store          = kg_store,
         graph_builder     = graph_builder,
+        knowledge_base    = pkb,
     )
     return container.build()
 
@@ -756,11 +789,202 @@ async def share_memory(req: _ShareMemoryReq):
 
 
 # ══════════════════════════════════════════════════════════════════════
-# Knowledge Graph REST API  /kg/*
+# Knowledge Base REST API  /kb/*
 # ══════════════════════════════════════════════════════════════════════
 
 from fastapi import UploadFile, File as _File, BackgroundTasks
 import tempfile, os as _os
+
+class _KBAskReq(_BM):
+    query:      str
+    kb_id:      str  = "global"
+    top_k:      int  = 5
+    mode:       str  = "hybrid"   # hybrid | vector | bm25
+    with_graph: bool = False       # also run graph search and merge
+
+class _KBAddTextReq(_BM):
+    text:     str
+    kb_id:    str = "global"
+    source:   str = "inline"
+    filename: str = ""
+
+
+def _pkb():
+    """获取 PersistentKnowledgeBase，未初始化时抛 503 / 501。"""
+    if _container is None:
+        raise HTTPException(503, "服务未初始化")
+    pkb = getattr(_container, "knowledge_base", None)
+    if not pkb or not hasattr(pkb, "list_documents"):
+        raise HTTPException(501, "持久化知识库未启用")
+    return pkb
+
+
+@app.post("/kb/documents/upload", summary="上传文件到知识库", tags=["KnowledgeBase"])
+async def kb_upload_file(
+    file:  UploadFile = _File(...),
+    kb_id: str        = "global",
+):
+    """
+    上传文档（PDF / TXT / MD / DOCX / HTML）到知识库，后台同步分块 + 向量化。
+    返回 KBDocument 元数据（含 doc_id、状态等）。
+    """
+    pkb = _pkb()
+    allowed_suffixes = {".pdf", ".txt", ".md", ".docx", ".html"}
+    suffix = _os.path.splitext(file.filename or "doc.txt")[1].lower()
+    if suffix not in allowed_suffixes:
+        raise HTTPException(400, f"不支持的文件类型: {suffix}，支持: {allowed_suffixes}")
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+        tmp.write(await file.read())
+        tmp_path = tmp.name
+    try:
+        doc = await pkb.add_file(tmp_path, kb_id=kb_id)
+    finally:
+        try:
+            _os.unlink(tmp_path)
+        except OSError:
+            pass
+
+    import dataclasses
+    return {**dataclasses.asdict(doc), "filename": file.filename or doc.filename}
+
+
+@app.post("/kb/documents/text", summary="直接添加文本到知识库", tags=["KnowledgeBase"])
+async def kb_add_text(req: _KBAddTextReq):
+    """将纯文本内容直接入库（无需上传文件），同步分块 + 向量化后返回文档元数据。"""
+    pkb  = _pkb()
+    import dataclasses
+    doc  = await pkb.add_text(
+        text=req.text, source=req.source, kb_id=req.kb_id, filename=req.filename
+    )
+    return dataclasses.asdict(doc)
+
+
+@app.get("/kb/documents", summary="列出知识库文档", tags=["KnowledgeBase"])
+async def kb_list_documents(kb_id: str = "global"):
+    """返回指定 kb_id 下所有文档的元数据列表（含状态、分块数等）。"""
+    pkb  = _pkb()
+    import dataclasses
+    docs = await pkb.list_documents(kb_id=kb_id)
+    return {"documents": [dataclasses.asdict(d) for d in docs], "total": len(docs)}
+
+
+@app.get("/kb/documents/{doc_id}", summary="获取文档详情", tags=["KnowledgeBase"])
+async def kb_get_document(doc_id: str):
+    """获取单个文档的元数据及分块数量。"""
+    pkb  = _pkb()
+    store = pkb._store
+    import dataclasses
+    doc = await store.get_document(doc_id)
+    if not doc:
+        raise HTTPException(404, "文档不存在")
+    chunks = await store.list_chunks(doc_id)
+    result = dataclasses.asdict(doc)
+    result["chunk_count"] = len(chunks)
+    return result
+
+
+@app.delete("/kb/documents/{doc_id}", summary="删除知识库文档", tags=["KnowledgeBase"])
+async def kb_delete_document(doc_id: str):
+    """删除文档及其所有分块（同时从内存索引中移除）。"""
+    pkb = _pkb()
+    await pkb.delete_document(doc_id)
+    return {"ok": True, "doc_id": doc_id}
+
+
+@app.post("/kb/ask", summary="知识库 RAG 问答", tags=["KnowledgeBase"])
+async def kb_ask(req: _KBAskReq):
+    """
+    基于知识库的检索增强问答（RAG）。
+
+    返回字段：
+    - chunks:    命中的分块列表
+    - context:   格式化后可注入 Prompt 的上下文文本
+    - citations: 引用信息列表，每项含 index/source/filename/text_preview
+    """
+    pkb = _pkb()
+
+    # Vector / hybrid retrieval
+    kb_chunks = await pkb.query(req.query, kb_id=req.kb_id, top_k=req.top_k)
+
+    # Optional: merge graph search results
+    if req.with_graph:
+        try:
+            store = getattr(_container, "kg_store", None)
+            if store:
+                router   = _container._effective_router()
+                embed_fn = lambda t: router.embed(t)  # noqa: E731
+                from rag.graph.retriever import GraphRetriever
+                gr       = GraphRetriever(store=store, embed_fn=embed_fn, llm_engine=router)
+                subgraph = await gr.local_search(req.query, req.kb_id, hops=2)
+                if subgraph.context_text:
+                    from rag.store import KBChunk as _KBChunk
+                    graph_chunk = _KBChunk(
+                        chunk_id    = "kg_context",
+                        doc_id      = "knowledge_graph",
+                        kb_id       = req.kb_id,
+                        chunk_index = 0,
+                        text        = subgraph.context_text,
+                        meta        = {"source": "knowledge_graph", "filename": "知识图谱"},
+                        created_at  = 0.0,
+                    )
+                    kb_chunks = [graph_chunk] + kb_chunks
+        except Exception as kg_exc:
+            log.warning("kb_ask.kg_merge_failed", error=str(kg_exc))
+
+    context    = pkb.format_context(kb_chunks)
+    citations  = [
+        {
+            "index":        i + 1,
+            "source":       c.meta.get("source", c.doc_id),
+            "filename":     c.meta.get("filename", c.doc_id),
+            "text_preview": c.text[:200],
+        }
+        for i, c in enumerate(kb_chunks)
+    ]
+    import dataclasses
+    return {
+        "chunks":    [dataclasses.asdict(c) for c in kb_chunks],
+        "context":   context,
+        "citations": citations,
+    }
+
+
+@app.get("/kb/stats", summary="知识库统计", tags=["KnowledgeBase"])
+async def kb_stats(kb_id: str = "global"):
+    """返回知识库的文档数、分块数、就绪文档数、总字符数等统计信息。"""
+    pkb   = _pkb()
+    stats = await pkb.get_stats(kb_id=kb_id)
+    return {"kb_id": kb_id, **stats}
+
+
+@app.post("/kb/build-graph/{doc_id}", summary="为 KB 文档触发图谱构建", tags=["KnowledgeBase"])
+async def kb_build_graph(doc_id: str, kb_id: str = "global"):
+    """
+    从知识库文档的分块数据触发知识图谱构建任务。
+    需要 GraphBuilder 已初始化（启用了 KG 功能）。
+    """
+    pkb = _pkb()
+    gb  = getattr(_container, "graph_builder", None)
+    if not gb:
+        raise HTTPException(501, "GraphBuilder 未配置")
+
+    store  = pkb._store
+    chunks = await store.list_chunks(doc_id)
+    if not chunks:
+        raise HTTPException(404, f"文档 {doc_id} 不存在或没有分块数据")
+
+    chunk_dicts = [
+        {"text": c.text, "doc_id": c.doc_id, "chunk_id": c.chunk_id}
+        for c in chunks
+    ]
+    job_id = gb.start_build_job(chunks=chunk_dicts, kb_id=kb_id, doc_id=doc_id)
+    return {"job_id": job_id, "doc_id": doc_id, "chunks": len(chunk_dicts)}
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Knowledge Graph REST API  /kg/*
+# ══════════════════════════════════════════════════════════════════════
 
 class _KGBuildTextReq(_BM):
     text:   str
@@ -1161,6 +1385,22 @@ async def kg_reindex_document(doc_id: str, kb_id: str = "global"):
     store = _kg()
     await store.delete_by_doc(doc_id, kb_id)
     return {"ok": True, "message": "旧数据已清除，请重新调用 /kg/build/text 或 /kg/build/file 触发构建"}
+
+
+@app.on_event("startup")
+async def _startup():
+    """
+    FastAPI startup hook — finish PKB index recovery once the event loop is live.
+    _container is set in main() before uvicorn starts, so it is available here.
+    """
+    if _container is not None:
+        pkb = getattr(_container, "knowledge_base", None)
+        if pkb and hasattr(pkb, "initialize"):
+            try:
+                await pkb.initialize()
+                log.info("server.pkb_initialized")
+            except Exception as exc:
+                log.warning("server.pkb_startup_init_failed", error=str(exc))
 
 
 @app.get("/health", summary="健康检查")
