@@ -53,9 +53,11 @@ def engine(ollama_cfg):
 class TestOllamaConfig:
 
     def test_yaml_exists(self):
+        print(f"=========={YAML_PATH}=====")
         assert YAML_PATH.exists(), f"llm.yaml 不存在: {YAML_PATH}"
 
     def test_alias_found(self, ollama_cfg):
+        print(f"=========={ollama_cfg.alias}====={ollama_cfg.alias}")
         assert ollama_cfg.alias == ALIAS
 
     def test_sdk_is_openai_compatible(self, ollama_cfg):

@@ -12,6 +12,8 @@ if _proj_root in sys.path:
 import queue as _stdlib_queue          # noqa: E402 — 缓存 stdlib queue
 sys.path.insert(0, _proj_root)         # 还原项目路径
 
+import pytest
+
 
 def pytest_addoption(parser):
     parser.addoption(
@@ -20,3 +22,9 @@ def pytest_addoption(parser):
         default=False,
         help="运行需要真实外部服务的集成测试（如 Ollama、vLLM）",
     )
+
+
+@pytest.fixture
+def anyio_backend():
+    """强制使用 asyncio 后端（避免 anyio 枚举后端时因 queue 遮蔽导致空参数集）。"""
+    return "asyncio"
