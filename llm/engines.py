@@ -332,15 +332,29 @@ class OpenAIEngine:
                 yield delta
 
     async def embed(self, text: str) -> list[float]:
-        if not self._embedding_model:
-            log.warning("openai_engine.embed.no_model")
-            import hashlib
+        import hashlib
+
+        def _hash_fallback() -> list[float]:
+            """当无真实 embedding 模型时用 MD5 哈希填充 1536 维向量（仅供检索降级）。"""
             h = hashlib.md5(text.encode()).digest()
-            return [b / 255.0 for b in h] * 96
-        resp = await self._client.embeddings.create(
-            model=self._embedding_model, input=text
-        )
-        return resp.data[0].embedding
+            base = [b / 255.0 for b in h]          # 16 维
+            return (base * 96)[:1536]               # 复制到 1536 维
+
+        if not self._embedding_model:
+            log.warning("openai_engine.embed.no_model_hash_fallback")
+            return _hash_fallback()
+
+        try:
+            resp = await self._client.embeddings.create(
+                model=self._embedding_model, input=text
+            )
+            return resp.data[0].embedding
+        except Exception as exc:
+            # 模型不存在（Ollama 404）或网络错误时降级到 hash fallback
+            # 向量相似度失效，检索将退化为 BM25-only，但不阻断请求
+            log.warning("openai_engine.embed.failed_hash_fallback",
+                        model=self._embedding_model, error=str(exc))
+            return _hash_fallback()
 
     async def summarize(self, text: str, max_tokens: int) -> str:
         resp = await self._client.chat.completions.create(

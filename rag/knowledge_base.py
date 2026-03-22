@@ -240,10 +240,16 @@ class HybridRetriever:
 
     async def add_chunks(self, chunks: list[Chunk]) -> None:
         for chunk in chunks:
-            vec = await self._embed(chunk.text)
-            chunk.embedding = vec
+            try:
+                vec = await self._embed(chunk.text)
+                chunk.embedding = vec
+                self._embeddings.append(vec)
+            except Exception as exc:
+                # embed 失败（如 Ollama 无 embedding 模型）时跳过向量，仍走 BM25
+                log.warning("rag.add_chunk.embed_failed_bm25_only",
+                            chunk_id=chunk.id, error=str(exc))
+                chunk.embedding = None
             self._chunks.append(chunk)
-            self._embeddings.append(vec)
         self._bm25.build(self._chunks)
         log.info("rag.indexed", total_chunks=len(self._chunks))
 
@@ -251,18 +257,24 @@ class HybridRetriever:
         if not self._chunks:
             return []
 
-        q_vec   = await self._embed(query)
-        vec_hits = self._vector_search(q_vec, top_k * 2)
+        # 向量检索（embed 失败时降级 BM25-only，不抛异常）
+        vec_hits: list[tuple[float, "Chunk"]] = []
+        try:
+            q_vec    = await self._embed(query)
+            vec_hits = self._vector_search(q_vec, top_k * 2)
+        except Exception as exc:
+            log.warning("rag.search.embed_failed_bm25_only", error=str(exc))
+
         bm25_hits = self._bm25.search(query, top_k * 2)
 
         # RRF 融合
         scores: dict[str, float] = {}
-        chunk_map: dict[str, Chunk] = {}
+        chunk_map: dict[str, "Chunk"] = {}
         for rank, (_, chunk) in enumerate(vec_hits):
-            scores[chunk.id]   = scores.get(chunk.id, 0) + 1 / (self._rrf_k + rank + 1)
+            scores[chunk.id]    = scores.get(chunk.id, 0) + 1 / (self._rrf_k + rank + 1)
             chunk_map[chunk.id] = chunk
         for rank, (_, chunk) in enumerate(bm25_hits):
-            scores[chunk.id]   = scores.get(chunk.id, 0) + 1 / (self._rrf_k + rank + 1)
+            scores[chunk.id]    = scores.get(chunk.id, 0) + 1 / (self._rrf_k + rank + 1)
             chunk_map[chunk.id] = chunk
 
         ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
