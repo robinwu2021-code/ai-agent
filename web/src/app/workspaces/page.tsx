@@ -80,15 +80,17 @@ export default function WorkspacesPage() {
     if (!wsNameInput.trim()) { setWsError('请输入工作空间名称'); return }
     setCreatingWs(true)
     setWsError('')
-    const ws = await createWorkspace(wsNameInput.trim(), wsDescInput.trim() || undefined)
-    setCreatingWs(false)
-    if (ws) {
+    try {
+      const ws = await createWorkspace(wsNameInput.trim(), wsDescInput.trim() || undefined)
       setWsNameInput('')
       setWsDescInput('')
       setShowCreateWs(false)
       setSelectedWs(ws)
-    } else {
-      setWsError('创建失败，请重试')
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : '创建失败，请重试'
+      setWsError(`创建失败：${msg}`)
+    } finally {
+      setCreatingWs(false)
     }
   }
 
@@ -99,18 +101,20 @@ export default function WorkspacesPage() {
     if (!projNameInput.trim()) { setProjError('请输入项目名称'); return }
     setCreatingProj(true)
     setProjError('')
-    const proj = await createProject(
-      selectedWs.workspace_id,
-      projNameInput.trim(),
-      projDescInput.trim() || undefined
-    )
-    setCreatingProj(false)
-    if (proj) {
+    try {
+      await createProject(
+        selectedWs.workspace_id,
+        projNameInput.trim(),
+        projDescInput.trim() || undefined
+      )
       setProjNameInput('')
       setProjDescInput('')
       setShowCreateProj(false)
-    } else {
-      setProjError('创建失败，请重试')
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : '创建失败，请重试'
+      setProjError(`创建失败：${msg}`)
+    } finally {
+      setCreatingProj(false)
     }
   }
 

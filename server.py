@@ -642,19 +642,30 @@ from pydantic import BaseModel as _BM
 
 class _CreateWorkspaceReq(_BM):
     name:           str
-    creator_id:     str
+    # 同时接受 creator_id（后端标准）和 created_by（前端惯例），二者皆可
+    creator_id:     str   = ""
+    created_by:     str   = ""   # alias for creator_id
     description:    str   = ""
     system_prompt:  str   = ""
     allowed_skills: list[str] = []
     token_budget:   int   = 16_000
     max_steps:      int   = 20
 
+    @property
+    def resolved_creator(self) -> str:
+        return self.creator_id or self.created_by or "anonymous"
+
 class _CreateProjectReq(_BM):
     name:           str
-    creator_id:     str
+    creator_id:     str   = ""
+    created_by:     str   = ""   # alias for creator_id
     description:    str   = ""
     system_prompt:  str   = ""
     allowed_skills: list[str] = []
+
+    @property
+    def resolved_creator(self) -> str:
+        return self.creator_id or self.created_by or "anonymous"
     token_budget:   int   = 12_000
     max_steps:      int   = 20
 
@@ -684,21 +695,31 @@ def _wm():
 @app.post("/workspaces", summary="创建工作区", tags=["Workspace"])
 async def create_workspace(req: _CreateWorkspaceReq):
     ws = await _wm().create_workspace(
-        name=req.name, creator_id=req.creator_id,
+        name=req.name, creator_id=req.resolved_creator,
         description=req.description, system_prompt=req.system_prompt,
         allowed_skills=req.allowed_skills,
         token_budget=req.token_budget, max_steps=req.max_steps,
     )
-    return {"workspace_id": ws.workspace_id, "name": ws.name}
+    return {
+        "workspace_id": ws.workspace_id,
+        "name":         ws.name,
+        "description":  ws.description,
+        "member_count": len(ws.members),
+        "project_count": len(ws.projects),
+    }
 
 
 @app.get("/workspaces", summary="列出工作区", tags=["Workspace"])
 async def list_workspaces(user_id: str | None = None):
     workspaces = await _wm().list_workspaces(user_id)
     return {"workspaces": [
-        {"workspace_id": w.workspace_id, "name": w.name,
-         "description": w.description,
-         "members": len(w.members), "projects": len(w.projects)}
+        {
+            "workspace_id":  w.workspace_id,
+            "name":          w.name,
+            "description":   w.description,
+            "member_count":  len(w.members),
+            "project_count": len(w.projects),
+        }
         for w in workspaces
     ]}
 
@@ -738,20 +759,31 @@ async def remove_workspace_member(workspace_id: str, user_id: str, operator_id: 
 @app.post("/workspaces/{workspace_id}/projects", summary="创建项目", tags=["Workspace"])
 async def create_project(workspace_id: str, req: _CreateProjectReq):
     proj = await _wm().create_project(
-        workspace_id=workspace_id, creator_id=req.creator_id,
+        workspace_id=workspace_id, creator_id=req.resolved_creator,
         name=req.name, description=req.description,
         system_prompt=req.system_prompt, allowed_skills=req.allowed_skills,
         token_budget=req.token_budget, max_steps=req.max_steps,
     )
-    return {"project_id": proj.project_id, "name": proj.name}
+    return {
+        "project_id":   proj.project_id,
+        "workspace_id": proj.workspace_id,
+        "name":         proj.name,
+        "description":  proj.description,
+        "member_count": len(proj.members),
+    }
 
 
 @app.get("/workspaces/{workspace_id}/projects", summary="列出项目", tags=["Workspace"])
 async def list_projects(workspace_id: str, user_id: str | None = None):
     projects = await _wm().list_projects(workspace_id, user_id)
     return {"projects": [
-        {"project_id": p.project_id, "name": p.name,
-         "description": p.description, "members": len(p.members)}
+        {
+            "project_id":   p.project_id,
+            "workspace_id": p.workspace_id,
+            "name":         p.name,
+            "description":  p.description,
+            "member_count": len(p.members),
+        }
         for p in projects
     ]}
 

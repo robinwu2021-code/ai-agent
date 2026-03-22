@@ -233,20 +233,29 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
 
   const createWorkspace = useCallback(
     async (name: string, description?: string): Promise<WorkspaceInfo | null> => {
-      try {
-        const res = await fetch('/api/agent/workspaces', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ name, description, created_by: currentUser.user_id }),
-        })
-        if (!res.ok) throw new Error(`HTTP ${res.status}`)
-        const json = await res.json()
-        const ws: WorkspaceInfo = json.workspace ?? json
-        await refreshWorkspaces()
-        return ws
-      } catch {
-        return null
+      const res = await fetch('/api/agent/workspaces', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name,
+          description: description ?? '',
+          creator_id: currentUser.user_id,  // 与服务端 _CreateWorkspaceReq 字段对齐
+        }),
+      })
+      if (!res.ok) {
+        const detail = await res.text().catch(() => `HTTP ${res.status}`)
+        throw new Error(detail || `HTTP ${res.status}`)
       }
+      const json = await res.json()
+      const ws: WorkspaceInfo = {
+        workspace_id:  json.workspace_id,
+        name:          json.name,
+        description:   json.description ?? '',
+        member_count:  json.member_count ?? 0,
+        project_count: json.project_count ?? 0,
+      }
+      await refreshWorkspaces()
+      return ws
     },
     [currentUser.user_id, refreshWorkspaces]
   )
@@ -257,23 +266,32 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       name: string,
       description?: string
     ): Promise<ProjectInfo | null> => {
-      try {
-        const res = await fetch(
-          `/api/agent/workspaces/${encodeURIComponent(workspace_id)}/projects`,
-          {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ name, description, created_by: currentUser.user_id }),
-          }
-        )
-        if (!res.ok) throw new Error(`HTTP ${res.status}`)
-        const json = await res.json()
-        const proj: ProjectInfo = json.project ?? json
-        await refreshProjects(workspace_id)
-        return proj
-      } catch {
-        return null
+      const res = await fetch(
+        `/api/agent/workspaces/${encodeURIComponent(workspace_id)}/projects`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            name,
+            description: description ?? '',
+            creator_id: currentUser.user_id,  // 与服务端 _CreateProjectReq 字段对齐
+          }),
+        }
+      )
+      if (!res.ok) {
+        const detail = await res.text().catch(() => `HTTP ${res.status}`)
+        throw new Error(detail || `HTTP ${res.status}`)
       }
+      const json = await res.json()
+      const proj: ProjectInfo = {
+        project_id:   json.project_id,
+        workspace_id: json.workspace_id ?? workspace_id,
+        name:         json.name,
+        description:  json.description ?? '',
+        member_count: json.member_count ?? 0,
+      }
+      await refreshProjects(workspace_id)
+      return proj
     },
     [currentUser.user_id, refreshProjects]
   )
