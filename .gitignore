@@ -37,3 +37,8 @@ htmlcov/
 # OS
 .DS_Store
 Thumbs.db
+
+# SQLite runtime databases (generated at startup, not for VCS)
+*.db
+*.db-shm
+*.db-wal
