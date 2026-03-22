@@ -226,6 +226,7 @@ class LLMConfig:
                 timeout_sec     = self.timeout_sec,
                 max_retries     = self.max_retries,
                 http_proxy      = self.http_proxy,
+                alias           = self.alias,   # pass alias for call logging
             )
 
         if self.sdk == "openai_compatible":
@@ -241,6 +242,7 @@ class LLMConfig:
                 http_proxy        = self.http_proxy,
                 is_azure          = self.is_azure,
                 azure_api_version = self.azure_api_version,
+                alias             = self.alias,   # pass alias for call logging
             )
 
         raise ValueError(

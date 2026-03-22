@@ -144,6 +144,15 @@ class Settings(BaseSettings):
     log_level: str  = Field("INFO",  alias="LOG_LEVEL")
     json_logs: bool = Field(False,   alias="JSON_LOGS")
 
+    # ── LLM 调用全链路日志 ────────────────────────────────────────
+    # 每次 chat / stream_chat / embed 均会产生 request / response / error 三类事件
+    llm_call_log_enabled:      bool  = Field(True,                    alias="LLM_CALL_LOG_ENABLED")
+    llm_call_log_level:        str   = Field("DEBUG",                 alias="LLM_CALL_LOG_LEVEL")
+    llm_call_log_file:         str   = Field("logs/llm_calls.jsonl",  alias="LLM_CALL_LOG_FILE")
+    llm_call_log_max_bytes:    int   = Field(10 * 1024 * 1024,        alias="LLM_CALL_LOG_MAX_BYTES")
+    llm_call_log_backup_count: int   = Field(5,                       alias="LLM_CALL_LOG_BACKUP_COUNT")
+    llm_call_log_msg_preview:  int   = Field(500,                     alias="LLM_CALL_LOG_MSG_PREVIEW")
+
     model_config = {
         "env_file":          ".env",
         "env_file_encoding": "utf-8",

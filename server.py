@@ -164,6 +164,19 @@ def _build_container(engine_alias: str | None = None):
     from utils.llm_config import load_from_yaml
     from llm.router import LLMRouter, ModelRegistry, TaskRouter
 
+    # ── 初始化 LLM 调用全链路日志 ─────────────────────────────────
+    from utils.config import get_settings as _get_settings
+    from llm.call_logger import init_call_logger as _init_call_logger
+    _s = _get_settings()
+    _init_call_logger(
+        enabled      = _s.llm_call_log_enabled,
+        log_level    = _s.llm_call_log_level,
+        file_path    = _s.llm_call_log_file,
+        max_bytes    = _s.llm_call_log_max_bytes,
+        backup_count = _s.llm_call_log_backup_count,
+        msg_preview  = _s.llm_call_log_msg_preview,
+    )
+
     yaml_path = pathlib.Path(__file__).parent / "llm.yaml"
     configs, router_cfg = load_from_yaml(yaml_path)
 
