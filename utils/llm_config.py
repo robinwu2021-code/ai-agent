@@ -112,12 +112,26 @@ SdkType = Literal["anthropic", "openai_compatible"]
 SDK_DEFAULTS: dict[str, dict[str, str]] = {
     "anthropic": {
         "default_model":   "claude-sonnet-4-20250514",
-        "embedding_model": "",          # Anthropic 无原生 embedding API
+        "embedding_model": "",   # Anthropic 无原生 embedding API，退化 hash
     },
     "openai_compatible": {
         "default_model":   "gpt-4o",
-        "embedding_model": "text-embedding-3-small",
+        # ⚠️  不再预设 text-embedding-3-small：
+        #   该模型仅 OpenAI/Azure 支持，Ollama/DeepSeek/vLLM 等均无此模型。
+        #   实例若需 embedding，应在 LLMConfig.embedding_model 或 llm.yaml 中
+        #   显式声明（如 qwen3-embedding:8b / text-embedding-3-small）。
+        #   未声明时 embed() 退化为 hash-fallback，检索仍可用（BM25 兜底）。
+        "embedding_model": "",
     },
+}
+
+# ── 已知厂商的 embedding 模型推荐值（供文档参考，不自动使用）──────
+_VENDOR_EMBED_SUGGESTIONS: dict[str, str] = {
+    "openai":   "text-embedding-3-small",
+    "azure":    "text-embedding-3-small",
+    "ollama":   "qwen3-embedding:8b",    # ollama pull qwen3-embedding:8b
+    "deepseek": "",                       # DeepSeek 暂无官方 embedding API
+    "groq":     "",
 }
 
 # ── 知名厂商的 base_url（手工配置时可直接引用）────────────────────

@@ -77,16 +77,32 @@ engines:
   #   cost_tier: 1
   #   tags: [fast, fallback]
 
-  # ── Ollama 本地（qwen3.5:35b-b，无需 key）───────────────────
+  # ── Ollama 本地推理（qwen3，无需 key）──────────────────────
   - alias: ollama-qwen3
     sdk: openai_compatible
     base_url: http://192.168.0.222:11434/v1
     model: qwen3.5:35b-a3b
+    embedding_model: ""              # 推理引擎不做 embedding，由 ollama-embed 专属处理
     max_tokens: 8192
     timeout_sec: 300.0               # 本地大模型推理较慢，适当放大超时
     cost_tier: 0
     supports_tools: true
+    supports_embed: false
     tags: [local, offline, qwen]
+
+  # ── Ollama 本地 Embedding（qwen3-embedding:8b）─────────────
+  # 安装：ollama pull qwen3-embedding:8b
+  - alias: ollama-embed
+    sdk: openai_compatible
+    base_url: http://192.168.0.222:11434/v1
+    model: qwen3-embedding:8b        # 主模型字段（有些 Ollama 版本兼容）
+    embedding_model: qwen3-embedding:8b
+    max_tokens: 4096
+    timeout_sec: 60.0
+    cost_tier: 0
+    supports_tools: false
+    supports_embed: true
+    tags: [local, embed, qwen]
 
   # ── vLLM 本地（qwen3.5:35b-b，OpenAI 兼容接口）─────────────
   - alias: vllm-qwen3
@@ -110,7 +126,8 @@ router:
   plan: claude-smart          # Plan-Execute 规划阶段
   summarize: claude-fast      # 文本摘要/上下文裁剪（用便宜模型）
   consolidate: claude-fast    # 记忆固化提炼
-  # embed: azure-east         # 向量化（需要支持 embedding 的引擎）
+  embed: ollama-embed         # 向量化 → 本地 qwen3-embedding:8b（离线可用，0成本）
+  # embed: azure-east         # 若需 OpenAI embedding 取消注释并注释上行
   # eval: claude-fast         # LLM-as-judge 打分
   # route: claude-fast        # Multi-Agent 路由决策
 
