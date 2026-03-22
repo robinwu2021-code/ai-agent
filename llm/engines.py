@@ -333,6 +333,7 @@ class OpenAIEngine:
 
     async def embed(self, text: str) -> list[float]:
         import hashlib
+        import time
 
         def _hash_fallback() -> list[float]:
             """当无真实 embedding 模型时用 MD5 哈希填充 1536 维向量（仅供检索降级）。"""
@@ -341,19 +342,54 @@ class OpenAIEngine:
             return (base * 96)[:1536]               # 复制到 1536 维
 
         if not self._embedding_model:
-            log.warning("openai_engine.embed.no_model_hash_fallback")
+            log.warning(
+                "openai_engine.embed.no_model_hash_fallback",
+                text_len=len(text),
+                text_preview=text[:80],
+            )
             return _hash_fallback()
+
+        # ── 请求日志 ──────────────────────────────────────────────────
+        t0 = time.perf_counter()
+        log.debug(
+            "openai_engine.embed.request",
+            model=self._embedding_model,
+            text_len=len(text),
+            text_preview=text[:120],
+        )
 
         try:
             resp = await self._client.embeddings.create(
                 model=self._embedding_model, input=text
             )
-            return resp.data[0].embedding
+            elapsed_ms = (time.perf_counter() - t0) * 1000
+            vec = resp.data[0].embedding
+
+            # ── 响应日志 ──────────────────────────────────────────────
+            log.debug(
+                "openai_engine.embed.response",
+                model=self._embedding_model,
+                dims=len(vec),
+                elapsed_ms=round(elapsed_ms, 1),
+                usage_tokens=getattr(resp.usage, "total_tokens", None),
+                vec_preview=[round(v, 6) for v in vec[:6]],  # 前 6 维供核查
+            )
+            return vec
+
         except Exception as exc:
+            elapsed_ms = (time.perf_counter() - t0) * 1000
+            # ── 异常日志 ──────────────────────────────────────────────
             # 模型不存在（Ollama 404）或网络错误时降级到 hash fallback
-            # 向量相似度失效，检索将退化为 BM25-only，但不阻断请求
-            log.warning("openai_engine.embed.failed_hash_fallback",
-                        model=self._embedding_model, error=str(exc))
+            # 向量相似度失效，检索退化为 BM25-only，但不阻断请求
+            log.warning(
+                "openai_engine.embed.failed_hash_fallback",
+                model=self._embedding_model,
+                elapsed_ms=round(elapsed_ms, 1),
+                error=str(exc),
+                error_type=type(exc).__name__,
+                text_len=len(text),
+                text_preview=text[:80],
+            )
             return _hash_fallback()
 
     async def summarize(self, text: str, max_tokens: int) -> str:
