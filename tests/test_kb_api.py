@@ -65,8 +65,69 @@ def mock_pkb():
     pkb._store = MagicMock()
     pkb._store.get_document = AsyncMock(return_value=doc)
     pkb._store.list_chunks = AsyncMock(return_value=[chunk])
+    pkb._store.list_chunks_by_kb = AsyncMock(return_value=[chunk])
     pkb.list_documents.return_value = [doc]
+    # _vector_store=None → kb_build_graph falls through to SQLite path
+    pkb._vector_store = None
     return pkb
+
+
+@pytest.fixture
+def mock_kg_store():
+    """A fully mocked SQLiteKGStore."""
+    from rag.graph.models import Node, Edge, NodeType, SubGraph
+    store = MagicMock()
+
+    node = Node(id="n_001", kb_id="global", name="TestEntity",
+                node_type=NodeType.ORG, description="A test org",
+                aliases=[], doc_ids=["doc_001"], degree=2, created_at=time.time())
+    node2 = Node(id="n_002", kb_id="global", name="RelatedEntity",
+                 node_type=NodeType.CONCEPT, description="A concept",
+                 aliases=[], doc_ids=[], degree=1, created_at=time.time())
+    edge = Edge(id="e_001", kb_id="global", src_id="n_001", dst_id="n_002",
+                relation="related_to", weight=0.9, context="some evidence",
+                created_at=time.time())
+
+    store.get_stats = AsyncMock(return_value={"nodes": 2, "edges": 1, "communities": 0})
+    store.list_nodes = AsyncMock(return_value=[node, node2])
+    store.get_node = AsyncMock(return_value=node)
+    store.get_node_by_name = AsyncMock(return_value=None)   # default: entity not found → will be created
+    store.upsert_node = AsyncMock()
+    store.upsert_edge = AsyncMock()
+    store.delete_node = AsyncMock()
+    store.delete_edge = AsyncMock()
+    store.delete_by_doc = AsyncMock()
+    store.search_nodes_by_text = AsyncMock(return_value=[node])
+    store.search_nodes_by_embedding = AsyncMock(return_value=[node])
+    store.list_edges = AsyncMock(return_value=[edge])
+    store.get_full_graph = AsyncMock(return_value=([node, node2], [edge]))
+    store.get_neighbors = AsyncMock(return_value=([node2], [edge]))
+
+    # Expose fixtures for per-test override
+    store._node  = node
+    store._node2 = node2
+    store._edge  = edge
+    return store
+
+
+@pytest.fixture
+def mock_graph_builder():
+    """A mocked GraphBuilder."""
+    gb = MagicMock()
+    gb.start_build_job       = MagicMock(return_value="job_kg_001")
+    gb.start_build_text_job  = MagicMock(return_value="job_txt_001")
+    gb.get_job_status        = MagicMock(return_value={
+        "status": "done", "progress": 1.0,
+        "result": {"nodes_created": 2, "edges_created": 1, "triples_found": 3},
+        "kb_id": "global", "doc_id": "doc_001",
+        "created_at": 0.0, "finished_at": 1.0, "error": None,
+    })
+    gb.list_jobs = MagicMock(return_value=[{
+        "status": "done", "kb_id": "global", "doc_id": "doc_001",
+        "progress": 1.0, "created_at": 0.0, "finished_at": 1.0, "error": None,
+    }])
+    gb.rebuild_communities = AsyncMock(return_value={"communities_created": 1, "communities_skipped": 0})
+    return gb
 
 
 @pytest.fixture
@@ -80,9 +141,39 @@ def mock_container(mock_pkb):
     mock_resp.content = "这是基于知识库的模拟回答。"
     router = MagicMock()
     router.chat = AsyncMock(return_value=mock_resp)
+    router.embed = AsyncMock(return_value=[0.1] * 8)
     container._effective_router = MagicMock(return_value=router)
     container.kg_store = None
+    # graph_builder is intentionally left as a MagicMock auto-attribute so
+    # TestKBBuildGraph tests that set it to None continue to work correctly.
     return container
+
+
+@pytest.fixture
+def kg_app_client(mock_pkb, mock_kg_store, mock_graph_builder):
+    """FastAPI TestClient pre-wired with KG store + GraphBuilder."""
+    import sys
+    from unittest.mock import MagicMock as _MM
+    for _pkg in ("uvicorn",):
+        if _pkg not in sys.modules:
+            sys.modules[_pkg] = _MM()
+    import server as srv
+
+    container = MagicMock()
+    container.knowledge_base = mock_pkb
+
+    mock_resp = MagicMock()
+    mock_resp.content = "模拟KG回答"
+    router = MagicMock()
+    router.chat = AsyncMock(return_value=mock_resp)
+    router.embed = AsyncMock(return_value=[0.1] * 8)
+    container._effective_router = MagicMock(return_value=router)
+    container.kg_store      = mock_kg_store
+    container.graph_builder = mock_graph_builder
+
+    srv._container = container
+    from fastapi.testclient import TestClient
+    return TestClient(srv.app)
 
 
 @pytest.fixture
@@ -518,3 +609,778 @@ class TestLiveKBApi:
         assert res.status_code == 200
         data = res.json()
         assert "documents" in data
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Missing KB endpoint coverage
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestKBGetDocument:
+    def test_get_existing_document(self, app_client):
+        res = app_client.get("/kb/documents/mock_doc")
+        assert res.status_code == 200
+        data = res.json()
+        assert data["doc_id"] == "mock_doc"
+        assert "status" in data
+        assert "chunk_count" in data
+
+    def test_get_missing_document_returns_404(self, app_client, mock_pkb):
+        mock_pkb._store.get_document = AsyncMock(return_value=None)
+        res = app_client.get("/kb/documents/nonexistent_xyz")
+        assert res.status_code == 404
+
+    def test_get_document_has_filename(self, app_client):
+        res = app_client.get("/kb/documents/mock_doc")
+        assert res.status_code == 200
+        assert res.json()["filename"] == "mock.txt"
+
+
+class TestKBChunks:
+    def test_list_chunks_for_doc(self, app_client):
+        res = app_client.get("/kb/chunks?kb_id=global&doc_id=mock_doc")
+        assert res.status_code == 200
+        data = res.json()
+        assert "chunks" in data
+        assert isinstance(data["chunks"], list)
+        assert "total" in data
+
+    def test_list_chunks_all_kb(self, app_client):
+        res = app_client.get("/kb/chunks?kb_id=global")
+        assert res.status_code == 200
+        data = res.json()
+        assert "chunks" in data
+        assert isinstance(data["total"], int)
+
+    def test_list_chunks_no_embedding_in_response(self, app_client):
+        """embedding field must be stripped from output (size + privacy)."""
+        res = app_client.get("/kb/chunks?kb_id=global&doc_id=mock_doc")
+        assert res.status_code == 200
+        for chunk in res.json()["chunks"]:
+            assert "embedding" not in chunk
+
+    def test_list_chunks_limit_respected(self, app_client):
+        res = app_client.get("/kb/chunks?kb_id=global&limit=10")
+        assert res.status_code == 200
+
+
+class TestKBUpload:
+    def test_upload_txt_file(self, app_client):
+        res = app_client.post(
+            "/kb/documents/upload",
+            files={"file": ("upload_test.txt", b"Upload test content.", "text/plain")},
+            data={"kb_id": "global"},
+        )
+        assert res.status_code == 200
+        data = res.json()
+        assert "doc_id" in data
+
+    def test_upload_unsupported_type_returns_400(self, app_client):
+        res = app_client.post(
+            "/kb/documents/upload",
+            files={"file": ("bad.exe", b"\x00\x01\x02", "application/octet-stream")},
+            data={"kb_id": "global"},
+        )
+        assert res.status_code == 400
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TestKBBuildGraph — vector store path (new after fix)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestKBBuildGraphVectorStore:
+    def test_build_graph_uses_vector_store_when_active(self, app_client, mock_container, mock_pkb):
+        """When _vector_store is set, chunks should come from it (not SQLite)."""
+        mock_gb = MagicMock()
+        mock_gb.start_build_job = MagicMock(return_value="job_vs_001")
+        mock_container.graph_builder = mock_gb
+
+        # Attach a mock vector store that returns chunks as dicts
+        vs = MagicMock()
+        vs.list_chunks = AsyncMock(return_value=[
+            {"chunk_id": "vs_c1", "doc_id": "vs_doc", "text": "Vector store chunk 1"},
+            {"chunk_id": "vs_c2", "doc_id": "vs_doc", "text": "Vector store chunk 2"},
+        ])
+        mock_pkb._vector_store = vs
+        mock_pkb._store.list_chunks = AsyncMock(return_value=[])  # SQLite is empty
+
+        res = app_client.post("/kb/build-graph/vs_doc?kb_id=global")
+        assert res.status_code == 200
+        data = res.json()
+        assert data["job_id"] == "job_vs_001"
+        assert data["chunks"] == 2
+
+        # Restore for other tests
+        mock_pkb._vector_store = None
+
+    def test_build_graph_falls_back_to_sqlite_on_vector_store_error(
+        self, app_client, mock_container, mock_pkb
+    ):
+        """If vector store raises, fall through to SQLite."""
+        from rag.store import KBChunk
+        mock_gb = MagicMock()
+        mock_gb.start_build_job = MagicMock(return_value="job_fallback")
+        mock_container.graph_builder = mock_gb
+
+        vs = MagicMock()
+        vs.list_chunks = AsyncMock(side_effect=RuntimeError("connection timeout"))
+        mock_pkb._vector_store = vs
+
+        sqlite_chunks = [KBChunk(chunk_id="sq1", doc_id="doc_fb", kb_id="global",
+                                 chunk_index=0, text="SQLite fallback text",
+                                 created_at=time.time())]
+        mock_pkb._store.list_chunks = AsyncMock(return_value=sqlite_chunks)
+
+        res = app_client.post("/kb/build-graph/doc_fb?kb_id=global")
+        assert res.status_code == 200
+        assert res.json()["chunks"] == 1
+
+        # Restore
+        mock_pkb._vector_store = None
+        mock_pkb._store.list_chunks = AsyncMock(return_value=sqlite_chunks)
+
+    def test_build_graph_returns_404_when_both_stores_empty(
+        self, app_client, mock_container, mock_pkb
+    ):
+        """Both vector store and SQLite empty → 404."""
+        mock_gb = MagicMock()
+        mock_gb.start_build_job = MagicMock(return_value="job_404")
+        mock_container.graph_builder = mock_gb
+
+        vs = MagicMock()
+        vs.list_chunks = AsyncMock(return_value=[])
+        mock_pkb._vector_store = vs
+        mock_pkb._store.list_chunks = AsyncMock(return_value=[])
+
+        res = app_client.post("/kb/build-graph/empty_doc?kb_id=global")
+        assert res.status_code == 404
+
+        mock_pkb._vector_store = None
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# KG: /kg/build/* endpoints
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestKGBuildText:
+    def test_build_from_text_success(self, kg_app_client):
+        res = kg_app_client.post("/kg/build/text", json={
+            "text": "Anthropic was founded by Dario Amodei. Claude is made by Anthropic.",
+            "kb_id": "global",
+        })
+        assert res.status_code == 200
+        data = res.json()
+        assert "job_id"  in data
+        assert "doc_id"  in data
+        assert "kb_id"   in data
+        assert data["job_id"] == "job_txt_001"
+
+    def test_build_from_text_auto_generates_doc_id(self, kg_app_client):
+        """When doc_id is omitted, server generates one starting with 'doc_'."""
+        res = kg_app_client.post("/kg/build/text", json={
+            "text": "Some entity text here.",
+            "kb_id": "global",
+        })
+        assert res.status_code == 200
+        doc_id = res.json()["doc_id"]
+        assert doc_id.startswith("doc_")
+
+    def test_build_from_text_with_explicit_doc_id(self, kg_app_client):
+        res = kg_app_client.post("/kg/build/text", json={
+            "text": "Entity A is related to Entity B.",
+            "kb_id": "global",
+            "doc_id": "my_custom_doc",
+        })
+        assert res.status_code == 200
+        assert res.json()["doc_id"] == "my_custom_doc"
+
+    def test_build_from_text_missing_text_returns_422(self, kg_app_client):
+        res = kg_app_client.post("/kg/build/text", json={"kb_id": "global"})
+        assert res.status_code == 422
+
+    def test_build_text_no_graph_builder_returns_501(self, app_client, mock_container):
+        mock_container.graph_builder = None
+        res = app_client.post("/kg/build/text", json={"text": "some text", "kb_id": "global"})
+        assert res.status_code == 501
+
+
+class TestKGBuildFile:
+    def test_build_from_txt_file(self, kg_app_client):
+        res = kg_app_client.post(
+            "/kg/build/file",
+            files={"file": ("kg_test.txt", b"Alice works at OpenAI. Bob founded DeepMind.", "text/plain")},
+            data={"kb_id": "global"},
+        )
+        assert res.status_code == 200
+        data = res.json()
+        assert "job_id"    in data
+        assert "doc_id"    in data
+        assert "kb_id"     in data
+        assert "chunks"    in data
+        assert "filename"  in data
+        assert data["filename"] == "kg_test.txt"
+
+    def test_build_from_md_file(self, kg_app_client):
+        content = b"# Companies\n\nMicrosoft acquired GitHub in 2018.\n"
+        res = kg_app_client.post(
+            "/kg/build/file",
+            files={"file": ("notes.md", content, "text/markdown")},
+            data={"kb_id": "global"},
+        )
+        assert res.status_code == 200
+
+    def test_build_file_no_graph_builder_returns_501(self, app_client, mock_container):
+        mock_container.graph_builder = None
+        res = app_client.post(
+            "/kg/build/file",
+            files={"file": ("t.txt", b"text", "text/plain")},
+            data={"kb_id": "global"},
+        )
+        assert res.status_code == 501
+
+
+class TestKGBuildStatus:
+    def test_get_job_status_done(self, kg_app_client):
+        res = kg_app_client.get("/kg/build/status/job_kg_001")
+        assert res.status_code == 200
+        data = res.json()
+        assert data["status"] == "done"
+        assert data["progress"] == 1.0
+
+    def test_get_job_status_has_result(self, kg_app_client):
+        res = kg_app_client.get("/kg/build/status/job_kg_001")
+        assert res.status_code == 200
+        result = res.json().get("result", {})
+        assert "nodes_created"  in result
+        assert "edges_created"  in result
+        assert "triples_found"  in result
+
+    def test_get_job_status_not_found_returns_404(self, kg_app_client, mock_graph_builder):
+        mock_graph_builder.get_job_status = MagicMock(return_value=None)
+        res = kg_app_client.get("/kg/build/status/nonexistent_job_xyz")
+        assert res.status_code == 404
+
+    def test_get_job_status_no_builder_returns_501(self, app_client, mock_container):
+        mock_container.graph_builder = None
+        res = app_client.get("/kg/build/status/any_job")
+        assert res.status_code == 501
+
+
+class TestKGBuildJobs:
+    def test_list_jobs_returns_list(self, kg_app_client):
+        res = kg_app_client.get("/kg/build/jobs")
+        assert res.status_code == 200
+        data = res.json()
+        assert "jobs" in data
+        assert isinstance(data["jobs"], list)
+
+    def test_list_jobs_shape(self, kg_app_client):
+        res = kg_app_client.get("/kg/build/jobs")
+        jobs = res.json()["jobs"]
+        assert len(jobs) >= 1
+        job = jobs[0]
+        assert "status"  in job
+        assert "kb_id"   in job
+
+    def test_list_jobs_no_builder_returns_501(self, app_client, mock_container):
+        mock_container.graph_builder = None
+        res = app_client.get("/kg/build/jobs")
+        assert res.status_code == 501
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# KG: communities rebuild
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestKGCommunitiesRebuild:
+    def test_rebuild_starts_background_task(self, kg_app_client):
+        res = kg_app_client.post("/kg/communities/rebuild?kb_id=global")
+        assert res.status_code == 200
+        data = res.json()
+        assert data["ok"] is True
+        assert data["kb_id"] == "global"
+        assert "message" in data
+
+    def test_rebuild_custom_kb_id(self, kg_app_client):
+        res = kg_app_client.post("/kg/communities/rebuild?kb_id=my_kb")
+        assert res.status_code == 200
+        assert res.json()["kb_id"] == "my_kb"
+
+    def test_rebuild_no_graph_builder_returns_501(self, app_client, mock_container):
+        mock_container.graph_builder = None
+        res = app_client.post("/kg/communities/rebuild")
+        assert res.status_code == 501
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# KG: /kg/query
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _make_mock_gr():
+    """Build a mock GraphRetriever with all search methods mocked."""
+    from rag.graph.models import Node, Edge, NodeType, SubGraph
+    node = Node(id="n_q1", kb_id="global", name="QueryEntity",
+                node_type=NodeType.CONCEPT, degree=1, created_at=time.time())
+    edge = Edge(id="e_q1", kb_id="global", src_id="n_q1", dst_id="n_q1",
+                relation="self_ref", created_at=time.time())
+    sub = SubGraph(nodes=[node], edges=[edge], context_text="KG context text",
+                   reasoning_chain=[{"src": "A", "relation": "r", "dst": "B"}])
+
+    mock_gr = MagicMock()
+    mock_gr.local_search    = AsyncMock(return_value=sub)
+    mock_gr.global_search   = AsyncMock(return_value=sub)
+    mock_gr.path_search     = AsyncMock(return_value=sub)
+    mock_gr.format_for_prompt = MagicMock(return_value="KG context text")
+    return mock_gr
+
+
+class TestKGQuery:
+    def test_query_local_mode(self, kg_app_client):
+        mock_gr = _make_mock_gr()
+        with patch("server._gr", return_value=mock_gr):
+            res = kg_app_client.post("/kg/query", json={
+                "query": "What is TestEntity?", "kb_id": "global", "mode": "local",
+            })
+        assert res.status_code == 200
+        data = res.json()
+        assert "context"     in data
+        assert "subgraph"    in data
+        assert "nodes_found" in data
+        assert "edges_found" in data
+        assert data["mode"] == "local"
+
+    def test_query_global_mode(self, kg_app_client):
+        mock_gr = _make_mock_gr()
+        with patch("server._gr", return_value=mock_gr):
+            res = kg_app_client.post("/kg/query", json={
+                "query": "Summarize the graph", "kb_id": "global", "mode": "global",
+            })
+        assert res.status_code == 200
+        mock_gr.global_search.assert_called_once()
+
+    def test_query_path_mode(self, kg_app_client):
+        mock_gr = _make_mock_gr()
+        with patch("server._gr", return_value=mock_gr):
+            res = kg_app_client.post("/kg/query", json={
+                "query": "How are A and B related?", "kb_id": "global", "mode": "path",
+            })
+        assert res.status_code == 200
+        mock_gr.path_search.assert_called_once()
+
+    def test_query_default_mode_is_local(self, kg_app_client):
+        mock_gr = _make_mock_gr()
+        with patch("server._gr", return_value=mock_gr):
+            res = kg_app_client.post("/kg/query", json={
+                "query": "something", "kb_id": "global",
+            })
+        assert res.status_code == 200
+        mock_gr.local_search.assert_called_once()
+
+    def test_query_no_kg_returns_501(self, app_client, mock_container):
+        mock_container.kg_store = None
+        res = app_client.post("/kg/query", json={"query": "q", "kb_id": "global"})
+        assert res.status_code == 501
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# KG: /kg/search/entities
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestKGSearchEntities:
+    def test_search_returns_entities_list(self, kg_app_client):
+        res = kg_app_client.post(
+            "/kg/search/entities",
+            params={"query": "TestEntity", "kb_id": "global"},
+        )
+        assert res.status_code == 200
+        data = res.json()
+        assert "entities" in data
+        assert isinstance(data["entities"], list)
+
+    def test_search_entity_shape(self, kg_app_client):
+        res = kg_app_client.post(
+            "/kg/search/entities",
+            params={"query": "TestEntity", "kb_id": "global"},
+        )
+        entities = res.json()["entities"]
+        if entities:
+            e = entities[0]
+            assert "id"          in e
+            assert "name"        in e
+            assert "type"        in e
+            assert "description" in e
+            assert "degree"      in e
+
+    def test_search_deduplicates_text_and_vector_hits(self, kg_app_client, mock_kg_store):
+        """search_nodes_by_text and search_nodes_by_embedding return same node → only one in result."""
+        res = kg_app_client.post(
+            "/kg/search/entities",
+            params={"query": "TestEntity", "kb_id": "global", "limit": "20"},
+        )
+        ids = [e["id"] for e in res.json()["entities"]]
+        assert len(ids) == len(set(ids)), "Duplicate entity IDs in search results"
+
+    def test_search_no_kg_returns_501(self, app_client, mock_container):
+        mock_container.kg_store = None
+        res = app_client.post("/kg/search/entities", params={"query": "x"})
+        assert res.status_code == 501
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# KG: /kg/subgraph
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestKGSubgraph:
+    def test_subgraph_returns_nodes_edges(self, kg_app_client):
+        res = kg_app_client.post("/kg/subgraph", json={
+            "node_id": "n_001", "kb_id": "global", "hops": 1,
+        })
+        assert res.status_code == 200
+        data = res.json()
+        assert "nodes" in data
+        assert "edges" in data
+        assert isinstance(data["nodes"], list)
+        assert isinstance(data["edges"], list)
+
+    def test_subgraph_center_node_prepended(self, kg_app_client, mock_kg_store):
+        """Center node is included in nodes list when not already present."""
+        from rag.graph.models import Node, NodeType
+        center = Node(id="n_center", kb_id="global", name="Center",
+                      node_type=NodeType.PERSON, degree=5, created_at=time.time())
+        neighbor = Node(id="n_neighbor", kb_id="global", name="Neighbor",
+                        node_type=NodeType.ORG, degree=1, created_at=time.time())
+        mock_kg_store.get_node = AsyncMock(return_value=center)
+        mock_kg_store.get_neighbors = AsyncMock(return_value=([neighbor], []))
+
+        res = kg_app_client.post("/kg/subgraph", json={"node_id": "n_center", "kb_id": "global"})
+        assert res.status_code == 200
+        ids = [n["id"] for n in res.json()["nodes"]]
+        assert "n_center" in ids
+
+    def test_subgraph_unknown_node_returns_empty_center(self, kg_app_client, mock_kg_store):
+        """If the node doesn't exist, no center is prepended."""
+        mock_kg_store.get_node = AsyncMock(return_value=None)
+        mock_kg_store.get_neighbors = AsyncMock(return_value=([], []))
+
+        res = kg_app_client.post("/kg/subgraph", json={"node_id": "ghost_node", "kb_id": "global"})
+        assert res.status_code == 200
+        assert res.json()["nodes"] == []
+
+    def test_subgraph_no_kg_returns_501(self, app_client, mock_container):
+        mock_container.kg_store = None
+        res = app_client.post("/kg/subgraph", json={"node_id": "x", "kb_id": "global"})
+        assert res.status_code == 501
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# KG: /kg/path
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestKGPath:
+    def test_path_returns_expected_keys(self, kg_app_client):
+        mock_gr = _make_mock_gr()
+        with patch("server._gr", return_value=mock_gr):
+            res = kg_app_client.post("/kg/path", json={
+                "query": "How are A and B related?", "kb_id": "global",
+            })
+        assert res.status_code == 200
+        data = res.json()
+        assert "subgraph"        in data
+        assert "reasoning_chain" in data
+        assert "context"         in data
+
+    def test_path_no_kg_returns_501(self, app_client, mock_container):
+        mock_container.kg_store = None
+        res = app_client.post("/kg/path", json={"query": "q", "kb_id": "global"})
+        assert res.status_code == 501
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# KG: /kg/entities (list, detail, patch, delete)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestKGEntitiesListing:
+    def test_list_entities(self, kg_app_client):
+        res = kg_app_client.get("/kg/entities?kb_id=global")
+        assert res.status_code == 200
+        data = res.json()
+        assert "entities" in data
+        assert "total"    in data
+        assert isinstance(data["entities"], list)
+
+    def test_list_entities_shape(self, kg_app_client):
+        entities = kg_app_client.get("/kg/entities?kb_id=global").json()["entities"]
+        if entities:
+            e = entities[0]
+            assert "id"      in e
+            assert "name"    in e
+            assert "type"    in e
+            assert "degree"  in e
+            assert "aliases" in e
+
+    def test_list_entities_with_type_filter(self, kg_app_client, mock_kg_store):
+        from rag.graph.models import Node, NodeType
+        person = Node(id="np1", kb_id="global", name="Alice",
+                      node_type=NodeType.PERSON, degree=1, created_at=time.time())
+        mock_kg_store.list_nodes = AsyncMock(return_value=[person])
+        res = kg_app_client.get("/kg/entities?kb_id=global&node_type=PERSON")
+        assert res.status_code == 200
+
+    def test_list_entities_pagination(self, kg_app_client):
+        res = kg_app_client.get("/kg/entities?kb_id=global&limit=1&offset=0")
+        assert res.status_code == 200
+
+    def test_list_entities_no_kg_returns_501(self, app_client, mock_container):
+        mock_container.kg_store = None
+        res = app_client.get("/kg/entities?kb_id=global")
+        assert res.status_code == 501
+
+
+class TestKGEntityDetail:
+    def test_get_entity_detail(self, kg_app_client):
+        res = kg_app_client.get("/kg/entities/n_001")
+        assert res.status_code == 200
+        data = res.json()
+        assert data["id"]   == "n_001"
+        assert "name"       in data
+        assert "type"       in data
+        assert "edges"      in data
+        assert isinstance(data["edges"], list)
+
+    def test_get_entity_edges_shape(self, kg_app_client):
+        data = kg_app_client.get("/kg/entities/n_001").json()
+        for edge in data["edges"]:
+            assert "id"       in edge
+            assert "src_id"   in edge
+            assert "dst_id"   in edge
+            assert "relation" in edge
+
+    def test_get_entity_not_found_returns_404(self, kg_app_client, mock_kg_store):
+        mock_kg_store.get_node = AsyncMock(return_value=None)
+        res = kg_app_client.get("/kg/entities/ghost_id")
+        assert res.status_code == 404
+
+    def test_get_entity_no_kg_returns_501(self, app_client, mock_container):
+        mock_container.kg_store = None
+        res = app_client.get("/kg/entities/any_id")
+        assert res.status_code == 501
+
+
+class TestKGEntityPatch:
+    def test_patch_entity_name(self, kg_app_client):
+        res = kg_app_client.patch("/kg/entities/n_001", json={"name": "UpdatedName"})
+        assert res.status_code == 200
+        data = res.json()
+        assert data["ok"] is True
+        assert "id"   in data
+        assert "name" in data
+
+    def test_patch_entity_description(self, kg_app_client):
+        res = kg_app_client.patch("/kg/entities/n_001", json={"description": "New description"})
+        assert res.status_code == 200
+        assert res.json()["ok"] is True
+
+    def test_patch_entity_not_found_returns_404(self, kg_app_client, mock_kg_store):
+        mock_kg_store.get_node = AsyncMock(return_value=None)
+        res = kg_app_client.patch("/kg/entities/ghost_id", json={"name": "X"})
+        assert res.status_code == 404
+
+    def test_patch_entity_no_kg_returns_501(self, app_client, mock_container):
+        mock_container.kg_store = None
+        res = app_client.patch("/kg/entities/any", json={"name": "X"})
+        assert res.status_code == 501
+
+
+class TestKGEntityDelete:
+    def test_delete_entity_returns_ok(self, kg_app_client):
+        res = kg_app_client.delete("/kg/entities/n_001")
+        assert res.status_code == 200
+        assert res.json()["ok"] is True
+
+    def test_delete_entity_calls_store(self, kg_app_client, mock_kg_store):
+        kg_app_client.delete("/kg/entities/n_delete_me")
+        mock_kg_store.delete_node.assert_called()
+
+    def test_delete_entity_no_kg_returns_501(self, app_client, mock_container):
+        mock_container.kg_store = None
+        res = app_client.delete("/kg/entities/any")
+        assert res.status_code == 501
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# KG: /kg/edges
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestKGEdges:
+    def test_add_edge_creates_edge(self, kg_app_client):
+        res = kg_app_client.post("/kg/edges", json={
+            "kb_id":    "global",
+            "src_name": "Alice",
+            "relation": "works_at",
+            "dst_name": "Anthropic",
+            "context":  "Alice works at Anthropic.",
+            "weight":   0.95,
+        })
+        assert res.status_code == 200
+        data = res.json()
+        assert data["ok"]      is True
+        assert "edge_id"       in data
+        assert data["src"]     == "Alice"
+        assert data["dst"]     == "Anthropic"
+        assert data["relation"] == "works_at"
+
+    def test_add_edge_reuses_existing_entity(self, kg_app_client, mock_kg_store):
+        """When get_node_by_name finds an existing node it should be reused."""
+        from rag.graph.models import Node, NodeType
+        existing = Node(id="n_existing", kb_id="global", name="Alice",
+                        node_type=NodeType.PERSON, degree=3, created_at=time.time())
+        mock_kg_store.get_node_by_name = AsyncMock(return_value=existing)
+        res = kg_app_client.post("/kg/edges", json={
+            "kb_id": "global", "src_name": "Alice",
+            "relation": "knows", "dst_name": "Bob",
+        })
+        assert res.status_code == 200
+        # upsert_node should NOT be called for Alice (she already exists)
+        calls = [str(c) for c in mock_kg_store.upsert_node.call_args_list]
+        alice_calls = [c for c in calls if "Alice" in c]
+        assert len(alice_calls) == 0, "Existing node was re-created"
+
+    def test_add_edge_no_kg_returns_501(self, app_client, mock_container):
+        mock_container.kg_store = None
+        res = app_client.post("/kg/edges", json={
+            "kb_id": "global", "src_name": "A", "relation": "r", "dst_name": "B",
+        })
+        assert res.status_code == 501
+
+    def test_delete_edge_returns_ok(self, kg_app_client):
+        res = kg_app_client.delete("/kg/edges/e_001?kb_id=global")
+        assert res.status_code == 200
+        assert res.json()["ok"] is True
+
+    def test_delete_edge_calls_store(self, kg_app_client, mock_kg_store):
+        kg_app_client.delete("/kg/edges/e_to_delete")
+        mock_kg_store.delete_edge.assert_called()
+
+    def test_delete_edge_no_kg_returns_501(self, app_client, mock_container):
+        mock_container.kg_store = None
+        res = app_client.delete("/kg/edges/any")
+        assert res.status_code == 501
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# KG: /kg/graph
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestKGGraph:
+    def test_full_graph_returns_nodes_edges_kb_id(self, kg_app_client):
+        res = kg_app_client.get("/kg/graph?kb_id=global")
+        assert res.status_code == 200
+        data = res.json()
+        assert "nodes"  in data
+        assert "edges"  in data
+        assert "kb_id"  in data
+        assert data["kb_id"] == "global"
+
+    def test_full_graph_node_shape(self, kg_app_client):
+        nodes = kg_app_client.get("/kg/graph?kb_id=global").json()["nodes"]
+        if nodes:
+            n = nodes[0]
+            assert "id"          in n
+            assert "name"        in n
+            assert "type"        in n
+            assert "description" in n
+            assert "degree"      in n
+
+    def test_full_graph_edge_shape(self, kg_app_client):
+        edges = kg_app_client.get("/kg/graph?kb_id=global").json()["edges"]
+        if edges:
+            e = edges[0]
+            assert "id"       in e
+            assert "src_id"   in e
+            assert "dst_id"   in e
+            assert "relation" in e
+            assert "weight"   in e
+
+    def test_full_graph_filters_dangling_edges(self, kg_app_client, mock_kg_store):
+        """Edges referencing nodes not in the result set must be filtered out."""
+        from rag.graph.models import Node, Edge, NodeType
+        n = Node(id="n_only", kb_id="global", name="Solo",
+                 node_type=NodeType.OTHER, degree=0, created_at=time.time())
+        dangling_edge = Edge(id="e_dangle", kb_id="global",
+                             src_id="n_only", dst_id="n_gone",
+                             relation="r", created_at=time.time())
+        valid_edge = Edge(id="e_valid", kb_id="global",
+                          src_id="n_only", dst_id="n_only",
+                          relation="self", created_at=time.time())
+        mock_kg_store.get_full_graph = AsyncMock(return_value=([n], [dangling_edge, valid_edge]))
+
+        data = kg_app_client.get("/kg/graph?kb_id=global").json()
+        edge_ids = [e["id"] for e in data["edges"]]
+        assert "e_dangle" not in edge_ids
+        assert "e_valid"  in edge_ids
+
+    def test_full_graph_no_kg_returns_501(self, app_client, mock_container):
+        mock_container.kg_store = None
+        res = app_client.get("/kg/graph?kb_id=global")
+        assert res.status_code == 501
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# KG: /kg/stats
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestKGStats:
+    def test_stats_returns_kb_id(self, kg_app_client):
+        res = kg_app_client.get("/kg/stats?kb_id=global")
+        assert res.status_code == 200
+        assert res.json()["kb_id"] == "global"
+
+    def test_stats_has_node_edge_counts(self, kg_app_client):
+        data = kg_app_client.get("/kg/stats?kb_id=global").json()
+        assert "nodes"  in data
+        assert "edges"  in data
+
+    def test_stats_no_kg_returns_501(self, app_client, mock_container):
+        mock_container.kg_store = None
+        res = app_client.get("/kg/stats?kb_id=global")
+        assert res.status_code == 501
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# KG: /kg/documents/{doc_id} and /kg/reindex/{doc_id}
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestKGDocumentDelete:
+    def test_delete_doc_graph_data(self, kg_app_client):
+        res = kg_app_client.delete("/kg/documents/doc_001?kb_id=global")
+        assert res.status_code == 200
+        data = res.json()
+        assert data["ok"]     is True
+        assert data["doc_id"] == "doc_001"
+
+    def test_delete_doc_calls_delete_by_doc(self, kg_app_client, mock_kg_store):
+        kg_app_client.delete("/kg/documents/doc_to_del?kb_id=test_kb")
+        mock_kg_store.delete_by_doc.assert_called_with("doc_to_del", "test_kb")
+
+    def test_delete_doc_no_kg_returns_501(self, app_client, mock_container):
+        mock_container.kg_store = None
+        res = app_client.delete("/kg/documents/any?kb_id=global")
+        assert res.status_code == 501
+
+
+class TestKGReindex:
+    def test_reindex_doc_returns_ok_and_message(self, kg_app_client):
+        res = kg_app_client.post("/kg/reindex/doc_001?kb_id=global")
+        assert res.status_code == 200
+        data = res.json()
+        assert data["ok"] is True
+        assert "message" in data
+        assert len(data["message"]) > 0
+
+    def test_reindex_calls_delete_by_doc(self, kg_app_client, mock_kg_store):
+        kg_app_client.post("/kg/reindex/some_doc?kb_id=global")
+        mock_kg_store.delete_by_doc.assert_called_with("some_doc", "global")
+
+    def test_reindex_no_kg_returns_501(self, app_client, mock_container):
+        mock_container.kg_store = None
+        res = app_client.post("/kg/reindex/any?kb_id=global")
+        assert res.status_code == 501

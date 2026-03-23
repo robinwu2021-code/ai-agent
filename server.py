@@ -1409,23 +1409,43 @@ async def kb_build_graph(doc_id: str, kb_id: str = "global"):
     """
     从知识库文档的分块数据触发知识图谱构建任务。
     需要 GraphBuilder 已初始化（启用了 KG 功能）。
+    优先从向量库（Milvus/Qdrant）读取分块，回退到 SQLite。
     """
     pkb = _pkb()
     gb  = getattr(_container, "graph_builder", None)
     if not gb:
         raise HTTPException(501, "GraphBuilder 未配置")
 
-    store  = pkb._store
-    chunks = await store.list_chunks(doc_id)
-    if not chunks:
+    # ── 优先从向量库读取（Milvus/Qdrant 模式下 SQLite kb_chunks 为空）──
+    raw_chunks: list[dict] = []
+    if pkb._vector_store is not None:
+        try:
+            vs_chunks = await pkb._vector_store.list_chunks(doc_id)
+            raw_chunks = [
+                {
+                    "text":     c.get("text", ""),
+                    "doc_id":   c.get("doc_id", doc_id),
+                    "chunk_id": c.get("chunk_id", ""),
+                }
+                for c in vs_chunks
+            ]
+        except Exception as _exc:
+            log.warning("kb_build_graph.vector_store_list_failed",
+                        doc_id=doc_id, error=str(_exc))
+
+    # ── 回退：从 SQLite 读取 ─────────────────────────────────────────
+    if not raw_chunks:
+        sqlite_chunks = await pkb._store.list_chunks(doc_id)
+        raw_chunks = [
+            {"text": c.text, "doc_id": c.doc_id, "chunk_id": c.chunk_id}
+            for c in sqlite_chunks
+        ]
+
+    if not raw_chunks:
         raise HTTPException(404, f"文档 {doc_id} 不存在或没有分块数据")
 
-    chunk_dicts = [
-        {"text": c.text, "doc_id": c.doc_id, "chunk_id": c.chunk_id}
-        for c in chunks
-    ]
-    job_id = gb.start_build_job(chunks=chunk_dicts, kb_id=kb_id, doc_id=doc_id)
-    return {"job_id": job_id, "doc_id": doc_id, "chunks": len(chunk_dicts)}
+    job_id = gb.start_build_job(chunks=raw_chunks, kb_id=kb_id, doc_id=doc_id)
+    return {"job_id": job_id, "doc_id": doc_id, "chunks": len(raw_chunks)}
 
 
 @app.post("/kb/documents/{doc_id}/reindex", summary="重新索引文档", tags=["KnowledgeBase"])
@@ -1620,8 +1640,7 @@ async def kg_query(req: _KGQueryReq):
     else:
         subgraph = await gr.local_search(req.query, req.kb_id, hops=req.hops)
 
-    from rag.graph.retriever import GraphRetriever
-    context = GraphRetriever.format_for_prompt(subgraph)
+    context = gr.format_for_prompt(subgraph)
     return {
         "context":        context,
         "subgraph":       subgraph.to_dict(),
