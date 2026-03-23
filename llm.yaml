@@ -104,12 +104,12 @@ engines:
     supports_embed: true
     tags: [local, embed, qwen]
 
-  # ── vLLM 本地（qwen3.5:35b-b，OpenAI 兼容接口）─────────────
+  # ── LM Studio / vLLM 本地（Qwen3.5-35B-A3B-FP8，OpenAI 兼容接口）─────
   - alias: vllm-qwen3
     sdk: openai_compatible
-    base_url: http://192.168.0.222:8000/v1
-    model: qwen3.5:35b-a3b             # 与 vLLM --served-model-name 保持一致
-    api_key: EMPTY                   # vLLM 默认不校验 key，填占位符即可
+    base_url: http://192.168.0.222:8003/v1
+    model: Qwen/Qwen3.5-35B-A3B-FP8   # 与 LM Studio served-model-name 保持一致
+    api_key: ${VLLM_API_KEY}           # LM Studio 接受任意非空 key，建议通过环境变量注入
     max_tokens: 8192
     timeout_sec: 300.0
     cost_tier: 0
