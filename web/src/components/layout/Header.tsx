@@ -7,6 +7,7 @@ const MODE_LABEL: Record<SkillMode, string> = {
   weather: '天气预报',
   report: '智能报表',
   marketing: '营销方案',
+  graph: '知识图谱',
 }
 
 const MODE_COLOR: Record<SkillMode, string> = {
@@ -14,6 +15,7 @@ const MODE_COLOR: Record<SkillMode, string> = {
   weather: '#38bdf8',
   report: '#34d399',
   marketing: '#fb923c',
+  graph: '#f472b6',
 }
 
 interface Props {

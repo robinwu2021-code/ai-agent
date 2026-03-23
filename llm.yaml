@@ -141,3 +141,108 @@ router:
   # node_overrides:
   #   react_final: claude-smart     # 最后一步用旗舰模型
   #   plan_generate: claude-smart   # 生成计划用旗舰模型
+
+
+# ══════════════════════════════════════════════════════════════════
+# vector_store — 向量数据库配置
+#
+# backend 可选值：
+#   milvus  — 推荐，原生 BM25 稀疏向量 + 内置 RRFRanker，支持远程服务器
+#   qdrant  — 备选，HNSW + Python 端 BM25，支持嵌入式 / 服务器模式
+#   sqlite  — 兜底，纯 Python numpy 检索，无需额外依赖（小数据量可用）
+#
+# 值支持 ${ENV_VAR} 语法做环境变量插值（敏感信息建议通过此方式引入）
+# ══════════════════════════════════════════════════════════════════
+
+vector_store:
+  backend: milvus
+
+  milvus:
+    uri: http://192.168.0.209:19530      # Milvus Standalone 服务器地址
+    token: root:${MILVUS_PASSWORD}               # 格式：root:密码 或 API key（无鉴权可留空）
+    collection: kb_chunks                # collection 名称，同一服务可部署多个项目
+    vector_size: 1536                    # 必须与 embedding 模型输出维度一致
+                                         # qwen3-embedding:8b → 1536
+                                         # text-embedding-3-small → 1536
+                                         # text-embedding-3-large → 3072
+    index_type: HNSW                     # HNSW（默认，适合 <500万向量）
+                                         # DISKANN（超大规模，磁盘 ANN，省内存）
+
+  # ── Qdrant 备选后端（注释上面的 milvus 节并启用此节切换）─────
+  # qdrant:
+  #   url: http://192.168.0.222:6333     # Qdrant 服务器地址
+  #   api_key: ${QDRANT_API_KEY}
+  #   collection: kb_chunks
+  #   vector_size: 1536
+
+
+# ══════════════════════════════════════════════════════════════════
+# memory — 记忆系统配置
+#
+# 关键设计：llm_engine / embed_engine / summarize_engine / engine
+# 全部引用上方 engines: 节中已定义的 alias，无需重复填写连接参数。
+#
+# 切换 LLM 后端只需改 alias 名，一行搞定：
+#   本地 Ollama:    llm_engine: ollama-qwen3
+#   本地 vLLM:      llm_engine: vllm-qwen3
+#   云端 Claude:    llm_engine: claude-fast
+#   云端 OpenAI:    llm_engine: gpt-4o-mini   （engines: 节新增实例即可）
+# ══════════════════════════════════════════════════════════════════
+
+memory:
+
+  # ── 短期记忆 (STM) ───────────────────────────────────────────
+  stm:
+    backend: redis                  # redis | in_memory
+    redis_url: ${REDIS_URL}         # 未设置环境变量时降级 in_memory
+    ttl_idle: 1800                  # 不活跃 30 分钟 TTL（秒）
+    ttl_max:  86400                 # 最长保留 24 小时（防止冷数据堆积）
+
+  # ── 长期记忆 (LTM) ───────────────────────────────────────────
+  ltm:
+    backend: mem0                   # mem0 | milvus | qdrant | zep | in_memory
+
+    # ── LLM 引擎：引用 engines 节 alias，无需重复配置 ──────────
+    llm_engine:   ollama-qwen3      # 用于 mem0 内部记忆提取/去重判断
+    embed_engine: ollama-embed      # 用于向量化存储与语义检索
+
+    # ── 切换示例（取消注释即生效）─────────────────────────────
+    # llm_engine: vllm-qwen3        # 改为本地 vLLM（推理更快）
+    # llm_engine: claude-fast       # 改为云端 Claude Haiku（质量更高）
+    # llm_engine: claude-smart      # 改为旗舰模型（成本高，质量最好）
+    # embed_engine: ollama-embed    # 本地 qwen3-embedding:8b（默认）
+
+    # ── 向量库（复用顶层 vector_store 节，独立 collection）─────
+    use_global_vector_store: true   # true → 复用本文件 vector_store: 节配置
+    collection: agent_memory        # 与 KB 的 kb_chunks 完全隔离
+
+    # ── mem0 专项参数 ─────────────────────────────────────────
+    mem0:
+      dedup_threshold: 0.85         # 语义相似度 > 此值视为重复（更新而非新增）
+      max_memories: 10000           # 每用户最大记忆条数
+
+    # ── Zep 配置（backend: zep 时生效）──────────────────────────
+    # zep_server_url: http://192.168.0.x:8000
+    # zep_api_key: ${ZEP_API_KEY}
+
+  # ── 工作记忆（Context 组装）────────────────────────────────
+  working:
+    # 历史压缩使用廉价快速模型，节省 token 成本
+    summarize_engine: claude-fast   # 空字符串 → 使用 router.summarize 默认路由
+    # summarize_engine: ollama-qwen3   # 离线优先，不依赖云端
+    # summarize_engine: vllm-qwen3     # 切换到 vLLM
+
+    token_budget: 12000             # 总 context token 预算
+    compress_threshold: 1500        # 历史超出此 token 数时触发 LLM 摘要压缩
+    ltm_score_min: 0.05             # LTM 召回低于此分数的条目不注入 context
+
+  # ── 记忆固化（Consolidation）────────────────────────────────
+  consolidation:
+    # 固化提取使用廉价模型（提取结构化事实，无需强推理能力）
+    engine: claude-fast             # 空字符串 → 使用 router.consolidate 默认路由
+    # engine: ollama-qwen3          # 切换到本地 Ollama
+    # engine: vllm-qwen3            # 切换到本地 vLLM
+
+    incremental_every: 10           # 每 N 条新消息触发增量固化（防崩溃丢失）
+    segment_size: 20                # 每次处理的消息段大小
+    min_importance: 0.2             # 低于此重要性的 fact 直接丢弃

@@ -3,7 +3,7 @@ rag/store.py — 知识库持久化存储
 
 表结构：
   kb_documents  文档元数据（状态、分块数、字符数等）
-  kb_chunks     分块文本 + 向量（pickle BLOB）
+  kb_chunks     分块文本 + 向量（JSON bytes BLOB，兼容旧 pickle 格式）
 
 支持 SQLite（默认）和 MySQL（通过 create_kb_store(url) 工厂）。
 与 workspace.db 同库：db_path 默认 "workspace.db"。
@@ -13,7 +13,6 @@ from __future__ import annotations
 import asyncio
 import json
 import math
-import pickle
 import sqlite3
 import time
 from abc import ABC, abstractmethod
@@ -51,6 +50,7 @@ class KBChunk:
     embedding:   list[float] | None = None
     meta:        dict             = field(default_factory=dict)
     created_at:  float            = 0.0
+    score:       float            = 0.0   # retrieval score (RRF); 0.0 for non-query results
 
 
 # ---------------------------------------------------------------------------
@@ -143,6 +143,11 @@ class KBStore(ABC):
     async def delete_chunks_by_doc(self, doc_id: str) -> None: ...
 
     @abstractmethod
+    async def update_chunk_embedding(
+        self, chunk_id: str, embedding: list[float]
+    ) -> None: ...
+
+    @abstractmethod
     async def search_chunks_by_text(
         self, query: str, kb_id: str, limit: int = 50
     ) -> list[KBChunk]: ...
@@ -161,15 +166,26 @@ class KBStore(ABC):
 # ---------------------------------------------------------------------------
 
 def _serialize_embedding(emb: list[float] | None) -> bytes | None:
+    """Serialize embedding as compact JSON bytes (safer than pickle)."""
     if emb is None:
         return None
-    return pickle.dumps(emb)
+    return json.dumps(emb, separators=(",", ":")).encode("utf-8")
 
 
 def _deserialize_embedding(blob: bytes | None) -> list[float] | None:
+    """Deserialize embedding from JSON bytes. Falls back to pickle for legacy data."""
     if blob is None:
         return None
-    return pickle.loads(blob)  # noqa: S301
+    try:
+        # Try JSON first (new format)
+        return json.loads(blob)
+    except (ValueError, UnicodeDecodeError):
+        # Legacy pickle format — migrate transparently
+        try:
+            import pickle  # noqa: PLC0415
+            return pickle.loads(blob)  # noqa: S301
+        except Exception:
+            return None
 
 
 def _cosine_similarity(a: list[float], b: list[float]) -> float:
@@ -466,6 +482,21 @@ class SQLiteKBStore(KBStore):
     async def delete_chunks_by_doc(self, doc_id: str) -> None:
         def _do() -> None:
             self._execute("DELETE FROM kb_chunks WHERE doc_id = ?", (doc_id,))
+            self._commit()
+
+        async with self._lock:
+            await asyncio.to_thread(_do)
+
+    async def update_chunk_embedding(
+        self, chunk_id: str, embedding: list[float]
+    ) -> None:
+        """Update the embedding blob for a single chunk (used by reindex)."""
+        def _do() -> None:
+            blob = _serialize_embedding(embedding)
+            self._execute(
+                "UPDATE kb_chunks SET embedding = ? WHERE chunk_id = ?",
+                (blob, chunk_id),
+            )
             self._commit()
 
         async with self._lock:

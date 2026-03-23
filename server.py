@@ -298,13 +298,32 @@ def _build_container(engine_alias: str | None = None):
     except Exception as exc:
         log.warning("server.kg_init_failed", error=str(exc))
 
-    # ── 持久化知识库（与 workspace.db 同库）──────────────────────────
+    # ── 持久化知识库 ──────────────────────────────────────────────────
+    # 向量后端配置优先级：
+    #   1. llm.yaml → vector_store 节（最高优先级，推荐生产使用）
+    #   2. VECTOR_BACKEND / MILVUS_* / QDRANT_* 环境变量（兜底）
+    #   3. 无配置 → SQLite 模式（向后兼容）
+    #
+    # llm.yaml 示例（推荐）：
+    #   vector_store:
+    #     backend: milvus
+    #     milvus:
+    #       uri: http://192.168.0.x:19530
+    #       token: ${MILVUS_TOKEN}
+    #       vector_size: 1536
+    #
+    # 环境变量兜底（.env 文件）：
+    #   VECTOR_BACKEND=milvus
+    #   MILVUS_URI=http://192.168.0.x:19530
+    #   MILVUS_TOKEN=root:password
     pkb = None
     try:
+        import os as _os2
         from rag.store import SQLiteKBStore
         from rag.persistent_kb import PersistentKnowledgeBase
+
+        # SQLite 始终用于文档元数据
         kb_store = SQLiteKBStore(ws_db_url.replace("sqlite:///", ""))
-        # 同步初始化（建表）
         try:
             loop3 = asyncio.get_event_loop()
             if loop3.is_running():
@@ -315,18 +334,29 @@ def _build_container(engine_alias: str | None = None):
                 loop3.run_until_complete(kb_store.initialize())
         except Exception as exc:
             log.warning("server.kb_store_init_failed", error=str(exc))
+
+        # 向量数据库后端：优先读 llm.yaml vector_store 节，兜底读环境变量
+        _vector_store = None
+        try:
+            _vector_store = _s.build_vector_store()
+            _be_name = type(_vector_store).__name__ if _vector_store else "SQLite"
+            log.info("server.vector_store_built", backend=_be_name)
+        except ImportError as _imp_err:
+            log.warning("server.vector_store_import_failed",
+                        error=str(_imp_err),
+                        hint="pip install 'pymilvus>=2.4.0'  or  pip install qdrant-client")
+        except Exception as _vs_err:
+            log.warning("server.vector_store_build_failed", error=str(_vs_err))
+
         _embed_fn2 = lambda text: llm_router.embed(text)  # noqa: E731
         pkb = PersistentKnowledgeBase(
-            store=kb_store, embed_fn=_embed_fn2, kb_id="global"
+            store=kb_store,
+            embed_fn=_embed_fn2,
+            kb_id="global",
+            vector_store=_vector_store,
         )
-        # 启动时尝试恢复索引（若事件循环尚未运行则跳过，由首次查询时懒加载）
-        try:
-            loop4 = asyncio.get_event_loop()
-            if not loop4.is_running():
-                loop4.run_until_complete(pkb.initialize())
-        except Exception:
-            pass  # 在 FastAPI startup 事件中恢复
-        log.info("server.pkb_ready")
+        _be_name = type(_vector_store).__name__ if _vector_store else "SQLite"
+        log.info("server.pkb_ready", backend=_be_name)
     except Exception as exc:
         log.warning("server.pkb_init_failed", error=str(exc))
 
@@ -840,18 +870,36 @@ async def share_memory(req: _ShareMemoryReq):
 from fastapi import UploadFile, File as _File, BackgroundTasks
 import tempfile, os as _os
 
+class _KBAskHistoryItem(_BM):
+    role:    str   # "user" | "assistant"
+    content: str
+
 class _KBAskReq(_BM):
     query:      str
-    kb_id:      str  = "global"
-    top_k:      int  = 5
-    mode:       str  = "hybrid"   # hybrid | vector | bm25
-    with_graph: bool = False       # also run graph search and merge
+    kb_id:      str       = "global"
+    top_k:      int       = 5
+    mode:       str       = "hybrid"   # hybrid | vector | bm25
+    with_graph: bool      = False      # also run graph search and merge
+    stream:     bool      = False      # use streaming endpoint instead
+    history:    list[_KBAskHistoryItem] = []   # prior conversation turns
+    doc_ids:    list[str] = []         # 空=全库检索；非空=指定文档范围
 
 class _KBAddTextReq(_BM):
-    text:     str
-    kb_id:    str = "global"
-    source:   str = "inline"
-    filename: str = ""
+    # Accept both "text" and "content" (frontend compatibility)
+    text:     str  = ""
+    content:  str  = ""          # alias for text
+    kb_id:    str  = "global"
+    source:   str  = "inline"
+    filename: str  = ""
+    title:    str  = ""          # alias for filename
+
+    @property
+    def resolved_text(self) -> str:
+        return self.text or self.content
+
+    @property
+    def resolved_filename(self) -> str:
+        return self.filename or self.title
 
 
 def _pkb():
@@ -894,13 +942,119 @@ async def kb_upload_file(
     return {**dataclasses.asdict(doc), "filename": file.filename or doc.filename}
 
 
+@app.post("/kb/documents/upload/stream", summary="流式上传文件并返回索引进度", tags=["KnowledgeBase"])
+async def kb_upload_file_stream(
+    file:  UploadFile = _File(...),
+    kb_id: str        = "global",
+):
+    """
+    上传文档并通过 SSE 流式返回索引进度。
+    事件格式：
+      {"type":"progress","step":"parsing"|"chunking"|"embedding","chunk_idx":N,"total":M,"progress":0-100,"message":"..."}
+      {"type":"done","doc_id":"...","chunk_count":N,"status":"ready"|"error"}
+      {"type":"error","message":"..."}
+      {"type":"heartbeat"}
+    """
+    import asyncio as _asyncio_up
+
+    pkb = _pkb()
+    allowed_suffixes = {".pdf", ".txt", ".md", ".docx", ".html"}
+    suffix = _os.path.splitext(file.filename or "doc.txt")[1].lower()
+    if suffix not in allowed_suffixes:
+        raise HTTPException(400, f"不支持的文件类型: {suffix}，支持: {allowed_suffixes}")
+
+    file_content  = await file.read()
+    orig_filename = file.filename or "upload"
+
+    async def _event_gen():
+        queue: _asyncio_up.Queue = _asyncio_up.Queue()
+
+        def _on_progress(chunk_idx: int, total: int) -> None:
+            pct = 20 + int(70 * chunk_idx / max(total, 1))
+            queue.put_nowait({
+                "type":      "progress",
+                "step":      "embedding",
+                "chunk_idx": chunk_idx,
+                "total":     total,
+                "progress":  pct,
+                "message":   f"向量化 {chunk_idx}/{total} 片段…",
+            })
+
+        async def _do_index() -> None:
+            tmp_path: str | None = None
+            try:
+                with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+                    tmp.write(file_content)
+                    tmp_path = tmp.name
+                queue.put_nowait({
+                    "type": "progress", "step": "chunking",
+                    "progress": 10, "message": "正在分块…",
+                })
+                doc = await pkb.add_file(
+                    tmp_path,
+                    kb_id=kb_id,
+                    filename=orig_filename,
+                    on_progress=_on_progress,
+                )
+                queue.put_nowait({
+                    "type":        "done",
+                    "doc_id":      doc.doc_id,
+                    "chunk_count": doc.chunk_count,
+                    "status":      doc.status,
+                    "filename":    orig_filename,
+                })
+            except Exception as exc:
+                queue.put_nowait({"type": "error", "message": str(exc)})
+            finally:
+                if tmp_path:
+                    try:
+                        _os.unlink(tmp_path)
+                    except OSError:
+                        pass
+                queue.put_nowait(None)  # sentinel — done
+
+        # Emit "parsing" immediately so the client sees activity right away
+        yield (
+            "data: "
+            + json.dumps({"type": "progress", "step": "parsing",
+                          "progress": 5, "message": "正在解析文件…"},
+                         ensure_ascii=False)
+            + "\n\n"
+        )
+
+        index_task = _asyncio_up.create_task(_do_index())
+
+        while True:
+            try:
+                item = await _asyncio_up.wait_for(queue.get(), timeout=1.0)
+                if item is None:
+                    break
+                yield "data: " + json.dumps(item, ensure_ascii=False) + "\n\n"
+            except _asyncio_up.TimeoutError:
+                yield "data: " + json.dumps({"type": "heartbeat"}, ensure_ascii=False) + "\n\n"
+
+        await index_task
+
+    return StreamingResponse(
+        _event_gen(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
 @app.post("/kb/documents/text", summary="直接添加文本到知识库", tags=["KnowledgeBase"])
 async def kb_add_text(req: _KBAddTextReq):
     """将纯文本内容直接入库（无需上传文件），同步分块 + 向量化后返回文档元数据。"""
+    resolved_text = req.resolved_text
+    if not resolved_text.strip():
+        raise HTTPException(400, "text / content 字段不能为空")
     pkb  = _pkb()
     import dataclasses
     doc  = await pkb.add_text(
-        text=req.text, source=req.source, kb_id=req.kb_id, filename=req.filename
+        text=resolved_text,
+        source=req.source,
+        kb_id=req.kb_id,
+        filename=req.resolved_filename,
     )
     return dataclasses.asdict(doc)
 
@@ -929,6 +1083,35 @@ async def kb_get_document(doc_id: str):
     return result
 
 
+@app.get("/kb/chunks", summary="列出知识库所有片段", tags=["KnowledgeBase"])
+async def kb_list_chunks(
+    kb_id:  str = "global",
+    doc_id: str | None = None,
+    limit:  int = 2000,
+):
+    """
+    返回指定 kb_id 下的所有分块（片段）列表。
+    - 可选 doc_id 过滤：只返回该文档的分块。
+    - limit 默认 2000，最大不超过 10000。
+    - score 字段对非检索结果始终为 0.0（需要带 score 请用 /kb/ask）。
+    """
+    pkb   = _pkb()
+    store = pkb._store
+    import dataclasses
+    limit = min(limit, 10_000)
+    if doc_id:
+        chunks = await store.list_chunks(doc_id)
+    else:
+        chunks = await store.list_chunks_by_kb(kb_id, limit=limit)
+    # 不回传 embedding（体积大，且无业务意义）
+    result = []
+    for c in chunks:
+        d = dataclasses.asdict(c)
+        d.pop("embedding", None)
+        result.append(d)
+    return {"chunks": result, "total": len(result)}
+
+
 @app.delete("/kb/documents/{doc_id}", summary="删除知识库文档", tags=["KnowledgeBase"])
 async def kb_delete_document(doc_id: str):
     """删除文档及其所有分块（同时从内存索引中移除）。"""
@@ -937,22 +1120,53 @@ async def kb_delete_document(doc_id: str):
     return {"ok": True, "doc_id": doc_id}
 
 
+_KB_ASK_SYSTEM = """你是一个专业的知识库问答助手。
+请根据下方提供的知识库内容，准确、简洁地回答用户的问题。
+回答要求：
+- 只使用知识库中提供的信息，不要编造不存在的内容
+- 如果知识库中没有相关信息，请明确告知用户"知识库中没有找到相关信息"
+- 回答时可以引用来源编号（如[1][2]），方便用户核对
+- 使用中文回答，语言简洁清晰"""
+
+
+def _build_kb_messages(req: _KBAskReq, context: str):
+    """Build the message list for the KB LLM call (supports history)."""
+    from core.models import Message, MessageRole
+    msgs = [Message(role=MessageRole.SYSTEM, content=_KB_ASK_SYSTEM)]
+    for h in req.history:
+        role = MessageRole.USER if h.role == "user" else MessageRole.ASSISTANT
+        msgs.append(Message(role=role, content=h.content))
+    msgs.append(
+        Message(
+            role    = MessageRole.USER,
+            content = f"{context}\n\n用户问题：{req.query}" if context else req.query,
+        )
+    )
+    return msgs
+
+
 @app.post("/kb/ask", summary="知识库 RAG 问答", tags=["KnowledgeBase"])
 async def kb_ask(req: _KBAskReq):
     """
     基于知识库的检索增强问答（RAG）。
 
     返回字段：
+    - answer:    LLM 生成的回答
     - chunks:    命中的分块列表
-    - context:   格式化后可注入 Prompt 的上下文文本
+    - context:   格式化后的上下文文本
     - citations: 引用信息列表，每项含 index/source/filename/text_preview
     """
     pkb = _pkb()
 
-    # Vector / hybrid retrieval
-    kb_chunks = await pkb.query(req.query, kb_id=req.kb_id, top_k=req.top_k)
+    # ── 1. Vector / hybrid retrieval (optionally scoped to doc_ids) ─────────
+    kb_chunks = await pkb.query(
+        req.query,
+        kb_id   = req.kb_id,
+        top_k   = req.top_k,
+        doc_ids = req.doc_ids or None,
+    )
 
-    # Optional: merge graph search results
+    # ── 2. Optional: merge graph search results ──────────────────────────────
     if req.with_graph:
         try:
             store = getattr(_container, "kg_store", None)
@@ -977,29 +1191,214 @@ async def kb_ask(req: _KBAskReq):
         except Exception as kg_exc:
             log.warning("kb_ask.kg_merge_failed", error=str(kg_exc))
 
-    context    = pkb.format_context(kb_chunks)
-    citations  = [
+    # ── 3. Build context + citations ─────────────────────────────────────────
+    context   = pkb.format_context(kb_chunks)
+    citations = [
         {
             "index":        i + 1,
             "source":       c.meta.get("source", c.doc_id),
             "filename":     c.meta.get("filename", c.doc_id),
             "text_preview": c.text[:200],
+            "score":        round(c.score, 4),
         }
         for i, c in enumerate(kb_chunks)
     ]
+
+    # ── 4. Call LLM to generate an answer ────────────────────────────────────
+    answer = ""
+    if not kb_chunks:
+        answer = "知识库中没有找到与您问题相关的内容，请尝试换个问法或先上传相关文档。"
+    else:
+        try:
+            from core.models import Message, MessageRole, AgentConfig
+            router = _container._effective_router()
+            messages = _build_kb_messages(req, context)
+            resp = await router.chat(
+                messages=messages,
+                tools=[],
+                config=AgentConfig(max_steps=1, timeout_ms=60_000),
+            )
+            answer = resp.content or ""
+        except Exception as llm_exc:
+            log.warning("kb_ask.llm_failed", error=str(llm_exc))
+            # Fall back: return the raw context so the user gets something useful
+            answer = f"（LLM 调用失败：{llm_exc}）\n\n相关知识库内容：\n{context}"
+
     import dataclasses
     return {
+        "answer":    answer,
         "chunks":    [dataclasses.asdict(c) for c in kb_chunks],
         "context":   context,
         "citations": citations,
     }
 
 
+_KB_STREAM_LLM_TIMEOUT = 300   # seconds — hard ceiling for LLM calls in stream mode
+_KB_STREAM_HEARTBEAT   = 3     # seconds between keep-alive SSE comments
+
+
+async def _stream_kb_answer(req: _KBAskReq):
+    """
+    SSE generator for streaming KB Q&A.
+
+    Event sequence:
+      {"type":"context","citations":[...],"chunks":[...]}  — retrieval results (sent immediately)
+      {"type":"thinking","elapsed":N}                       — keep-alive while LLM is running
+      {"type":"delta","text":"..."}                         — answer tokens (word-batched)
+      {"type":"done"}
+      [DONE]
+
+    The LLM call is launched as a concurrent asyncio task so the generator
+    can keep sending heartbeat events every _KB_STREAM_HEARTBEAT seconds.
+    This prevents browser / reverse-proxy timeouts and keeps the UI responsive
+    even when the model (e.g. a 35B Ollama model) takes 30-120 s to respond.
+    """
+    import asyncio as _asyncio
+    import dataclasses
+
+    pkb = _pkb()
+
+    # 1. Retrieve chunks (optionally filtered to selected doc_ids)
+    kb_chunks = await pkb.query(
+        req.query,
+        kb_id   = req.kb_id,
+        top_k   = req.top_k,
+        doc_ids = req.doc_ids or None,
+    )
+
+    # 2. Optional graph merge
+    if req.with_graph:
+        try:
+            store = getattr(_container, "kg_store", None)
+            if store:
+                router   = _container._effective_router()
+                from rag.graph.retriever import GraphRetriever
+                gr       = GraphRetriever(store=store, embed_fn=lambda t: router.embed(t), llm_engine=router)
+                subgraph = await gr.local_search(req.query, req.kb_id, hops=2)
+                if subgraph.context_text:
+                    from rag.store import KBChunk as _KBChunk2
+                    kb_chunks = [_KBChunk2(
+                        chunk_id="kg_context", doc_id="knowledge_graph",
+                        kb_id=req.kb_id, chunk_index=0,
+                        text=subgraph.context_text,
+                        meta={"source": "knowledge_graph", "filename": "知识图谱"},
+                        created_at=0.0,
+                    )] + kb_chunks
+        except Exception as kg_exc:
+            log.warning("kb_ask_stream.kg_merge_failed", error=str(kg_exc))
+
+    # 3. Build context & citations — send immediately so the UI can show sources
+    context   = pkb.format_context(kb_chunks)
+    citations = [
+        {
+            "index":        i + 1,
+            "source":       c.meta.get("source", c.doc_id),
+            "filename":     c.meta.get("filename", c.doc_id),
+            "text_preview": c.text[:200],
+            "score":        round(c.score, 4),
+        }
+        for i, c in enumerate(kb_chunks)
+    ]
+    yield (
+        f"data: {json.dumps({'type': 'context', 'citations': citations, 'chunks': [dataclasses.asdict(c) for c in kb_chunks]}, ensure_ascii=False)}\n\n"
+    )
+
+    # 4. Generate answer
+    if not kb_chunks:
+        no_result = "知识库中没有找到与您问题相关的内容，请尝试换个问法或先上传相关文档。"
+        yield f"data: {json.dumps({'type': 'delta', 'text': no_result}, ensure_ascii=False)}\n\n"
+    else:
+        answer = ""
+        try:
+            from core.models import AgentConfig
+            router   = _container._effective_router()
+            messages = _build_kb_messages(req, context)
+
+            # Launch LLM call as a concurrent task so this generator stays
+            # free to send keep-alive events while Ollama / any slow model
+            # is computing.  We poll with asyncio.sleep() — much simpler and
+            # more reliable than wait_for+shield, which can interfere with
+            # the underlying HTTP connection scheduling in Python 3.12+.
+            import time as _time
+            llm_task  = _asyncio.create_task(
+                router.chat(
+                    messages=messages,
+                    tools=[],
+                    config=AgentConfig(max_steps=1, timeout_ms=_KB_STREAM_LLM_TIMEOUT * 1000),
+                )
+            )
+            start_wall = _time.monotonic()
+
+            while not llm_task.done():
+                await _asyncio.sleep(_KB_STREAM_HEARTBEAT)
+                if llm_task.done():
+                    break
+                elapsed = int(_time.monotonic() - start_wall)
+                yield f"data: {json.dumps({'type': 'thinking', 'elapsed': elapsed}, ensure_ascii=False)}\n\n"
+                if elapsed >= _KB_STREAM_LLM_TIMEOUT:
+                    llm_task.cancel()
+                    try:
+                        await llm_task
+                    except _asyncio.CancelledError:
+                        pass
+                    raise _asyncio.TimeoutError(
+                        f"LLM 响应超时（>{_KB_STREAM_LLM_TIMEOUT}s）"
+                    )
+
+            # Propagate any exception raised inside the task
+            resp   = await llm_task
+            answer = resp.content or ""
+
+        except _asyncio.TimeoutError:
+            log.warning("kb_ask_stream.llm_timeout", timeout=_KB_STREAM_LLM_TIMEOUT)
+            answer = f"⚠️ 大模型响应超时（超过 {_KB_STREAM_LLM_TIMEOUT} 秒），请稍后重试或换用更小的模型。"
+        except Exception as llm_exc:
+            log.warning("kb_ask_stream.llm_failed", error=str(llm_exc))
+            answer = f"（LLM 调用失败：{llm_exc}）\n\n相关知识库内容：\n{context}"
+
+        # Stream answer word-by-word for live-typing feel
+        words = answer.split(" ")
+        buf: list[str] = []
+        for i, word in enumerate(words):
+            buf.append(word)
+            if len(buf) >= 4 or i == len(words) - 1:
+                chunk_text = " ".join(buf) + (" " if i < len(words) - 1 else "")
+                yield f"data: {json.dumps({'type': 'delta', 'text': chunk_text}, ensure_ascii=False)}\n\n"
+                buf = []
+
+    yield f"data: {json.dumps({'type': 'done'}, ensure_ascii=False)}\n\n"
+    yield "data: [DONE]\n\n"
+
+
+@app.post("/kb/ask/stream", summary="知识库 RAG 流式问答（SSE）", tags=["KnowledgeBase"])
+async def kb_ask_stream(req: _KBAskReq):
+    """
+    与 /kb/ask 相同，但以 Server-Sent Events 格式流式推送：
+    - `{"type":"context","citations":[...],"chunks":[...]}` — 检索结果
+    - `{"type":"delta","text":"..."}` — 回答文本片段
+    - `{"type":"done"}` — 完成
+    """
+    if _container is None:
+        raise HTTPException(status_code=503, detail="服务未初始化")
+    return StreamingResponse(
+        _stream_kb_answer(req),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
 @app.get("/kb/stats", summary="知识库统计", tags=["KnowledgeBase"])
 async def kb_stats(kb_id: str = "global"):
-    """返回知识库的文档数、分块数、就绪文档数、总字符数等统计信息。"""
+    """返回知识库的文档数、分块数、就绪文档数、总字符数，以及向量数据库信息。"""
     pkb   = _pkb()
     stats = await pkb.get_stats(kb_id=kb_id)
+    # 如果使用 Qdrant，追加 collection 级别信息
+    vs = getattr(pkb, "_vector_store", None)
+    if vs is not None:
+        try:
+            stats["qdrant"] = await vs.collection_info()
+        except Exception:
+            pass
     return {"kb_id": kb_id, **stats}
 
 
@@ -1025,6 +1424,24 @@ async def kb_build_graph(doc_id: str, kb_id: str = "global"):
     ]
     job_id = gb.start_build_job(chunks=chunk_dicts, kb_id=kb_id, doc_id=doc_id)
     return {"job_id": job_id, "doc_id": doc_id, "chunks": len(chunk_dicts)}
+
+
+@app.post("/kb/documents/{doc_id}/reindex", summary="重新索引文档", tags=["KnowledgeBase"])
+async def kb_reindex_document(doc_id: str):
+    """
+    对指定文档重新执行向量化，修复因嵌入失败而处于 error/pending 状态的文档。
+    重新索引完成后文档状态将变为 ready。
+    """
+    pkb = _pkb()
+    try:
+        import dataclasses
+        doc = await pkb.reindex_document(doc_id)
+        return dataclasses.asdict(doc)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except Exception as exc:
+        log.warning("kb_reindex.failed", doc_id=doc_id, error=str(exc))
+        raise HTTPException(status_code=500, detail=str(exc))
 
 
 # ══════════════════════════════════════════════════════════════════════

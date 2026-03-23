@@ -1,7 +1,7 @@
 'use client'
 import type { SkillMode, SessionStats } from '@/types'
 import { cn } from '@/lib/utils'
-import { useEffect, useState, useRef } from 'react'
+import { useEffect, useState, useRef, useCallback } from 'react'
 import { useRouter, usePathname } from 'next/navigation'
 import { fetchHealth } from '@/lib/api'
 import { useApp } from '@/contexts/AppContext'
@@ -192,6 +192,9 @@ export default function Sidebar({ mode, setMode, stats, sessionId, open, onClear
   const [nameInput, setNameInput] = useState('')
   const nameInputRef = useRef<HTMLInputElement>(null)
 
+  const [showNewChatPopup, setShowNewChatPopup] = useState(false)
+  const newChatPopupRef = useRef<HTMLDivElement>(null)
+
   const router = useRouter()
   const pathname = usePathname()
 
@@ -201,6 +204,26 @@ export default function Sidebar({ mode, setMode, stats, sessionId, open, onClear
       .then(() => setConnected(true))
       .catch(() => setConnected(false))
   }, [])
+
+  // ── Close new-chat popup on outside click ─────────────────────────────────
+  useEffect(() => {
+    if (!showNewChatPopup) return
+    function handler(e: MouseEvent) {
+      if (newChatPopupRef.current && !newChatPopupRef.current.contains(e.target as Node)) {
+        setShowNewChatPopup(false)
+      }
+    }
+    document.addEventListener('mousedown', handler)
+    return () => document.removeEventListener('mousedown', handler)
+  }, [showNewChatPopup])
+
+  // ── Start new chat ────────────────────────────────────────────────────────
+  const doStartNewChat = useCallback(() => {
+    setShowNewChatPopup(false)
+    onClear()
+    appCtx.setCurrentSessionId(null)
+    if (pathname !== '/') router.push('/')
+  }, [onClear, appCtx, pathname, router])
 
   // ── Nav handlers ──────────────────────────────────────────────────────────
   function handleNavClick(item: NavItem) {
@@ -499,21 +522,71 @@ export default function Sidebar({ mode, setMode, stats, sessionId, open, onClear
             )}
           </div>
 
-          {/* New chat button */}
-          <button
-            onClick={() => {
-              onClear()
-              setCurrentSessionId(null)
-            }}
-            className="w-full mt-1.5 text-xs py-1.5 rounded-lg transition-all duration-150 hover:bg-white/5 flex items-center justify-center gap-1.5"
-            style={{
-              color: '#a78bfa',
-              border: '1px dashed rgba(124,58,237,0.3)',
-            }}
-          >
-            <span>✦</span>
-            <span>新建对话</span>
-          </button>
+          {/* New chat button + popup */}
+          <div className="relative mt-1.5" ref={newChatPopupRef}>
+            <button
+              onClick={() => setShowNewChatPopup(v => !v)}
+              className="w-full text-xs py-1.5 rounded-lg transition-all duration-150 hover:bg-white/5 flex items-center justify-center gap-1.5"
+              style={{
+                color: '#a78bfa',
+                border: showNewChatPopup
+                  ? '1px solid rgba(124,58,237,0.5)'
+                  : '1px dashed rgba(124,58,237,0.3)',
+                background: showNewChatPopup ? 'rgba(124,58,237,0.08)' : undefined,
+              }}
+            >
+              <span>✦</span>
+              <span>新建对话</span>
+            </button>
+
+            {showNewChatPopup && (
+              <div
+                className="absolute bottom-full left-0 right-0 mb-1.5 z-50 rounded-xl p-3 space-y-2.5 shadow-2xl"
+                style={{
+                  background: 'var(--elevated)',
+                  border: '1px solid var(--border-strong)',
+                }}
+              >
+                <div className="text-xs font-semibold" style={{ color: '#a78bfa' }}>
+                  ✦ 新建对话
+                </div>
+                <div className="text-[11px]" style={{ color: 'var(--muted)' }}>
+                  选择项目（可选）
+                </div>
+                <SelectorDropdown
+                  label="未选择工作空间"
+                  value={selectedWorkspace?.name ?? null}
+                  items={workspaces}
+                  onSelect={handleSelectWorkspace}
+                  icon="🏢"
+                />
+                <SelectorDropdown
+                  label="未选择项目"
+                  value={selectedProject?.name ?? null}
+                  items={projects}
+                  disabled={!selectedWorkspace}
+                  onSelect={handleSelectProject}
+                  icon="📁"
+                />
+                <div className="flex gap-2 pt-0.5">
+                  <button
+                    onClick={doStartNewChat}
+                    className="flex-1 py-1.5 text-xs rounded-lg font-medium transition-opacity hover:opacity-90"
+                    style={{ background: 'var(--purple)', color: '#fff' }}
+                  >
+                    开始对话
+                  </button>
+                  <button
+                    onClick={() => setShowNewChatPopup(false)}
+                    className="flex-1 py-1.5 text-xs rounded-lg transition-colors hover:bg-white/5"
+                    style={{ color: 'var(--muted)', border: '1px solid var(--border)' }}
+                  >
+                    取消
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
         </div>
 
         {/* ── Session stats ─────────────────────────────────────────────────── */}

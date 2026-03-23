@@ -5,6 +5,39 @@ import { useApp } from '@/contexts/AppContext'
 import type { WorkspaceInfo, ProjectInfo } from '@/contexts/AppContext'
 import { cn } from '@/lib/utils'
 
+// ─── API helpers ──────────────────────────────────────────────────────────────
+
+async function apiJoinWorkspace(workspace_id: string, user_id: string): Promise<void> {
+  const res = await fetch(`/api/agent/workspaces/${encodeURIComponent(workspace_id)}/members`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ operator_id: user_id, user_id, role: 'member' }),
+  })
+  if (!res.ok) {
+    const detail = await res.text().catch(() => `HTTP ${res.status}`)
+    throw new Error(detail || `HTTP ${res.status}`)
+  }
+}
+
+async function apiJoinProject(
+  workspace_id: string,
+  project_id: string,
+  user_id: string,
+): Promise<void> {
+  const res = await fetch(
+    `/api/agent/workspaces/${encodeURIComponent(workspace_id)}/projects/${encodeURIComponent(project_id)}/members`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ operator_id: user_id, user_id, role: 'member' }),
+    },
+  )
+  if (!res.ok) {
+    const detail = await res.text().catch(() => `HTTP ${res.status}`)
+    throw new Error(detail || `HTTP ${res.status}`)
+  }
+}
+
 // ─── Role badge ───────────────────────────────────────────────────────────────
 
 function RoleBadge({ role }: { role?: string }) {
@@ -31,6 +64,7 @@ export default function WorkspacesPage() {
   const router = useRouter()
   const appCtx = useApp()
   const {
+    currentUser,
     workspaces,
     projects,
     loadingWorkspaces,
@@ -59,6 +93,25 @@ export default function WorkspacesPage() {
   const [projDescInput, setProjDescInput] = useState('')
   const [creatingProj, setCreatingProj] = useState(false)
   const [projError, setProjError] = useState('')
+
+  // ── Top-level create project dialog ────────────────────────────────────────
+  const [showTopCreateProj, setShowTopCreateProj] = useState(false)
+  const [topProjWsId, setTopProjWsId] = useState<string>('')
+  const [topProjName, setTopProjName] = useState('')
+  const [topProjDesc, setTopProjDesc] = useState('')
+  const [topCreatingProj, setTopCreatingProj] = useState(false)
+  const [topProjError, setTopProjError] = useState('')
+
+  // ── Join workspace state ────────────────────────────────────────────────────
+  const [showJoinWs, setShowJoinWs] = useState(false)
+  const [joinWsIdInput, setJoinWsIdInput] = useState('')
+  const [joiningWs, setJoiningWs] = useState(false)
+  const [joinWsError, setJoinWsError] = useState('')
+  const [joinWsSuccess, setJoinWsSuccess] = useState('')
+
+  // ── Join project state ──────────────────────────────────────────────────────
+  const [joiningProjId, setJoiningProjId] = useState<string | null>(null)
+  const [joinProjError, setJoinProjError] = useState('')
 
   // ── Mount: refresh workspaces ──────────────────────────────────────────────
   useEffect(() => {
@@ -118,6 +171,75 @@ export default function WorkspacesPage() {
     }
   }
 
+  // ── Top-level create project (any workspace) ──────────────────────────────
+  async function handleTopCreateProj(e: React.FormEvent) {
+    e.preventDefault()
+    if (!topProjWsId) { setTopProjError('请选择工作空间'); return }
+    if (!topProjName.trim()) { setTopProjError('请输入项目名称'); return }
+    setTopCreatingProj(true)
+    setTopProjError('')
+    try {
+      await createProject(topProjWsId, topProjName.trim(), topProjDesc.trim() || undefined)
+      setTopProjName('')
+      setTopProjDesc('')
+      setShowTopCreateProj(false)
+      // If this workspace is already selected in the left panel, refresh
+      if (selectedWs?.workspace_id === topProjWsId) {
+        await refreshProjects(topProjWsId)
+      } else {
+        // Switch left panel to this workspace so user sees the new project
+        const ws = workspaces.find(w => w.workspace_id === topProjWsId)
+        if (ws) setSelectedWs(ws)
+      }
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : '创建失败，请重试'
+      setTopProjError(`创建失败：${msg}`)
+    } finally {
+      setTopCreatingProj(false)
+    }
+  }
+
+  // ── Join workspace ─────────────────────────────────────────────────────────
+  async function handleJoinWs(e: React.FormEvent) {
+    e.preventDefault()
+    const wsId = joinWsIdInput.trim()
+    if (!wsId) { setJoinWsError('请输入工作空间 ID'); return }
+    setJoiningWs(true)
+    setJoinWsError('')
+    setJoinWsSuccess('')
+    try {
+      await apiJoinWorkspace(wsId, currentUser.user_id)
+      setJoinWsSuccess('加入成功！')
+      setJoinWsIdInput('')
+      await refreshWorkspaces()
+      setTimeout(() => {
+        setShowJoinWs(false)
+        setJoinWsSuccess('')
+      }, 1200)
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : '加入失败，请重试'
+      setJoinWsError(`加入失败：${msg}`)
+    } finally {
+      setJoiningWs(false)
+    }
+  }
+
+  // ── Join project ───────────────────────────────────────────────────────────
+  async function handleJoinProject(proj: ProjectInfo) {
+    if (!selectedWs) return
+    setJoiningProjId(proj.project_id)
+    setJoinProjError('')
+    try {
+      await apiJoinProject(selectedWs.workspace_id, proj.project_id, currentUser.user_id)
+      await refreshProjects(selectedWs.workspace_id)
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : '加入失败，请重试'
+      setJoinProjError(`${proj.project_id}:${msg}`)
+    } finally {
+      setJoiningProjId(null)
+    }
+  }
+
   // ── Helpers ────────────────────────────────────────────────────────────────
   function formatDate(ts?: number) {
     if (!ts) return '—'
@@ -154,13 +276,50 @@ export default function WorkspacesPage() {
             🏢 工作空间管理
           </h1>
         </div>
-        <button
-          onClick={() => { setShowCreateWs(v => !v); setShowCreateProj(false) }}
-          className="flex items-center gap-1.5 text-sm px-3 py-1.5 rounded-lg font-medium transition-all hover:opacity-90"
-          style={{ background: 'var(--purple)', color: '#fff' }}
-        >
-          + 新建工作空间
-        </button>
+        <div className="flex items-center gap-2">
+          <button
+            onClick={() => {
+              setShowJoinWs(v => !v)
+              setShowCreateWs(false)
+              setJoinWsError('')
+              setJoinWsSuccess('')
+            }}
+            className="flex items-center gap-1.5 text-sm px-3 py-1.5 rounded-lg font-medium transition-all hover:opacity-90"
+            style={{
+              background: showJoinWs ? 'var(--elevated)' : 'rgba(124,58,237,0.15)',
+              color: '#a78bfa',
+              border: '1px solid rgba(124,58,237,0.3)',
+            }}
+          >
+            🔗 加入工作空间
+          </button>
+          <button
+            onClick={() => {
+              setTopProjWsId(workspaces[0]?.workspace_id ?? '')
+              setTopProjName('')
+              setTopProjDesc('')
+              setTopProjError('')
+              setShowTopCreateProj(true)
+            }}
+            disabled={workspaces.length === 0}
+            className="flex items-center gap-1.5 text-sm px-3 py-1.5 rounded-lg font-medium transition-all hover:opacity-90 disabled:opacity-40"
+            style={{
+              background: 'rgba(16,185,129,0.15)',
+              color: '#6ee7b7',
+              border: '1px solid rgba(16,185,129,0.3)',
+            }}
+            title={workspaces.length === 0 ? '请先创建工作空间' : '新增项目'}
+          >
+            + 新增项目
+          </button>
+          <button
+            onClick={() => { setShowCreateWs(v => !v); setShowJoinWs(false); setShowCreateProj(false) }}
+            className="flex items-center gap-1.5 text-sm px-3 py-1.5 rounded-lg font-medium transition-all hover:opacity-90"
+            style={{ background: 'var(--purple)', color: '#fff' }}
+          >
+            + 新建工作空间
+          </button>
+        </div>
       </div>
 
       {/* Body */}
@@ -253,6 +412,61 @@ export default function WorkspacesPage() {
               </div>
             </div>
           ))}
+
+          {/* Join workspace inline form */}
+          {showJoinWs && (
+            <form
+              onSubmit={handleJoinWs}
+              className="rounded-xl p-3 space-y-2"
+              style={{
+                background: 'var(--surface)',
+                border: '1px solid rgba(124,58,237,0.4)',
+              }}
+            >
+              <div className="text-xs font-semibold mb-1" style={{ color: '#a78bfa' }}>
+                加入工作空间
+              </div>
+              <p className="text-[11px]" style={{ color: 'var(--muted)' }}>
+                输入工作空间 ID 以申请加入
+              </p>
+              <input
+                autoFocus
+                value={joinWsIdInput}
+                onChange={e => setJoinWsIdInput(e.target.value)}
+                placeholder="工作空间 ID *"
+                className="w-full text-xs px-2.5 py-1.5 rounded-lg outline-none font-mono"
+                style={{
+                  background: 'var(--elevated)',
+                  border: '1px solid var(--border-strong)',
+                  color: '#e2e8f0',
+                }}
+              />
+              {joinWsError && (
+                <div className="text-[11px]" style={{ color: '#f87171' }}>{joinWsError}</div>
+              )}
+              {joinWsSuccess && (
+                <div className="text-[11px]" style={{ color: '#86efac' }}>{joinWsSuccess}</div>
+              )}
+              <div className="flex gap-2">
+                <button
+                  type="submit"
+                  disabled={joiningWs}
+                  className="flex-1 py-1.5 text-xs rounded-lg font-medium transition-opacity hover:opacity-90 disabled:opacity-50"
+                  style={{ background: 'var(--purple)', color: '#fff' }}
+                >
+                  {joiningWs ? '加入中…' : '加入'}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => { setShowJoinWs(false); setJoinWsError(''); setJoinWsSuccess('') }}
+                  className="flex-1 py-1.5 text-xs rounded-lg transition-colors hover:bg-white/5"
+                  style={{ color: 'var(--muted)', border: '1px solid var(--border)' }}
+                >
+                  取消
+                </button>
+              </div>
+            </form>
+          )}
 
           {/* Create workspace inline form */}
           {showCreateWs && (
@@ -396,18 +610,26 @@ export default function WorkspacesPage() {
                 >
                   📁 项目列表
                 </h3>
-                <button
-                  onClick={() => { setShowCreateProj(v => !v); setProjError('') }}
-                  className="text-xs px-2.5 py-1 rounded-lg transition-all hover:opacity-90"
-                  style={{
-                    background: showCreateProj ? 'var(--elevated)' : 'rgba(124,58,237,0.15)',
-                    color: '#a78bfa',
-                    border: '1px solid rgba(124,58,237,0.3)',
-                  }}
-                >
-                  + 新建项目
-                </button>
+                <div className="flex items-center gap-2">
+                  <button
+                    onClick={() => { setShowCreateProj(v => !v); setProjError('') }}
+                    className="text-xs px-2.5 py-1 rounded-lg transition-all hover:opacity-90"
+                    style={{
+                      background: showCreateProj ? 'var(--elevated)' : 'rgba(124,58,237,0.15)',
+                      color: '#a78bfa',
+                      border: '1px solid rgba(124,58,237,0.3)',
+                    }}
+                  >
+                    + 新建项目
+                  </button>
+                </div>
               </div>
+              {/* Hint: projects without a role can be joined via the card button */}
+              {projects.some(p => !p.role) && (
+                <p className="text-[11px] mb-2" style={{ color: 'var(--muted)' }}>
+                  💡 带有 <span style={{ color: '#67e8f9' }}>🔗 加入项目</span> 按钮的项目表示你尚未加入，点击即可申请加入。
+                </p>
+              )}
 
               {/* Create project inline form */}
               {showCreateProj && (
@@ -578,7 +800,41 @@ export default function WorkspacesPage() {
                       )}
                     </div>
 
-                    {!isCurrentProj(proj) ? (
+                    {/* Join project error */}
+                    {joinProjError.startsWith(proj.project_id + ':') && (
+                      <div className="text-[10px] mb-1.5" style={{ color: '#f87171' }}>
+                        {joinProjError.slice(proj.project_id.length + 1)}
+                      </div>
+                    )}
+
+                    {/* Action buttons */}
+                    {isCurrentProj(proj) ? (
+                      <button
+                        onClick={() => selectProject(null)}
+                        className="w-full py-1 text-[11px] rounded-lg font-medium transition-all hover:opacity-90"
+                        style={{
+                          background: 'rgba(34,197,94,0.1)',
+                          color: '#86efac',
+                          border: '1px solid rgba(34,197,94,0.2)',
+                        }}
+                      >
+                        ✓ 已选择 · 取消
+                      </button>
+                    ) : !proj.role ? (
+                      /* User has no role → show join button */
+                      <button
+                        onClick={() => handleJoinProject(proj)}
+                        disabled={joiningProjId === proj.project_id}
+                        className="w-full py-1 text-[11px] rounded-lg font-medium transition-all hover:opacity-90 disabled:opacity-60"
+                        style={{
+                          background: 'rgba(6,182,212,0.15)',
+                          color: '#67e8f9',
+                          border: '1px solid rgba(6,182,212,0.3)',
+                        }}
+                      >
+                        {joiningProjId === proj.project_id ? '加入中…' : '🔗 加入项目'}
+                      </button>
+                    ) : (
                       <button
                         onClick={() => {
                           selectWorkspace(selectedWs)
@@ -592,18 +848,6 @@ export default function WorkspacesPage() {
                         }}
                       >
                         选择项目
-                      </button>
-                    ) : (
-                      <button
-                        onClick={() => selectProject(null)}
-                        className="w-full py-1 text-[11px] rounded-lg font-medium transition-all hover:opacity-90"
-                        style={{
-                          background: 'rgba(34,197,94,0.1)',
-                          color: '#86efac',
-                          border: '1px solid rgba(34,197,94,0.2)',
-                        }}
-                      >
-                        ✓ 已选择 · 取消
                       </button>
                     )}
                   </div>
@@ -632,6 +876,126 @@ export default function WorkspacesPage() {
           </div>
         )}
       </div>
+
+      {/* ── Top-level Create Project Modal ────────────────────────────────── */}
+      {showTopCreateProj && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center"
+          style={{ background: 'rgba(0,0,0,0.6)', backdropFilter: 'blur(2px)' }}
+          onClick={e => { if (e.target === e.currentTarget) setShowTopCreateProj(false) }}
+        >
+          <form
+            onSubmit={handleTopCreateProj}
+            className="w-full max-w-md rounded-2xl p-6 space-y-4 shadow-2xl"
+            style={{
+              background: 'var(--surface)',
+              border: '1px solid rgba(16,185,129,0.35)',
+            }}
+          >
+            <div className="flex items-center justify-between">
+              <h2 className="text-base font-semibold" style={{ color: '#f1f5f9' }}>
+                📁 新增项目
+              </h2>
+              <button
+                type="button"
+                onClick={() => setShowTopCreateProj(false)}
+                className="text-lg hover:text-white transition-colors"
+                style={{ color: 'var(--muted)' }}
+              >
+                ✕
+              </button>
+            </div>
+
+            {/* Workspace selector */}
+            <div>
+              <label className="text-xs font-medium block mb-1.5" style={{ color: 'var(--muted)' }}>
+                所属工作空间 *
+              </label>
+              <select
+                value={topProjWsId}
+                onChange={e => setTopProjWsId(e.target.value)}
+                className="w-full text-xs px-2.5 py-2 rounded-lg outline-none appearance-none"
+                style={{
+                  background: 'var(--elevated)',
+                  border: '1px solid var(--border-strong)',
+                  color: '#e2e8f0',
+                }}
+              >
+                {workspaces.length === 0 && (
+                  <option value="">暂无工作空间</option>
+                )}
+                {workspaces.map(ws => (
+                  <option key={ws.workspace_id} value={ws.workspace_id}>
+                    {ws.name}
+                  </option>
+                ))}
+              </select>
+            </div>
+
+            {/* Project name */}
+            <div>
+              <label className="text-xs font-medium block mb-1.5" style={{ color: 'var(--muted)' }}>
+                项目名称 *
+              </label>
+              <input
+                autoFocus
+                value={topProjName}
+                onChange={e => setTopProjName(e.target.value)}
+                placeholder="输入项目名称"
+                className="w-full text-xs px-2.5 py-2 rounded-lg outline-none"
+                style={{
+                  background: 'var(--elevated)',
+                  border: '1px solid var(--border-strong)',
+                  color: '#e2e8f0',
+                }}
+                maxLength={50}
+              />
+            </div>
+
+            {/* Project description */}
+            <div>
+              <label className="text-xs font-medium block mb-1.5" style={{ color: 'var(--muted)' }}>
+                描述（可选）
+              </label>
+              <input
+                value={topProjDesc}
+                onChange={e => setTopProjDesc(e.target.value)}
+                placeholder="简短描述项目用途"
+                className="w-full text-xs px-2.5 py-2 rounded-lg outline-none"
+                style={{
+                  background: 'var(--elevated)',
+                  border: '1px solid var(--border-strong)',
+                  color: '#e2e8f0',
+                }}
+                maxLength={120}
+              />
+            </div>
+
+            {topProjError && (
+              <div className="text-xs" style={{ color: '#f87171' }}>{topProjError}</div>
+            )}
+
+            <div className="flex gap-3 pt-1">
+              <button
+                type="submit"
+                disabled={topCreatingProj || workspaces.length === 0}
+                className="flex-1 py-2 text-sm rounded-lg font-medium transition-opacity hover:opacity-90 disabled:opacity-50"
+                style={{ background: 'rgba(16,185,129,0.85)', color: '#fff' }}
+              >
+                {topCreatingProj ? '创建中…' : '创建项目'}
+              </button>
+              <button
+                type="button"
+                onClick={() => setShowTopCreateProj(false)}
+                className="flex-1 py-2 text-sm rounded-lg transition-colors hover:bg-white/5"
+                style={{ color: 'var(--muted)', border: '1px solid var(--border)' }}
+              >
+                取消
+              </button>
+            </div>
+          </form>
+        </div>
+      )}
     </div>
   )
 }
