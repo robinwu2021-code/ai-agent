@@ -195,11 +195,24 @@ class TripleExtractor:
     # ------------------------------------------------------------------
 
     async def _call_llm(self, prompt: str) -> str:
-        """Call LLM engine, supporting both sync and async generate methods."""
+        """Call LLM engine.
+
+        Supports two interface styles:
+        1. LLMRouter / LLMEngine (project standard): chat(messages, tools, config)
+        2. Legacy: generate(prompt) — sync or async
+        """
+        # ── LLMRouter / LLMEngine: chat() interface ──────────────────────
+        if hasattr(self._llm, "chat") and not hasattr(self._llm, "generate"):
+            from core.models import AgentConfig, Message, MessageRole
+            messages = [Message(role=MessageRole.USER, content=prompt)]
+            config   = AgentConfig()
+            resp     = await self._llm.chat(messages, [], config)
+            return resp.content or ""
+
+        # ── Legacy: generate() method ─────────────────────────────────────
         if asyncio.iscoroutinefunction(self._llm.generate):
             return await self._llm.generate(prompt)
-        else:
-            return await asyncio.to_thread(self._llm.generate, prompt)
+        return await asyncio.to_thread(self._llm.generate, prompt)
 
     def _parse_response(
         self, raw_response: str, doc_id: str = "", chunk_id: str = ""

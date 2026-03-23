@@ -132,6 +132,9 @@ class PersistentKnowledgeBase:
                                 error=str(vs_exc),
                                 fallback="sqlite")
                     self._vector_store = None  # fall through to SQLite path
+                    # Lazily create in-memory retriever that was skipped in __init__
+                    if self._retriever is None:
+                        self._retriever = HybridRetriever(embed_fn=self._embed_fn)
 
             # ── Legacy SQLite path ─────────────────────────────────────
             kb_chunks = await self._store.list_chunks_by_kb(self._kb_id, limit=10_000)

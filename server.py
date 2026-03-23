@@ -288,8 +288,9 @@ def _build_container(engine_alias: str | None = None):
         except Exception as exc:
             log.warning("server.kg_store_init_failed", error=str(exc))
 
-        # embed_fn 从 llm_router 借用
-        _embed_fn = lambda text: llm_router.embed(text)  # noqa: E731
+        # embed_fn 从 llm_router 借用（必须是 async def，lambda 返回协程对象会被误判为同步）
+        async def _embed_fn(text: str) -> list[float]:
+            return await llm_router.embed(text)
 
         extractor     = TripleExtractor(llm_router)
         resolver      = EntityResolver(kg_store, _embed_fn)
@@ -348,7 +349,8 @@ def _build_container(engine_alias: str | None = None):
         except Exception as _vs_err:
             log.warning("server.vector_store_build_failed", error=str(_vs_err))
 
-        _embed_fn2 = lambda text: llm_router.embed(text)  # noqa: E731
+        async def _embed_fn2(text: str) -> list[float]:
+            return await llm_router.embed(text)
         pkb = PersistentKnowledgeBase(
             store=kb_store,
             embed_fn=_embed_fn2,
