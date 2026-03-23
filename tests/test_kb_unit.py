@@ -357,3 +357,166 @@ class TestChunkConversion:
         assert kbc.kb_id == "kb2"
         assert kbc.text == "foo bar"
         assert kbc.embedding == pytest.approx([0.3, 0.4])
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 7. doc_ids scoped filtering (SQLite path)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestDocIdsFiltering:
+    """Test that PKB.query() respects the doc_ids filter in SQLite (no-vector-store) mode."""
+
+    def test_filter_to_single_doc(self, pkb):
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(pkb.add_text("Cats are fluffy animals that purr.", source="alpha.txt", kb_id="scope_kb"))
+        loop.run_until_complete(pkb.add_text("Dogs are loyal companions for humans.", source="beta.txt", kb_id="scope_kb"))
+
+        docs = loop.run_until_complete(pkb.list_documents(kb_id="scope_kb"))
+        assert len(docs) == 2
+        alpha_id = next(d.doc_id for d in docs if d.filename == "alpha.txt")
+        beta_id  = next(d.doc_id for d in docs if d.filename == "beta.txt")
+
+        results = loop.run_until_complete(pkb.query("cats fluffy", kb_id="scope_kb", doc_ids=[alpha_id]))
+        returned_doc_ids = {c.doc_id for c in results}
+        assert beta_id not in returned_doc_ids, "beta doc leaked into single-doc filter results"
+        if results:
+            assert alpha_id in returned_doc_ids
+
+    def test_filter_to_multiple_docs(self, pkb):
+        loop = asyncio.get_event_loop()
+        for name in ["d1.txt", "d2.txt", "d3.txt"]:
+            loop.run_until_complete(pkb.add_text(f"Information about {name} topic", source=name, kb_id="multi_kb"))
+
+        docs = loop.run_until_complete(pkb.list_documents(kb_id="multi_kb"))
+        ids_12  = [d.doc_id for d in docs if d.filename in ("d1.txt", "d2.txt")]
+        id_3    = next(d.doc_id for d in docs if d.filename == "d3.txt")
+
+        results = loop.run_until_complete(pkb.query("Information topic", kb_id="multi_kb", doc_ids=ids_12))
+        assert id_3 not in {c.doc_id for c in results}, "d3 leaked into 2-doc filtered results"
+
+    def test_none_doc_ids_returns_all(self, pkb):
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(pkb.add_text("Text alpha content here.", source="t1.txt", kb_id="all_kb"))
+        loop.run_until_complete(pkb.add_text("Text beta content here.", source="t2.txt", kb_id="all_kb"))
+
+        results_none  = loop.run_until_complete(pkb.query("Text content", kb_id="all_kb", doc_ids=None))
+        results_empty = loop.run_until_complete(pkb.query("Text content", kb_id="all_kb", doc_ids=[]))
+        assert len(results_none) > 0
+        assert len(results_empty) > 0
+        # Both should return the same set of doc_ids (all docs)
+        assert {c.doc_id for c in results_none} == {c.doc_id for c in results_empty}
+
+    def test_nonexistent_doc_id_returns_empty(self, pkb):
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(pkb.add_text("Real document content here.", source="real.txt", kb_id="ghost_kb"))
+        results = loop.run_until_complete(
+            pkb.query("document", kb_id="ghost_kb", doc_ids=["nonexistent_doc_id"])
+        )
+        assert results == [], f"Expected empty results for nonexistent doc_id, got {results}"
+
+    def test_doc_ids_respects_kb_isolation(self, pkb):
+        """doc_ids from a different kb should not produce results in another kb."""
+        loop = asyncio.get_event_loop()
+        doc_a = loop.run_until_complete(pkb.add_text("Content in kb_x.", source="a.txt", kb_id="kb_x"))
+        loop.run_until_complete(pkb.add_text("Content in kb_y.", source="b.txt", kb_id="kb_y"))
+
+        # Pass alpha's doc_id but query kb_y — should get nothing
+        results = loop.run_until_complete(
+            pkb.query("Content", kb_id="kb_y", doc_ids=[doc_a.doc_id])
+        )
+        assert results == [], "Cross-kb doc_id should not return results"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 8. on_progress callback
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestProgressCallback:
+    def test_progress_fires_for_each_chunk(self, pkb):
+        loop = asyncio.get_event_loop()
+        progress_calls: list[tuple[int, int]] = []
+
+        def on_progress(done: int, total: int) -> None:
+            progress_calls.append((done, total))
+
+        # Long enough to produce multiple chunks
+        long_text = " ".join([f"Sentence number {i} about interesting topics for testing purposes." for i in range(60)])
+        doc = loop.run_until_complete(pkb.add_text(long_text, source="long.txt", on_progress=on_progress))
+
+        assert doc.status == "ready"
+        assert len(progress_calls) >= 1, "on_progress was never called"
+        # Last call: done == total
+        last_done, last_total = progress_calls[-1]
+        assert last_done == last_total, f"Final call should have done==total, got {last_done}/{last_total}"
+        # done values should be monotonically non-decreasing
+        dones = [d for d, _ in progress_calls]
+        assert dones == sorted(dones), f"Progress done values not monotonic: {dones}"
+        # total should be consistent across all calls
+        totals = [t for _, t in progress_calls]
+        assert len(set(totals)) == 1, f"total changed across progress calls: {totals}"
+
+    def test_no_progress_callback_still_succeeds(self, pkb):
+        loop = asyncio.get_event_loop()
+        doc = loop.run_until_complete(pkb.add_text("Short text with no callback.", source="short.txt"))
+        assert doc.status == "ready"
+
+    def test_progress_receives_correct_range(self, pkb):
+        loop = asyncio.get_event_loop()
+        calls: list[tuple[int, int]] = []
+
+        loop.run_until_complete(pkb.add_text(
+            "Simple one or two chunk text content here for progress testing.",
+            source="simple.txt",
+            on_progress=lambda d, t: calls.append((d, t)),
+        ))
+        # All done values must be 1..total
+        for done, total in calls:
+            assert 1 <= done <= total, f"Invalid progress: done={done}, total={total}"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 9. VectorStoreBase abstract interface
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestVectorStoreBase:
+    def test_cannot_instantiate_abstract_class(self):
+        from rag.vector_store_base import VectorStoreBase
+        with pytest.raises(TypeError, match="abstract"):
+            VectorStoreBase()  # type: ignore[abstract]
+
+    def test_partial_implementation_raises(self):
+        from rag.vector_store_base import VectorStoreBase
+
+        class PartialStore(VectorStoreBase):
+            async def initialize(self): pass
+            async def upsert_chunks(self, chunks): pass
+            # All other abstract methods missing
+
+        with pytest.raises(TypeError):
+            PartialStore()  # type: ignore[abstract]
+
+    def test_full_implementation_is_valid(self):
+        from rag.vector_store_base import VectorStoreBase
+
+        class MinimalStore(VectorStoreBase):
+            async def initialize(self): pass
+            async def upsert_chunks(self, chunks): pass
+            async def hybrid_search(self, query_vec, query_text, kb_id, top_k=5, rrf_k=60, doc_ids=None): return []
+            async def vector_search(self, query_vec, kb_id, top_k=10): return []
+            async def delete_by_doc_id(self, doc_id): return 0
+            async def delete_by_kb_id(self, kb_id): return 0
+            async def list_chunks(self, doc_id): return []
+            async def list_chunks_by_kb(self, kb_id, limit=2000): return []
+            async def get_stats(self, kb_id): return {}
+            async def collection_info(self): return {}
+
+        store = MinimalStore()
+        assert isinstance(store, VectorStoreBase)
+
+    def test_hybrid_search_signature_includes_doc_ids(self):
+        """Ensure doc_ids parameter is present in the abstract method signature."""
+        import inspect
+        from rag.vector_store_base import VectorStoreBase
+        sig = inspect.signature(VectorStoreBase.hybrid_search)
+        assert "doc_ids" in sig.parameters, "doc_ids param missing from VectorStoreBase.hybrid_search"
+        assert sig.parameters["doc_ids"].default is None
