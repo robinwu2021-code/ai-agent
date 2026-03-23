@@ -120,10 +120,18 @@ class PersistentKnowledgeBase:
             return
         try:
             if self._vector_store is not None:
-                await self._vector_store.initialize()
-                self._initialized = True
-                log.info("rag.persistent_kb.initialized_qdrant", kb_id=self._kb_id)
-                return
+                try:
+                    await self._vector_store.initialize()
+                    self._initialized = True
+                    log.info("rag.persistent_kb.initialized_vector_store",
+                             backend=type(self._vector_store).__name__, kb_id=self._kb_id)
+                    return
+                except Exception as vs_exc:
+                    log.warning("rag.persistent_kb.vector_store_init_failed",
+                                backend=type(self._vector_store).__name__,
+                                error=str(vs_exc),
+                                fallback="sqlite")
+                    self._vector_store = None  # fall through to SQLite path
 
             # ── Legacy SQLite path ─────────────────────────────────────
             kb_chunks = await self._store.list_chunks_by_kb(self._kb_id, limit=10_000)

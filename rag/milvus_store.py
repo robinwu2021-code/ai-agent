@@ -433,18 +433,36 @@ class MilvusVectorStore(VectorStoreBase):
         return [self._row_to_payload(r) for r in rows]
 
     async def get_stats(self, kb_id: str) -> dict:
-        rows = await asyncio.to_thread(
-            self._client.query,
-            collection_name=self._collection,
-            filter=f'kb_id == "{kb_id}"',
-            output_fields=["doc_id", "text"],
-            limit=100000,
-        )
-        doc_ids    = list({r["doc_id"] for r in rows})
-        total_chars = sum(len(r.get("text", "")) for r in rows)
+        # Milvus limits (offset+limit) to 16384; use pagination to aggregate stats
+        _PAGE   = 1000
+        offset  = 0
+        all_doc_ids:   set[str] = set()
+        total_chars = 0
+        chunk_count = 0
+
+        def _query_page(off: int) -> list:
+            return self._client.query(
+                collection_name=self._collection,
+                filter=f'kb_id == "{kb_id}"',
+                output_fields=["doc_id", "text"],
+                limit=_PAGE,
+                offset=off,
+            )
+
+        while True:
+            rows = await asyncio.to_thread(_query_page, offset)
+            if not rows:
+                break
+            chunk_count += len(rows)
+            all_doc_ids.update(r["doc_id"] for r in rows)
+            total_chars += sum(len(r.get("text", "")) for r in rows)
+            if len(rows) < _PAGE:
+                break
+            offset += _PAGE
+
         return {
-            "chunk_count": len(rows),
-            "doc_count":   len(doc_ids),
+            "chunk_count": chunk_count,
+            "doc_count":   len(all_doc_ids),
             "total_chars": total_chars,
         }
 

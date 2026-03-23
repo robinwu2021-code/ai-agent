@@ -178,7 +178,7 @@ def _build_container(engine_alias: str | None = None):
     )
 
     yaml_path = pathlib.Path(__file__).parent / "llm.yaml"
-    configs, router_cfg = load_from_yaml(yaml_path)
+    configs, router_cfg, _vs_cfg, _mem_cfg = load_from_yaml(yaml_path)
 
     # 构建引擎注册表，跟踪成功加载的 alias
     registry       = ModelRegistry()

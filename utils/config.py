@@ -195,7 +195,7 @@ class Settings(BaseSettings):
             yaml_path = Path(self.llm_config_file)
             if yaml_path.exists():
                 try:
-                    _, _, vs_cfg = load_from_yaml(yaml_path)
+                    _, _, vs_cfg, _ = load_from_yaml(yaml_path)
                     if vs_cfg and vs_cfg.backend != "sqlite":
                         return vs_cfg.build()
                 except Exception as exc:

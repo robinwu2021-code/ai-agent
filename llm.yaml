@@ -119,21 +119,21 @@ engines:
 
 router:
   # 所有未覆盖任务类型的回落引擎
-  default: claude-smart
+  default: vllm-qwen3
 
   # ── 按任务类型路由（留空则回落 default）──────────────────────
-  chat: claude-smart          # 主推理对话（ReAct 循环）
-  plan: claude-smart          # Plan-Execute 规划阶段
-  summarize: claude-fast      # 文本摘要/上下文裁剪（用便宜模型）
-  consolidate: claude-fast    # 记忆固化提炼
+  chat: vllm-qwen3            # 主推理对话（ReAct 循环）
+  plan: vllm-qwen3            # Plan-Execute 规划阶段
+  summarize: vllm-qwen3       # 文本摘要/上下文裁剪
+  consolidate: vllm-qwen3     # 记忆固化提炼
   embed: ollama-embed         # 向量化 → 本地 qwen3-embedding:8b（离线可用，0成本）
   # embed: azure-east         # 若需 OpenAI embedding 取消注释并注释上行
-  # eval: claude-fast         # LLM-as-judge 打分
-  # route: claude-fast        # Multi-Agent 路由决策
+  # eval: vllm-qwen3          # LLM-as-judge 打分
+  # route: vllm-qwen3         # Multi-Agent 路由决策
 
   # ── Fallback 链（主引擎失败后按序尝试）──────────────────────
   fallback:
-    - claude-fast
+    - vllm-qwen3
     # - deepseek-chat
     # - groq-fast
 
@@ -203,11 +203,11 @@ memory:
     backend: mem0                   # mem0 | milvus | qdrant | zep | in_memory
 
     # ── LLM 引擎：引用 engines 节 alias，无需重复配置 ──────────
-    llm_engine:   ollama-qwen3      # 用于 mem0 内部记忆提取/去重判断
+    llm_engine:   vllm-qwen3        # 用于 mem0 内部记忆提取/去重判断
     embed_engine: ollama-embed      # 用于向量化存储与语义检索
 
     # ── 切换示例（取消注释即生效）─────────────────────────────
-    # llm_engine: vllm-qwen3        # 改为本地 vLLM（推理更快）
+    # llm_engine: ollama-qwen3      # 改为本地 Ollama
     # llm_engine: claude-fast       # 改为云端 Claude Haiku（质量更高）
     # llm_engine: claude-smart      # 改为旗舰模型（成本高，质量最好）
     # embed_engine: ollama-embed    # 本地 qwen3-embedding:8b（默认）
@@ -227,10 +227,10 @@ memory:
 
   # ── 工作记忆（Context 组装）────────────────────────────────
   working:
-    # 历史压缩使用廉价快速模型，节省 token 成本
-    summarize_engine: claude-fast   # 空字符串 → 使用 router.summarize 默认路由
-    # summarize_engine: ollama-qwen3   # 离线优先，不依赖云端
-    # summarize_engine: vllm-qwen3     # 切换到 vLLM
+    # 历史压缩使用本地 vLLM 引擎
+    summarize_engine: vllm-qwen3    # 空字符串 → 使用 router.summarize 默认路由
+    # summarize_engine: ollama-qwen3   # 切换回 Ollama
+    # summarize_engine: claude-fast    # 切换到云端 Claude
 
     token_budget: 12000             # 总 context token 预算
     compress_threshold: 1500        # 历史超出此 token 数时触发 LLM 摘要压缩
@@ -238,10 +238,10 @@ memory:
 
   # ── 记忆固化（Consolidation）────────────────────────────────
   consolidation:
-    # 固化提取使用廉价模型（提取结构化事实，无需强推理能力）
-    engine: claude-fast             # 空字符串 → 使用 router.consolidate 默认路由
+    # 固化提取使用本地 vLLM 引擎
+    engine: vllm-qwen3              # 空字符串 → 使用 router.consolidate 默认路由
     # engine: ollama-qwen3          # 切换到本地 Ollama
-    # engine: vllm-qwen3            # 切换到本地 vLLM
+    # engine: claude-fast           # 切换到云端 Claude
 
     incremental_every: 10           # 每 N 条新消息触发增量固化（防崩溃丢失）
     segment_size: 20                # 每次处理的消息段大小
