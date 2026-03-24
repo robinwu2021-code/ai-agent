@@ -1,9 +1,9 @@
 name: agent_bi
-version: "1.0.0"
-description: "查询商家BI报表数据，支持销售额、订单数、客户数等多维度业务指标统计分析"
+version: "2.0.0"
+description: "查询商家BI报表数据，支持销售额、订单数、顾客数等多维度业务指标统计分析，可按门店和时间范围过滤，支持 SUM/AVG/MAX/MIN/COUNT 聚合，结果附带中文标签。接口: https://fnb-qrcode.neargo.ai/v1/report/agent_bi"
 author: "ai-agent"
 tags: ["report", "bi", "analytics", "business", "sales"]
-permission: read
+permission: network
 timeout_ms: 15000
 entrypoint: AgentBiSkill
 input_schema:
@@ -15,18 +15,45 @@ input_schema:
       description: "操作类型，目前支持 query"
     metrics:
       type: array
+      minItems: 1
       items:
         type: string
-        enum: [turnover, actual_income, actual_income_no_tips, tips_amount, order_quantity, average_order_price, customer_number, dining_room_amount, togo_amount, store_delivery_amount, discount_amount, discount_ratio, member_quantity, new_member_number, first_member_number, second_member_number, regular_member_number, refund_amount, refunded_quantity, pay_by_cash, pay_by_card, pay_by_online, pay_by_savings, pos_amount, amount_not_taxed, vat]
-      description: "要查询的指标字段列表"
+        enum:
+          - turnover
+          - actual_income
+          - actual_income_no_tips
+          - tips_amount
+          - order_quantity
+          - average_order_price
+          - customer_number
+          - dining_room_amount
+          - togo_amount
+          - store_delivery_amount
+          - discount_amount
+          - discount_ratio
+          - member_quantity
+          - new_member_number
+          - first_member_number
+          - second_member_number
+          - regular_member_number
+          - refund_amount
+          - refunded_quantity
+          - pay_by_cash
+          - pay_by_card
+          - pay_by_online
+          - pay_by_savings
+          - pos_amount
+          - amount_not_taxed
+          - vat
+      description: "要查询的指标字段列表（至少一个）"
     bra_id:
       type: string
-      description: "门店ID，不传则查询全部门店"
+      description: "门店ID，不传则查询所有门店"
     aggregation:
       type: string
       enum: [SUM, AVG, MAX, MIN, COUNT]
       default: SUM
-      description: "聚合函数"
+      description: "聚合函数（默认 SUM）"
     range_start:
       type: integer
       description: "统计开始时间（13位毫秒时间戳，每日凌晨00:00:00）"
