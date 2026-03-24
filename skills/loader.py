@@ -55,6 +55,8 @@ HUB_DIR = pathlib.Path(__file__).parent / "hub"
 _PERMISSION_MAP = {
     "read":    PermissionLevel.READ,
     "write":   PermissionLevel.WRITE,
+    "network": PermissionLevel.NETWORK,
+    "exec":    PermissionLevel.EXEC,
 }
 
 

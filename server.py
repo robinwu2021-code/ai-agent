@@ -248,6 +248,15 @@ def _build_container(engine_alias: str | None = None):
         except Exception as e:
             log.warning("server.hub_skill_skip", name=getattr(hub_skill, "descriptor", None) and hub_skill.descriptor.name, error=str(e))
 
+    # 兜底：确保 agent_bi 一定被注册（hub 自动发现失败时的安全网）
+    if not skill_registry.get("agent_bi"):
+        try:
+            from skills.hub.agent_bi import AgentBiSkill as _AgentBiSkill
+            skill_registry.register(_AgentBiSkill())
+            log.info("server.agent_bi_registered_fallback")
+        except Exception as _e:
+            log.error("server.agent_bi_registration_failed", error=str(_e))
+
     # ── Workspace 存储（SQLite，可通过 WORKSPACE_DB_URL 环境变量切换 MySQL）──
     import asyncio, os
     from workspace.store import create_store
@@ -491,10 +500,34 @@ def _build_prompt(req: "ChatRequest") -> str | None:
     """组装系统提示词：自定义 > 营销模式 > BI 门店上下文。"""
     base = req.system_prompt or (_MARKETING_SYSTEM_PROMPT if req.mode == "marketing" else None)
 
-    if req.bra_id:
+    # 当请求限定使用 agent_bi，或者明确传入了 bra_id 时，注入 BI 上下文。
+    # 这能确保 LLM 始终知道：① 有 agent_bi 工具可用；② 门店 ID 是什么。
+    is_bi_request = bool(
+        req.bra_id
+        or (req.skills and "agent_bi" in req.skills)
+    )
+    if is_bi_request:
+        if req.bra_id:
+            store_line = (
+                f"Current store ID (bra_id): {req.bra_id}  "
+                "← you MUST pass this exact value as the bra_id parameter when calling agent_bi."
+            )
+        else:
+            from skills.hub.agent_bi import _default_bra_id as _bi_default
+            default_id = _bi_default()
+            store_line = (
+                f"No store ID was provided by the user; the system default will be used automatically "
+                f"(bra_id will default to {default_id!r} inside agent_bi). "
+                "Do NOT ask the user for a store ID — just call agent_bi without bra_id."
+            )
         bi_ctx = (
-            f"\n\n[BI store context] Current store ID: {req.bra_id}. "
-            "When calling the agent_bi tool you MUST pass this value as the bra_id parameter."
+            "\n\n[BI Report Context]\n"
+            "You have access to the `agent_bi` tool which queries real merchant BI data "
+            "(sales / 销售额, orders / 订单数, customers / 顾客数, payments / 支付, members / 会员, etc.). "
+            "当用户要查询销售数据、营业额、订单量等门店业务数据时，必须调用 agent_bi 工具。\n"
+            f"{store_line}\n"
+            "Use the rangeStart/rangeEnd values from the [BI date context] block in the user message "
+            "to fill range_start and range_end parameters."
         )
         return (base or "") + bi_ctx
 

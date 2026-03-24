@@ -138,11 +138,16 @@ class AgentBiSkill:
     descriptor = ToolDescriptor(
         name="agent_bi",
         description=(
-            "Query merchant BI report data: sales, orders, customers, payments, members, refunds, etc. "
-            "Use the rangeStart/rangeEnd pairs provided in the [BI date context] block of the user message. "
-            "The bra_id (store ID) is provided in the system prompt [BI store context]; copy it exactly as-is. "
-            "If no store context is present, omit bra_id and the backend will use the configured default. "
-            "Respond to the user in whatever language they used."
+            # 中文：让 LLM 在中文对话中也能识别
+            "查询门店BI报表数据（销售额/营业额、订单数、顾客数、支付方式、会员、退款等）。"
+            "当用户询问销售数据、营业额、订单量、客流量等门店经营指标时，必须调用此工具。\n"
+            # English: for multi-language support
+            "Query merchant BI report data: turnover/sales, orders, customers, payments, members, refunds. "
+            "Call this tool whenever the user asks about store sales, revenue, order count, or any business metrics. "
+            # Parameter guidance
+            "bra_id: copy from [BI store context] in system prompt, or omit to use the configured default store. "
+            "range_start/range_end: use the ms-timestamp pairs from [BI date context] in the user message. "
+            "Respond in the same language the user used."
         ),
         input_schema={
             "type": "object",

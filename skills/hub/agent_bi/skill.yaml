@@ -1,6 +1,6 @@
 name: agent_bi
 version: "2.0.0"
-description: "查询商家BI报表数据，支持销售额、订单数、顾客数等多维度业务指标统计分析，可按门店和时间范围过滤，支持 SUM/AVG/MAX/MIN/COUNT 聚合，结果附带中文标签。接口: https://fnb-qrcode.neargo.ai/v1/report/agent_bi"
+description: "查询门店BI报表数据（销售额/营业额、订单数、顾客数、支付方式、会员、退款等）。当用户询问销售数据、营业额、订单量时必须调用此工具。API: https://fnb-qrcode.neargo.ai/v1/report/agent_bi"
 author: "ai-agent"
 tags: ["report", "bi", "analytics", "business", "sales"]
 permission: network
