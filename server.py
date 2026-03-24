@@ -122,6 +122,14 @@ class ChatRequest(BaseModel):
         None,
         description="项目 ID（必须属于 workspace_id 下的项目）；设置后启用项目级记忆",
     )
+    # ── BI 报表 ────────────────────────────────────────────────────
+    bra_id: str | None = Field(
+        None,
+        description=(
+            "门店ID，供 agent_bi skill 使用。"
+            "不传时 skill 自动回落到 AGENT_BI_DEFAULT_BRA_ID 环境变量。"
+        ),
+    )
     # ── Orchestrator 选择 ──────────────────────────────────────────
     orchestrator_type: str | None = Field(
         None,
@@ -479,11 +487,25 @@ async def _resolve_workspace_ctx(req: ChatRequest) -> Any:
         return None
 
 
+def _build_prompt(req: "ChatRequest") -> str | None:
+    """组装系统提示词：自定义 > 营销模式 > BI 门店上下文。"""
+    base = req.system_prompt or (_MARKETING_SYSTEM_PROMPT if req.mode == "marketing" else None)
+
+    if req.bra_id:
+        bi_ctx = (
+            f"\n\n[BI store context] Current store ID: {req.bra_id}. "
+            "When calling the agent_bi tool you MUST pass this value as the bra_id parameter."
+        )
+        return (base or "") + bi_ctx
+
+    return base
+
+
 async def _run_agent(req: ChatRequest):
     """返回 (session_id, reply, usage, steps) 四元组。"""
     from core.models import AgentConfig
 
-    prompt       = req.system_prompt or (_MARKETING_SYSTEM_PROMPT if req.mode == "marketing" else None)
+    prompt       = _build_prompt(req)
     ws_ctx       = await _resolve_workspace_ctx(req)
     container    = _get_container(req.skills, prompt, ws_ctx,
                                   req.orchestrator_type, req.agent_specs)
@@ -537,7 +559,7 @@ async def _stream_agent(req: ChatRequest) -> AsyncIterator[str]:
     """生成 SSE 事件流。"""
     from core.models import AgentConfig
 
-    prompt     = req.system_prompt or (_MARKETING_SYSTEM_PROMPT if req.mode == "marketing" else None)
+    prompt     = _build_prompt(req)
     ws_ctx     = await _resolve_workspace_ctx(req)
     container  = _get_container(req.skills, prompt, ws_ctx,
                                 req.orchestrator_type, req.agent_specs)

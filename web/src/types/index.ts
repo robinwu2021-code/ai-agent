@@ -109,6 +109,10 @@ export interface ChatRequest {
   max_steps?: number
   skills?: string[]
   mode?: string
+  /** Store ID for BI report queries; backend falls back to AGENT_BI_DEFAULT_BRA_ID if omitted */
+  bra_id?: string
+  workspace_id?: string
+  project_id?: string
   orchestrator_type?: 'react' | 'plan_execute' | 'dag' | 'multiagent'
   agent_specs?: Array<{
     name: string

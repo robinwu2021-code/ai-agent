@@ -2,7 +2,12 @@
 import { useState, useCallback, useRef, useEffect } from 'react'
 import type { Message, SkillMode, SessionStats, ToolCall, DagStep, SubTaskInfo } from '@/types'
 import { streamChat } from '@/lib/api'
-import { genId, daysMidnightTs, todayMidnightTs } from '@/lib/utils'
+import {
+  genId,
+  todayMidnightTs, tomorrowMidnightTs, daysMidnightTs,
+  thisWeekStartTs, nextWeekStartTs, lastWeekStartTs,
+  thisMonthStartTs, nextMonthStartTs,
+} from '@/lib/utils'
 import { parseStructuredData } from '@/lib/parseStructuredData'
 import { useApp } from '@/contexts/AppContext'
 import type { ChatSession } from '@/contexts/AppContext'
@@ -129,14 +134,21 @@ export function useChat() {
       return updatedMessages
     })
 
-    // Build request — inject date + store context for BI queries
+    // Build request — inject date range anchors for BI queries so the LLM
+    // can pick rangeStart/rangeEnd directly without computing timestamps itself.
     let enrichedText = text
     if (mode === 'report') {
       const today = new Date()
-      const dateCtx = `（当前日期：${today.toLocaleDateString('zh-CN')}，今日凌晨时间戳：${todayMidnightTs()}，昨日凌晨时间戳：${daysMidnightTs(1)}，7天前凌晨时间戳：${daysMidnightTs(7)}`
-      // 注入门店 ID（前端有值时传递，后端兜底使用 AGENT_BI_DEFAULT_BRA_ID）
-      const storeCtx = braId.trim() ? `，当前查询门店ID: ${braId.trim()}` : '，门店ID: 使用默认配置'
-      enrichedText = text + '\n' + dateCtx + storeCtx + '）'
+      const dateCtx = [
+        `[BI date context — ${today.toISOString().slice(0, 10)}]`,
+        `today:      rangeStart=${todayMidnightTs()}, rangeEnd=${tomorrowMidnightTs()}`,
+        `yesterday:  rangeStart=${daysMidnightTs(1)}, rangeEnd=${todayMidnightTs()}`,
+        `this_week:  rangeStart=${thisWeekStartTs()}, rangeEnd=${nextWeekStartTs()}`,
+        `last_week:  rangeStart=${lastWeekStartTs()}, rangeEnd=${thisWeekStartTs()}`,
+        `last_7days: rangeStart=${daysMidnightTs(7)}, rangeEnd=${tomorrowMidnightTs()}`,
+        `this_month: rangeStart=${thisMonthStartTs()}, rangeEnd=${nextMonthStartTs()}`,
+      ].join('\n')
+      enrichedText = text + '\n\n' + dateCtx
     }
 
     const req = {
@@ -146,6 +158,8 @@ export function useChat() {
       max_steps: 15,
       skills: SKILL_MAP[mode] ?? undefined,
       mode: mode === 'marketing' ? 'marketing' : undefined,
+      // bra_id passed as structured field; backend falls back to AGENT_BI_DEFAULT_BRA_ID
+      bra_id: mode === 'report' && braId.trim() ? braId.trim() : undefined,
       workspace_id: selectedWorkspace?.workspace_id,
       project_id: selectedProject?.project_id,
     }

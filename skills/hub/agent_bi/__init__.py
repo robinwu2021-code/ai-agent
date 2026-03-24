@@ -133,9 +133,11 @@ class AgentBiSkill:
     descriptor = ToolDescriptor(
         name="agent_bi",
         description=(
-            "查询商家BI报表数据，支持销售额、订单数、顾客数等多维度业务指标统计分析。"
-            "可按门店(bra_id)和时间范围(range_start/range_end 毫秒时间戳)过滤，"
-            "支持 SUM/AVG/MAX/MIN/COUNT 聚合。结果附带中文标签。"
+            "Query merchant BI report data: sales, orders, customers, payments, members, refunds, etc. "
+            "Use the rangeStart/rangeEnd pairs provided in the [BI date context] block of the user message. "
+            "The bra_id (store ID) is provided in the system prompt [BI store context]; copy it exactly as-is. "
+            "If no store context is present, omit bra_id and the backend will use the configured default. "
+            "Respond to the user in whatever language they used."
         ),
         input_schema={
             "type": "object",
@@ -143,7 +145,7 @@ class AgentBiSkill:
                 "action": {
                     "type": "string",
                     "enum": ["query"],
-                    "description": "操作类型，目前支持 query",
+                    "description": "Operation type, currently only 'query' is supported.",
                 },
                 "metrics": {
                     "type": "array",
@@ -153,27 +155,36 @@ class AgentBiSkill:
                     },
                     "minItems": 1,
                     "description": (
-                        "要查询的指标列表（至少一个），可选值: "
-                        + ", ".join(sorted(_VALID_METRICS))
+                        "List of metric fields to query (at least one). "
+                        "Available values: " + ", ".join(sorted(_VALID_METRICS))
                     ),
                 },
                 "bra_id": {
                     "type": "string",
-                    "description": "门店ID，不传则查询所有门店",
+                    "description": (
+                        "Store ID. Copy the value from '[BI store context] Current store ID: <value>' "
+                        "in the system prompt. Omit this field if no store context is present."
+                    ),
                 },
                 "aggregation": {
                     "type": "string",
                     "enum": sorted(_VALID_AGGREGATIONS),
                     "default": "SUM",
-                    "description": "聚合函数（默认 SUM）",
+                    "description": "Aggregation function (default SUM).",
                 },
                 "range_start": {
                     "type": "integer",
-                    "description": "统计开始时间（13位毫秒时间戳，精确到每日凌晨00:00:00）",
+                    "description": (
+                        "Range start: 13-digit ms timestamp at midnight 00:00:00. "
+                        "Use the rangeStart value from the matching entry in [BI date context]."
+                    ),
                 },
                 "range_end": {
                     "type": "integer",
-                    "description": "统计结束时间（13位毫秒时间戳，精确到每日凌晨00:00:00）",
+                    "description": (
+                        "Range end: 13-digit ms timestamp at midnight 00:00:00. "
+                        "Use the rangeEnd value from the matching entry in [BI date context]."
+                    ),
                 },
             },
             "required": ["action", "metrics"],
