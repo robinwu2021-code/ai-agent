@@ -1,5 +1,4 @@
 'use client'
-import { useEffect } from 'react'
 import { useChat } from '@/hooks/useChat'
 import { useApp } from '@/contexts/AppContext'
 import Sidebar from '@/components/layout/Sidebar'
@@ -11,18 +10,9 @@ import { useState } from 'react'
 export default function Home() {
   const chat = useChat()
   const appCtx = useApp()
-  const { currentSessionId, sessions, selectedWorkspace, selectedProject } = appCtx
+  const { selectedWorkspace, selectedProject } = appCtx
   const [sidebarOpen, setSidebarOpen] = useState(true)
-
-  // When currentSessionId changes, load that session's messages
-  useEffect(() => {
-    if (!currentSessionId) return
-    const session = sessions.find(s => s.session_id === currentSessionId)
-    if (session) {
-      chat.loadSession(session)
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [currentSessionId])
+  // Session loading is handled inside useChat (useEffect on currentSessionId + sessions)
 
   return (
     <div className="flex h-screen overflow-hidden" style={{ background: 'var(--bg)' }}>
