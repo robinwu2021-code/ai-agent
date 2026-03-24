@@ -1821,28 +1821,61 @@ async def kg_delete_edge(edge_id: str, kb_id: str = "global"):
 # ── 可视化数据 ─────────────────────────────────────────────────────
 
 @app.get("/kg/graph", summary="获取完整图谱数据", tags=["KnowledgeGraph"])
-async def kg_full_graph(kb_id: str = "global", limit: int = 500):
+async def kg_full_graph(kb_id: str = "global", limit: int = 500, doc_id: str | None = None):
     """
     获取完整图谱的节点和边（用于前端可视化）。
-    limit 控制最大节点数（按 degree 降序取前 N 个）。
+    - limit 控制最大节点数。
+    - doc_id 指定时只返回该文档的节点和边（按文档隔离）。
     """
     store = _kg()
-    nodes, edges = await store.get_full_graph(kb_id, limit=limit)
+    nodes, edges = await store.get_full_graph(kb_id, limit=limit, doc_id=doc_id)
     node_ids = {n.id for n in nodes}
     # 过滤掉引用了不在节点集中的悬空边
     edges = [e for e in edges if e.src_id in node_ids and e.dst_id in node_ids]
     return {
         "nodes": [
             {"id": n.id, "name": n.name, "type": n.node_type.value,
-             "description": n.description, "degree": n.degree}
+             "description": n.description, "degree": n.degree,
+             "doc_ids": n.doc_ids}
             for n in nodes
         ],
         "edges": [
             {"id": e.id, "src_id": e.src_id, "dst_id": e.dst_id,
-             "relation": e.relation, "weight": e.weight}
+             "relation": e.relation, "weight": e.weight, "doc_id": e.doc_id}
             for e in edges
         ],
         "kb_id": kb_id,
+        "doc_id": doc_id,
+    }
+
+
+@app.get("/kg/graph/doc/{doc_id}", summary="按文档查看图谱", tags=["KnowledgeGraph"])
+async def kg_doc_graph(doc_id: str, kb_id: str = "global", limit: int = 500):
+    """
+    获取指定文档的知识图谱节点和边。
+    只返回由该文档生成的边，以及这些边所引用的节点（包含与其他文档共享的节点）。
+    """
+    store = _kg()
+    nodes, edges = await store.get_full_graph(kb_id, limit=limit, doc_id=doc_id)
+    node_ids = {n.id for n in nodes}
+    edges = [e for e in edges if e.src_id in node_ids and e.dst_id in node_ids]
+    return {
+        "nodes": [
+            {"id": n.id, "name": n.name, "type": n.node_type.value,
+             "description": n.description, "degree": n.degree,
+             "doc_ids": n.doc_ids, "shared": len(n.doc_ids) > 1}
+            for n in nodes
+        ],
+        "edges": [
+            {"id": e.id, "src_id": e.src_id, "dst_id": e.dst_id,
+             "relation": e.relation, "weight": e.weight,
+             "context": e.context, "doc_id": e.doc_id}
+            for e in edges
+        ],
+        "kb_id": kb_id,
+        "doc_id": doc_id,
+        "node_count": len(nodes),
+        "edge_count": len(edges),
     }
 
 

@@ -52,6 +52,7 @@ class KGStore(ABC):
         kb_id: str,
         src_id: str | None = None,
         dst_id: str | None = None,
+        doc_id: str | None = None,
     ) -> list[Edge]: ...
 
     @abstractmethod
@@ -100,7 +101,7 @@ class KGStore(ABC):
 
     @abstractmethod
     async def get_full_graph(
-        self, kb_id: str, limit: int = 500
+        self, kb_id: str, limit: int = 500, doc_id: str | None = None
     ) -> tuple[list[Node], list[Edge]]: ...
 
     @abstractmethod
@@ -494,27 +495,26 @@ class SQLiteKGStore(KGStore):
         kb_id: str,
         src_id: str | None = None,
         dst_id: str | None = None,
+        doc_id: str | None = None,
     ) -> list[Edge]:
         def _do() -> list[Edge]:
+            conditions = ["kb_id = ?"]
+            params: list = [kb_id]
             if src_id and dst_id:
-                rows = self._execute(
-                    "SELECT * FROM kg_edges WHERE kb_id = ? AND src_id = ? AND dst_id = ?",
-                    (kb_id, src_id, dst_id),
-                ).fetchall()
+                conditions.append("src_id = ?")
+                conditions.append("dst_id = ?")
+                params += [src_id, dst_id]
             elif src_id:
-                rows = self._execute(
-                    "SELECT * FROM kg_edges WHERE kb_id = ? AND src_id = ?",
-                    (kb_id, src_id),
-                ).fetchall()
+                conditions.append("src_id = ?")
+                params.append(src_id)
             elif dst_id:
-                rows = self._execute(
-                    "SELECT * FROM kg_edges WHERE kb_id = ? AND dst_id = ?",
-                    (kb_id, dst_id),
-                ).fetchall()
-            else:
-                rows = self._execute(
-                    "SELECT * FROM kg_edges WHERE kb_id = ?", (kb_id,)
-                ).fetchall()
+                conditions.append("dst_id = ?")
+                params.append(dst_id)
+            if doc_id:
+                conditions.append("doc_id = ?")
+                params.append(doc_id)
+            sql = "SELECT * FROM kg_edges WHERE " + " AND ".join(conditions)
+            rows = self._execute(sql, tuple(params)).fetchall()
             return [_row_to_edge(r) for r in rows]
 
         return await asyncio.to_thread(_do)
@@ -776,22 +776,56 @@ class SQLiteKGStore(KGStore):
         return await asyncio.to_thread(_do)
 
     async def get_full_graph(
-        self, kb_id: str, limit: int = 500
+        self, kb_id: str, limit: int = 500, doc_id: str | None = None
     ) -> tuple[list[Node], list[Edge]]:
         def _do() -> tuple[list[Node], list[Edge]]:
-            node_rows = self._execute(
-                "SELECT * FROM kg_nodes WHERE kb_id = ? LIMIT ?", (kb_id, limit)
-            ).fetchall()
-            nodes = [_row_to_node(r) for r in node_rows]
-            node_ids = [n.id for n in nodes]
-            if not node_ids:
-                return nodes, []
-            ph = ",".join("?" * len(node_ids))
-            edge_rows = self._execute(
-                f"SELECT * FROM kg_edges WHERE kb_id = ? AND src_id IN ({ph}) AND dst_id IN ({ph})",
-                (kb_id, *node_ids, *node_ids),
-            ).fetchall()
-            edges = [_row_to_edge(r) for r in edge_rows]
+            if doc_id:
+                # 按文档过滤：只返回该文档的节点和边
+                edge_rows = self._execute(
+                    "SELECT * FROM kg_edges WHERE kb_id = ? AND doc_id = ?",
+                    (kb_id, doc_id),
+                ).fetchall()
+                edges = [_row_to_edge(r) for r in edge_rows]
+                # 收集边中涉及的节点 ID
+                node_ids: set[str] = set()
+                for e in edges:
+                    node_ids.add(e.src_id)
+                    node_ids.add(e.dst_id)
+                # 补充属于该文档但可能没有边的孤立节点
+                orphan_rows = self._execute(
+                    "SELECT * FROM kg_nodes WHERE kb_id = ? AND doc_ids LIKE ? LIMIT ?",
+                    (kb_id, f'%"{doc_id}"%', limit),
+                ).fetchall()
+                nodes_map: dict[str, Node] = {}
+                for r in orphan_rows:
+                    n = _row_to_node(r)
+                    nodes_map[n.id] = n
+                    node_ids.discard(n.id)
+                # 获取边引用但 doc_ids 过滤未覆盖到的节点（共享节点）
+                if node_ids:
+                    ph = ",".join("?" * len(node_ids))
+                    shared_rows = self._execute(
+                        f"SELECT * FROM kg_nodes WHERE id IN ({ph})",
+                        tuple(node_ids),
+                    ).fetchall()
+                    for r in shared_rows:
+                        n = _row_to_node(r)
+                        nodes_map[n.id] = n
+                nodes = list(nodes_map.values())[:limit]
+            else:
+                node_rows = self._execute(
+                    "SELECT * FROM kg_nodes WHERE kb_id = ? LIMIT ?", (kb_id, limit)
+                ).fetchall()
+                nodes = [_row_to_node(r) for r in node_rows]
+                nid_list = [n.id for n in nodes]
+                if not nid_list:
+                    return nodes, []
+                ph = ",".join("?" * len(nid_list))
+                edge_rows = self._execute(
+                    f"SELECT * FROM kg_edges WHERE kb_id = ? AND src_id IN ({ph}) AND dst_id IN ({ph})",
+                    (kb_id, *nid_list, *nid_list),
+                ).fetchall()
+                edges = [_row_to_edge(r) for r in edge_rows]
             return nodes, edges
 
         return await asyncio.to_thread(_do)
@@ -835,7 +869,7 @@ class Neo4jKGStore(KGStore):
     async def list_nodes(self, kb_id: str, node_type=None, limit: int = 100, offset: int = 0) -> list:
         raise NotImplementedError
 
-    async def list_edges(self, kb_id: str, src_id=None, dst_id=None) -> list:
+    async def list_edges(self, kb_id: str, src_id=None, dst_id=None, doc_id=None) -> list:
         raise NotImplementedError
 
     async def get_neighbors(self, node_id: str, kb_id: str, hops: int = 1) -> tuple:
@@ -868,7 +902,7 @@ class Neo4jKGStore(KGStore):
     async def get_stats(self, kb_id: str) -> dict:
         raise NotImplementedError
 
-    async def get_full_graph(self, kb_id: str, limit: int = 500) -> tuple:
+    async def get_full_graph(self, kb_id: str, limit: int = 500, doc_id: str | None = None) -> tuple:
         raise NotImplementedError
 
     async def get_path(self, src_id: str, dst_id: str, kb_id: str, max_hops: int = 4) -> list:
