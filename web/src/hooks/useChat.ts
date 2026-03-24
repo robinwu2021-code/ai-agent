@@ -39,6 +39,8 @@ export function useChat() {
   const [mode, setMode] = useState<SkillMode>('general')
   const [busy, setBusy] = useState(false)
   const [stats, setStats] = useState<SessionStats>({ calls: 0, totalTokens: 0, toolCalls: 0 })
+  /** 当前报表门店 ID；空字符串 = 全部门店（后端自动回落到默认配置） */
+  const [braId, setBraId] = useState<string>('')
 
   // Use a stable ref for session id; regenerated on clearSession
   const sessionId = useRef<string>('sess_' + genId())
@@ -127,12 +129,14 @@ export function useChat() {
       return updatedMessages
     })
 
-    // Build request — inject date context for BI queries
+    // Build request — inject date + store context for BI queries
     let enrichedText = text
     if (mode === 'report') {
       const today = new Date()
-      const dateCtx = `（当前日期：${today.toLocaleDateString('zh-CN')}，今日凌晨时间戳：${todayMidnightTs()}，昨日凌晨时间戳：${daysMidnightTs(1)}，7天前凌晨时间戳：${daysMidnightTs(7)}）`
-      enrichedText = text + '\n' + dateCtx
+      const dateCtx = `（当前日期：${today.toLocaleDateString('zh-CN')}，今日凌晨时间戳：${todayMidnightTs()}，昨日凌晨时间戳：${daysMidnightTs(1)}，7天前凌晨时间戳：${daysMidnightTs(7)}`
+      // 注入门店 ID（前端有值时传递，后端兜底使用 AGENT_BI_DEFAULT_BRA_ID）
+      const storeCtx = braId.trim() ? `，当前查询门店ID: ${braId.trim()}` : '，门店ID: 使用默认配置'
+      enrichedText = text + '\n' + dateCtx + storeCtx + '）'
     }
 
     const req = {
@@ -360,5 +364,8 @@ export function useChat() {
     stats,
     quickPrompts,
     sessionId: sessionId.current,
+    /** 当前报表门店 ID（空 = 使用后端默认） */
+    braId,
+    setBraId,
   }
 }

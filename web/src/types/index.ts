@@ -53,11 +53,16 @@ export interface BiMetricRow {
 
 export interface BiData {
   metrics: BiMetricRow[]
+  /** 未经标签加工的原始指标数组（与 metrics 一一对应） */
+  raw_metrics?: Array<Record<string, number | string>>
   aggregation?: string
   bra_id?: string
   range_start?: number
   range_end?: number
 }
+
+/** 报表图表视图类型 */
+export type BiChartTab = 'overview' | 'table' | 'line' | 'pie' | 'comparison'
 
 export interface MarketingActivity {
   name: string

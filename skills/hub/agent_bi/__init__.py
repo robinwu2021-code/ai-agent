@@ -60,6 +60,11 @@ _VALID_AGGREGATIONS = frozenset({"SUM", "AVG", "MAX", "MIN", "COUNT"})
 _DEFAULT_API_URL    = "https://fnb-qrcode.neargo.ai/v1/report/agent_bi"
 
 
+def _default_bra_id() -> str | None:
+    """返回配置文件中的默认门店ID（AGENT_BI_DEFAULT_BRA_ID 环境变量）。"""
+    return os.environ.get("AGENT_BI_DEFAULT_BRA_ID") or None
+
+
 # ── 时间范围工具函数 ──────────────────────────────────────────────────────────
 
 def _midnight_ms(dt: datetime) -> int:
@@ -219,6 +224,11 @@ class AgentBiSkill:
         range_start: int | None = None,
         range_end: int | None = None,
     ) -> dict[str, Any]:
+        # ── 默认门店回落 ──────────────────────────────────────────────
+        # 前端未传入 bra_id 时，自动使用 AGENT_BI_DEFAULT_BRA_ID 配置
+        if not bra_id:
+            bra_id = _default_bra_id()
+
         # ── 参数校验 ─────────────────────────────────────────────────
         if not metrics:
             return {

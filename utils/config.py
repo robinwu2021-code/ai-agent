@@ -149,6 +149,10 @@ class Settings(BaseSettings):
     api_host: str = Field("0.0.0.0", alias="API_HOST")
     api_port: int = Field(8000,      alias="API_PORT")
 
+    # ── 智能报表（AgentBiSkill）────────────────────────────────
+    # 默认门店 ID；前端未传入 bra_id 时，Skill 自动使用此值
+    agent_bi_default_bra_id: str | None = Field(None, alias="AGENT_BI_DEFAULT_BRA_ID")
+
     # ── Agent 运行参数 ─────────────────────────────────────────────
     orchestrator_type: str = Field("react", alias="ORCHESTRATOR_TYPE")
     max_steps:         int = Field(20,      alias="MAX_STEPS")

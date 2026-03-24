@@ -63,7 +63,13 @@ export default function Home() {
           quickPrompts={chat.quickPrompts}
           onQuick={chat.send}
         />
-        <InputBar onSend={chat.send} busy={chat.busy} />
+        <InputBar
+          onSend={chat.send}
+          busy={chat.busy}
+          mode={chat.mode}
+          braId={chat.braId}
+          onBraIdChange={chat.setBraId}
+        />
       </div>
     </div>
   )
