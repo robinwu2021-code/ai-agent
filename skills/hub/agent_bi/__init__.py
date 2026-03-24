@@ -16,7 +16,7 @@ skills/hub/agent_bi/__init__.py — 智能报表 BI 查询 Skill
 """
 from __future__ import annotations
 
-import json
+import asyncio
 import os
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -62,6 +62,8 @@ _METRIC_LABELS: dict[str, str] = {
 
 _VALID_METRICS      = frozenset(_METRIC_LABELS.keys())
 _VALID_AGGREGATIONS = frozenset({"SUM", "AVG", "MAX", "MIN", "COUNT"})
+
+
 def _default_bra_id() -> str:
     """返回配置的默认门店ID。
     优先读取 utils.config.get_settings()，回落到内置默认值 B17612377308779358。
@@ -83,7 +85,6 @@ def _midnight_ms(dt: datetime) -> int:
 
 
 def today_range(tz: timezone = timezone.utc) -> tuple[int, int]:
-    """今天的时间范围：今日 00:00 ~ 明日 00:00（毫秒）。"""
     now   = datetime.now(tz)
     start = _midnight_ms(now)
     end   = _midnight_ms(now + timedelta(days=1))
@@ -91,7 +92,6 @@ def today_range(tz: timezone = timezone.utc) -> tuple[int, int]:
 
 
 def yesterday_range(tz: timezone = timezone.utc) -> tuple[int, int]:
-    """昨天的时间范围：昨日 00:00 ~ 今日 00:00（毫秒）。"""
     now   = datetime.now(tz)
     start = _midnight_ms(now - timedelta(days=1))
     end   = _midnight_ms(now)
@@ -99,7 +99,6 @@ def yesterday_range(tz: timezone = timezone.utc) -> tuple[int, int]:
 
 
 def week_range(tz: timezone = timezone.utc) -> tuple[int, int]:
-    """本周时间范围：本周一 00:00 ~ 下周一 00:00（毫秒）。"""
     now    = datetime.now(tz)
     monday = now - timedelta(days=now.weekday())
     start  = _midnight_ms(monday)
@@ -108,7 +107,6 @@ def week_range(tz: timezone = timezone.utc) -> tuple[int, int]:
 
 
 def last_week_range(tz: timezone = timezone.utc) -> tuple[int, int]:
-    """上周时间范围：上周一 00:00 ~ 本周一 00:00（毫秒）。"""
     now          = datetime.now(tz)
     this_monday  = now - timedelta(days=now.weekday())
     last_monday  = this_monday - timedelta(weeks=1)
@@ -118,7 +116,6 @@ def last_week_range(tz: timezone = timezone.utc) -> tuple[int, int]:
 
 
 def month_range(tz: timezone = timezone.utc) -> tuple[int, int]:
-    """本月时间范围：本月1日 00:00 ~ 下月1日 00:00（毫秒）。"""
     now       = datetime.now(tz)
     first_day = now.replace(day=1)
     start     = _midnight_ms(first_day)
@@ -130,12 +127,32 @@ def month_range(tz: timezone = timezone.utc) -> tuple[int, int]:
     return start, end
 
 
+def _yoy_period(start_ms: int, end_ms: int) -> tuple[int, int]:
+    """同比：返回去年同期的时间范围（精确到天）。"""
+    def shift_year(ms: int) -> int:
+        dt = datetime.fromtimestamp(ms / 1000, tz=timezone.utc)
+        try:
+            shifted = dt.replace(year=dt.year - 1)
+        except ValueError:          # Feb 29 → Feb 28
+            shifted = dt.replace(year=dt.year - 1, day=28)
+        return int(shifted.timestamp() * 1000)
+
+    return shift_year(start_ms), shift_year(end_ms)
+
+
+def _pop_period(start_ms: int, end_ms: int) -> tuple[int, int]:
+    """环比：返回紧前同等时长的时间范围。"""
+    duration = end_ms - start_ms
+    return start_ms - duration, start_ms
+
+
 # ── Skill 主类 ───────────────────────────────────────────────────────────────
 
 class AgentBiSkill:
     """商家 BI 报表查询 Skill。
 
     通过对话框调用，支持按门店、时间范围、聚合函数查询多维度业务指标。
+    支持同比（yoy）和环比（pop）对比分析。
     接口地址: https://fnb-qrcode.neargo.ai/v1/report/agent_bi
     """
 
@@ -144,13 +161,16 @@ class AgentBiSkill:
         description=(
             # 中文：让 LLM 在中文对话中也能识别
             "查询门店BI报表数据（销售额/营业额、订单数、顾客数、支付方式、会员、退款等）。"
-            "当用户询问销售数据、营业额、订单量、客流量等门店经营指标时，必须调用此工具。\n"
+            "当用户询问销售数据、营业额、订单量、客流量等门店经营指标时，必须调用此工具。"
+            "支持同比（yoy，与去年同期对比）和环比（pop，与上一时段对比）分析。\n"
             # English: for multi-language support
             "Query merchant BI report data: turnover/sales, orders, customers, payments, members, refunds. "
             "Call this tool whenever the user asks about store sales, revenue, order count, or any business metrics. "
+            "Supports year-over-year (yoy/同比) and period-over-period (pop/环比) comparison. "
             # Parameter guidance
             "bra_id: copy from [BI store context] in system prompt, or omit to use the configured default store. "
             "range_start/range_end: use the ms-timestamp pairs from [BI date context] in the user message. "
+            "comparison: set to 'yoy' for 同比 (vs. same period last year), 'pop' for 环比 (vs. immediately preceding period). "
             "Respond in the same language the user used."
         ),
         input_schema={
@@ -203,13 +223,24 @@ class AgentBiSkill:
                         "Never set range_end equal to range_start (that is a zero-length window)."
                     ),
                 },
+                "comparison": {
+                    "type": "string",
+                    "enum": ["yoy", "pop"],
+                    "description": (
+                        "Comparison mode (optional). "
+                        "'yoy' = 同比: compare current period vs same period last year. "
+                        "'pop' = 环比: compare current period vs immediately preceding period of same length. "
+                        "Only set when the user explicitly asks for 同比/环比 analysis. "
+                        "The response will include both current and previous period data plus delta percentages."
+                    ),
+                },
             },
             "required": ["action", "metrics"],
         },
         source="skill",
         permission=PermissionLevel.NETWORK,
-        timeout_ms=15_000,
-        tags=["report", "bi", "analytics", "business", "sales"],
+        timeout_ms=30_000,
+        tags=["report", "bi", "analytics", "business", "sales", "comparison"],
     )
 
     def __init__(
@@ -242,6 +273,7 @@ class AgentBiSkill:
                 aggregation=arguments.get("aggregation", "SUM"),
                 range_start=arguments.get("range_start"),
                 range_end=arguments.get("range_end"),
+                comparison=arguments.get("comparison"),
             )
         return {
             "error": f"不支持的操作: {action!r}，目前仅支持: query",
@@ -249,7 +281,89 @@ class AgentBiSkill:
         }
 
     # ------------------------------------------------------------------
-    # Internal
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _build_headers(self) -> dict[str, str]:
+        headers: dict[str, str] = {"Content-Type": "application/json"}
+        if self._api_key:
+            headers["Authorization"] = f"Bearer {self._api_key}"
+        return headers
+
+    async def _call_api_raw(
+        self,
+        payload: dict[str, Any],
+        headers: dict[str, str],
+        label: str = "current",
+    ) -> dict[str, Any] | None:
+        """发起单次 API 请求并返回原始 result dict；失败返回 None。"""
+        log.info("agent_bi.request", label=label, url=self._api_url, payload=payload)
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                resp = await client.post(self._api_url, json=payload, headers=headers)
+                log.info("agent_bi.response", label=label,
+                         http_status=resp.status_code,
+                         body_preview=resp.text[:500])
+                resp.raise_for_status()
+                return resp.json()
+        except httpx.TimeoutException:
+            log.error("agent_bi.timeout", label=label, url=self._api_url)
+            return None
+        except httpx.HTTPStatusError as exc:
+            log.error("agent_bi.http_error", label=label,
+                      status=exc.response.status_code, body=exc.response.text[:300])
+            return None
+        except httpx.RequestError as exc:
+            log.error("agent_bi.network_error", label=label, error=str(exc))
+            return None
+        except Exception as exc:  # noqa: BLE001
+            log.error("agent_bi.unexpected_error", label=label, error=str(exc))
+            return None
+
+    @staticmethod
+    def _extract_rows(result: dict[str, Any] | None) -> list[dict[str, Any]]:
+        """从 API 响应中提取 metrics 列表，过滤掉 null 行。"""
+        if not result:
+            return []
+        _SUCCESS_CODES = {0, 200}
+        api_code = result.get("code")
+        if api_code not in _SUCCESS_CODES:
+            return []
+        data_block = result.get("data") or {}
+        raw: list = data_block.get("metrics", [])
+        return [r for r in raw if isinstance(r, dict)]
+
+    @staticmethod
+    def _label_rows(raw_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """为每个指标值附加中文 label。"""
+        return [
+            {k: {"value": v, "label": _METRIC_LABELS.get(k, k)} for k, v in row.items()}
+            for row in raw_rows
+        ]
+
+    @staticmethod
+    def _compute_deltas(
+        current_rows: list[dict[str, Any]],
+        prev_rows: list[dict[str, Any]],
+    ) -> dict[str, dict[str, Any]]:
+        """计算同比/环比变化量和变化率。"""
+        if not current_rows or not prev_rows:
+            return {}
+        curr = current_rows[0]
+        prev = prev_rows[0]
+        deltas: dict[str, dict[str, Any]] = {}
+        for k in curr:
+            cv = curr[k]
+            pv = prev.get(k)
+            curr_val = float(cv) if isinstance(cv, (int, float)) else 0.0
+            prev_val = float(pv) if isinstance(pv, (int, float)) else 0.0
+            delta = curr_val - prev_val
+            delta_pct = round(delta / prev_val * 100, 2) if prev_val != 0 else None
+            deltas[k] = {"delta": round(delta, 4), "delta_pct": delta_pct}
+        return deltas
+
+    # ------------------------------------------------------------------
+    # Core query
     # ------------------------------------------------------------------
 
     async def _query(
@@ -259,6 +373,7 @@ class AgentBiSkill:
         aggregation: str = "SUM",
         range_start: int | None = None,
         range_end: int | None = None,
+        comparison: str | None = None,   # 'yoy' | 'pop'
     ) -> dict[str, Any]:
         # ── 默认门店回落 ──────────────────────────────────────────────
         if not bra_id:
@@ -266,42 +381,32 @@ class AgentBiSkill:
 
         # ── 参数校验 ─────────────────────────────────────────────────
         if not metrics:
-            return {
-                "error": "metrics 不能为空，请至少指定一个指标",
-                "valid_metrics": sorted(_VALID_METRICS),
-            }
+            return {"error": "metrics 不能为空，请至少指定一个指标",
+                    "valid_metrics": sorted(_VALID_METRICS)}
 
         invalid_metrics = [m for m in metrics if m not in _VALID_METRICS]
         if invalid_metrics:
-            return {
-                "error": f"无效指标: {invalid_metrics}",
-                "valid_metrics": sorted(_VALID_METRICS),
-            }
+            return {"error": f"无效指标: {invalid_metrics}",
+                    "valid_metrics": sorted(_VALID_METRICS)}
 
         if aggregation not in _VALID_AGGREGATIONS:
-            return {
-                "error": f"无效聚合函数: {aggregation!r}",
-                "valid_aggregations": sorted(_VALID_AGGREGATIONS),
-            }
+            return {"error": f"无效聚合函数: {aggregation!r}",
+                    "valid_aggregations": sorted(_VALID_AGGREGATIONS)}
+
+        if comparison and comparison not in ("yoy", "pop"):
+            return {"error": f"无效对比类型: {comparison!r}，支持: yoy（同比）、pop（环比）",
+                    "type": "InvalidComparison"}
 
         # ── 单日时间范围自动修复 ──────────────────────────────────────
-        # 规则：某一天的数据 rangeEnd = rangeStart + 24h (86400000 ms)
-        # 防止 LLM 传入 range_end == range_start 或漏传 range_end
         _ONE_DAY_MS = 86_400_000
         if range_start is not None:
             if range_end is None or range_end <= range_start:
                 range_end = range_start + _ONE_DAY_MS
-                log.info(
-                    "agent_bi.range_end_auto_fixed",
-                    range_start=range_start,
-                    range_end=range_end,
-                )
+                log.info("agent_bi.range_end_auto_fixed",
+                         range_start=range_start, range_end=range_end)
 
-        # ── 构建请求体 ────────────────────────────────────────────────
-        payload: dict[str, Any] = {
-            "metrics":     metrics,
-            "aggregation": aggregation,
-        }
+        # ── 构建当期请求体 ────────────────────────────────────────────
+        payload: dict[str, Any] = {"metrics": metrics, "aggregation": aggregation}
         if bra_id:
             payload["braId"] = bra_id
         if range_start is not None:
@@ -309,95 +414,53 @@ class AgentBiSkill:
         if range_end is not None:
             payload["rangeEnd"] = range_end
 
-        # ── HTTP 请求 + 日志 ──────────────────────────────────────────
-        headers: dict[str, str] = {"Content-Type": "application/json"}
-        if self._api_key:
-            headers["Authorization"] = f"Bearer {self._api_key}"
+        headers = self._build_headers()
 
-        log.info(
-            "agent_bi.request",
-            url=self._api_url,
-            payload=payload,
-            has_auth=bool(self._api_key),
-        )
+        # ── 发起请求（含同比/环比并发） ───────────────────────────────
+        prev_start: int | None = None
+        prev_end:   int | None = None
 
-        try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                resp = await client.post(
-                    self._api_url,
-                    json=payload,
-                    headers=headers,
-                )
-                http_status = resp.status_code
-                raw_body    = resp.text
-                log.info(
-                    "agent_bi.response",
-                    http_status=http_status,
-                    body_preview=raw_body[:500],
-                )
-                resp.raise_for_status()
-                result: dict[str, Any] = resp.json()
+        if comparison and range_start is not None and range_end is not None:
+            if comparison == "yoy":
+                prev_start, prev_end = _yoy_period(range_start, range_end)
+            else:  # pop
+                prev_start, prev_end = _pop_period(range_start, range_end)
 
-        except httpx.TimeoutException:
-            log.error("agent_bi.timeout", url=self._api_url)
-            return {"error": "请求超时，BI 接口响应时间过长，请稍后重试", "type": "TimeoutError"}
-        except httpx.HTTPStatusError as exc:
-            log.error("agent_bi.http_error",
-                      status=exc.response.status_code,
-                      body=exc.response.text[:300])
-            return {
-                "error": f"HTTP 错误: {exc.response.status_code}",
-                "type": "HTTPError",
-                "status_code": exc.response.status_code,
-                "body": exc.response.text[:300],
-            }
-        except httpx.RequestError as exc:
-            log.error("agent_bi.network_error", error=str(exc))
-            return {"error": f"网络错误: {exc}", "type": "NetworkError"}
-        except Exception as exc:  # noqa: BLE001
-            log.error("agent_bi.unexpected_error", error=str(exc))
-            return {"error": str(exc), "type": type(exc).__name__}
+            prev_payload = {**payload, "rangeStart": prev_start, "rangeEnd": prev_end}
+            log.info("agent_bi.comparison_periods",
+                     comparison=comparison,
+                     current=(range_start, range_end),
+                     previous=(prev_start, prev_end))
 
-        # ── 判断业务状态码 ─────────────────────────────────────────────
-        # 实际 API 使用 HTTP 200 + body.code=200 表示成功（文档写的是 0，已知差异）
-        api_code = result.get("code")
-        api_msg  = result.get("message", "")
-        _SUCCESS_CODES = {0, 200}  # 兼容文档(0) 和实际返回(200)
+            curr_result, prev_result = await asyncio.gather(
+                self._call_api_raw(payload, headers, label="current"),
+                self._call_api_raw(prev_payload, headers, label="previous"),
+            )
+        else:
+            curr_result = await self._call_api_raw(payload, headers, label="current")
+            prev_result = None
 
-        if api_code not in _SUCCESS_CODES:
-            log.warning("agent_bi.api_error", code=api_code, message=api_msg,
-                        full_result=result)
-            return {
-                "error":   api_msg or "API 返回错误",
-                "code":    api_code,
-                "type":    "APIError",
-                "detail":  result,
-            }
+        # ── 检查当期状态码 ────────────────────────────────────────────
+        if curr_result is None:
+            return {"error": "API 请求失败，请检查网络或稍后重试", "type": "NetworkError"}
 
-        # ── 解析并丰富响应 ─────────────────────────────────────────────
-        data_block:  dict       = result.get("data") or {}
-        raw_metrics: list[dict] = data_block.get("metrics", [])
+        api_code = curr_result.get("code")
+        api_msg  = curr_result.get("message", "")
+        if api_code not in {0, 200}:
+            log.warning("agent_bi.api_error", code=api_code, message=api_msg)
+            return {"error": api_msg or "API 返回错误", "code": api_code,
+                    "type": "APIError", "detail": curr_result}
 
-        log.info(
-            "agent_bi.success",
-            bra_id=bra_id,
-            aggregation=aggregation,
-            range_start=range_start,
-            range_end=range_end,
-            row_count=len(raw_metrics),
-            sample=raw_metrics[:1],
-        )
+        # ── 解析当期数据 ──────────────────────────────────────────────
+        raw_metrics  = self._extract_rows(curr_result)
+        labeled      = self._label_rows(raw_metrics)
 
-        labeled: list[dict[str, Any]] = []
-        for row in raw_metrics:
-            if not isinstance(row, dict):
-                continue   # skip null / non-dict rows
-            labeled.append({
-                k: {"value": v, "label": _METRIC_LABELS.get(k, k)}
-                for k, v in row.items()
-            })
+        log.info("agent_bi.success",
+                 bra_id=bra_id, aggregation=aggregation,
+                 range_start=range_start, range_end=range_end,
+                 row_count=len(raw_metrics), comparison=comparison)
 
-        return {
+        response: dict[str, Any] = {
             "success":     True,
             "aggregation": aggregation,
             "bra_id":      bra_id,
@@ -406,3 +469,25 @@ class AgentBiSkill:
             "metrics":     labeled,
             "raw_metrics": raw_metrics,
         }
+
+        # ── 追加对比期数据 ────────────────────────────────────────────
+        if comparison and prev_start is not None:
+            prev_raw     = self._extract_rows(prev_result)
+            prev_labeled = self._label_rows(prev_raw)
+            deltas       = self._compute_deltas(raw_metrics, prev_raw)
+
+            response.update({
+                "comparison_type":      comparison,
+                "previous_range_start": prev_start,
+                "previous_range_end":   prev_end,
+                "previous_metrics":     prev_labeled,
+                "previous_raw_metrics": prev_raw,
+                "deltas":               deltas,
+            })
+
+            log.info("agent_bi.comparison_done",
+                     comparison=comparison,
+                     prev_rows=len(prev_raw),
+                     delta_keys=list(deltas.keys()))
+
+        return response

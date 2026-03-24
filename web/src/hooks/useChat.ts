@@ -139,16 +139,33 @@ export function useChat() {
     let enrichedText = text
     if (mode === 'report') {
       const today = new Date()
-      const todayStart = todayMidnightTs()
+      const todayStart  = todayMidnightTs()
+      const weekStart   = thisWeekStartTs()
+      const monthStart  = thisMonthStartTs()
+      // YoY helpers: same period one year ago
+      const msPerYear = 365.25 * 24 * 3600 * 1000
+      const yoyOffset = Math.round(msPerYear)
       const dateCtx = [
         `[BI date context — ${today.toISOString().slice(0, 10)}]`,
         `RULE: for any single day, rangeEnd = rangeStart + 86400000 (exactly +24 h, never equal to rangeStart)`,
-        `today:      rangeStart=${todayStart}, rangeEnd=${todayStart + 86400000}`,
-        `yesterday:  rangeStart=${todayStart - 86400000}, rangeEnd=${todayStart}`,
-        `this_week:  rangeStart=${thisWeekStartTs()}, rangeEnd=${nextWeekStartTs()}`,
-        `last_week:  rangeStart=${lastWeekStartTs()}, rangeEnd=${thisWeekStartTs()}`,
-        `last_7days: rangeStart=${todayStart - 7 * 86400000}, rangeEnd=${todayStart + 86400000}`,
-        `this_month: rangeStart=${thisMonthStartTs()}, rangeEnd=${nextMonthStartTs()}`,
+        `-- Current periods --`,
+        `today:           rangeStart=${todayStart}, rangeEnd=${todayStart + 86400000}`,
+        `yesterday:       rangeStart=${todayStart - 86400000}, rangeEnd=${todayStart}`,
+        `this_week:       rangeStart=${weekStart}, rangeEnd=${nextWeekStartTs()}`,
+        `last_week:       rangeStart=${lastWeekStartTs()}, rangeEnd=${weekStart}`,
+        `last_7days:      rangeStart=${todayStart - 7 * 86400000}, rangeEnd=${todayStart + 86400000}`,
+        `this_month:      rangeStart=${monthStart}, rangeEnd=${nextMonthStartTs()}`,
+        `-- 同比 (yoy) comparison periods — same period last year --`,
+        `yoy_today:       rangeStart=${todayStart - yoyOffset}, rangeEnd=${todayStart - yoyOffset + 86400000}`,
+        `yoy_yesterday:   rangeStart=${todayStart - 86400000 - yoyOffset}, rangeEnd=${todayStart - yoyOffset}`,
+        `yoy_this_week:   rangeStart=${weekStart - yoyOffset}, rangeEnd=${weekStart - yoyOffset + 7 * 86400000}`,
+        `yoy_this_month:  rangeStart=${monthStart - yoyOffset}, rangeEnd=${nextMonthStartTs() - yoyOffset}`,
+        `-- 环比 (pop) comparison periods — immediately preceding period --`,
+        `pop_today:       rangeStart=${todayStart - 86400000}, rangeEnd=${todayStart}`,
+        `pop_this_week:   rangeStart=${lastWeekStartTs()}, rangeEnd=${weekStart}`,
+        `pop_this_month:  rangeStart=${monthStart - yoyOffset / 12}, rangeEnd=${monthStart}`,
+        `-- Comparison instructions --`,
+        `When user asks for 同比 (year-over-year), set comparison="yoy". When user asks for 环比 (period-over-period), set comparison="pop".`,
       ].join('\n')
       enrichedText = text + '\n\n' + dateCtx
     }

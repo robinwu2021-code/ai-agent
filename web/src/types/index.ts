@@ -51,6 +51,11 @@ export interface BiMetricRow {
   [key: string]: { value: number | string; label: string } | number | string
 }
 
+export interface BiDelta {
+  delta: number
+  delta_pct: number | null
+}
+
 export interface BiData {
   metrics: BiMetricRow[]
   /** 未经标签加工的原始指标数组（与 metrics 一一对应） */
@@ -59,10 +64,19 @@ export interface BiData {
   bra_id?: string
   range_start?: number
   range_end?: number
+  // ── 同比/环比对比字段 ────────────────────────────────────────
+  /** 'yoy' = 同比（去年同期）| 'pop' = 环比（上一时段） */
+  comparison_type?: 'yoy' | 'pop'
+  previous_metrics?: BiMetricRow[]
+  previous_raw_metrics?: Array<Record<string, number | string>>
+  previous_range_start?: number
+  previous_range_end?: number
+  /** key → { delta, delta_pct } */
+  deltas?: Record<string, BiDelta>
 }
 
 /** 报表图表视图类型 */
-export type BiChartTab = 'overview' | 'table' | 'line' | 'pie' | 'comparison'
+export type BiChartTab = 'overview' | 'table' | 'line' | 'pie' | 'comparison' | 'yoy_pop'
 
 export interface MarketingActivity {
   name: string
