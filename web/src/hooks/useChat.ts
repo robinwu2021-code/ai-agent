@@ -139,13 +139,15 @@ export function useChat() {
     let enrichedText = text
     if (mode === 'report') {
       const today = new Date()
+      const todayStart = todayMidnightTs()
       const dateCtx = [
         `[BI date context — ${today.toISOString().slice(0, 10)}]`,
-        `today:      rangeStart=${todayMidnightTs()}, rangeEnd=${tomorrowMidnightTs()}`,
-        `yesterday:  rangeStart=${daysMidnightTs(1)}, rangeEnd=${todayMidnightTs()}`,
+        `RULE: for any single day, rangeEnd = rangeStart + 86400000 (exactly +24 h, never equal to rangeStart)`,
+        `today:      rangeStart=${todayStart}, rangeEnd=${todayStart + 86400000}`,
+        `yesterday:  rangeStart=${todayStart - 86400000}, rangeEnd=${todayStart}`,
         `this_week:  rangeStart=${thisWeekStartTs()}, rangeEnd=${nextWeekStartTs()}`,
         `last_week:  rangeStart=${lastWeekStartTs()}, rangeEnd=${thisWeekStartTs()}`,
-        `last_7days: rangeStart=${daysMidnightTs(7)}, rangeEnd=${tomorrowMidnightTs()}`,
+        `last_7days: rangeStart=${todayStart - 7 * 86400000}, rangeEnd=${todayStart + 86400000}`,
         `this_month: rangeStart=${thisMonthStartTs()}, rangeEnd=${nextMonthStartTs()}`,
       ].join('\n')
       enrichedText = text + '\n\n' + dateCtx

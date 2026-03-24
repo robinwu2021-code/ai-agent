@@ -190,14 +190,17 @@ class AgentBiSkill:
                     "type": "integer",
                     "description": (
                         "Range start: 13-digit ms timestamp at midnight 00:00:00. "
-                        "Use the rangeStart value from the matching entry in [BI date context]."
+                        "Use the rangeStart value from the matching entry in [BI date context]. "
+                        "For a specific date not in the context: convert that date to its midnight ms timestamp."
                     ),
                 },
                 "range_end": {
                     "type": "integer",
                     "description": (
                         "Range end: 13-digit ms timestamp at midnight 00:00:00. "
-                        "Use the rangeEnd value from the matching entry in [BI date context]."
+                        "RULE — for a single day: range_end = range_start + 86400000 (exactly +24 h). "
+                        "Use the rangeEnd value from [BI date context], or compute: rangeStart + 86400000. "
+                        "Never set range_end equal to range_start (that is a zero-length window)."
                     ),
                 },
             },
@@ -280,6 +283,19 @@ class AgentBiSkill:
                 "error": f"无效聚合函数: {aggregation!r}",
                 "valid_aggregations": sorted(_VALID_AGGREGATIONS),
             }
+
+        # ── 单日时间范围自动修复 ──────────────────────────────────────
+        # 规则：某一天的数据 rangeEnd = rangeStart + 24h (86400000 ms)
+        # 防止 LLM 传入 range_end == range_start 或漏传 range_end
+        _ONE_DAY_MS = 86_400_000
+        if range_start is not None:
+            if range_end is None or range_end <= range_start:
+                range_end = range_start + _ONE_DAY_MS
+                log.info(
+                    "agent_bi.range_end_auto_fixed",
+                    range_start=range_start,
+                    range_end=range_end,
+                )
 
         # ── 构建请求体 ────────────────────────────────────────────────
         payload: dict[str, Any] = {
@@ -374,6 +390,8 @@ class AgentBiSkill:
 
         labeled: list[dict[str, Any]] = []
         for row in raw_metrics:
+            if not isinstance(row, dict):
+                continue   # skip null / non-dict rows
             labeled.append({
                 k: {"value": v, "label": _METRIC_LABELS.get(k, k)}
                 for k, v in row.items()
