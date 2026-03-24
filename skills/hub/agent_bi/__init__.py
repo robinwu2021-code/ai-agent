@@ -9,9 +9,10 @@ skills/hub/agent_bi/__init__.py — 智能报表 BI 查询 Skill
   - rangeStart : 13位毫秒时间戳，每日凌晨 00:00:00
   - rangeEnd   : 13位毫秒时间戳，每日凌晨 00:00:00
 
-环境变量:
-  AGENT_BI_API_URL — 覆盖默认接口地址
-  AGENT_BI_API_KEY — Bearer Token（可选，接口需要鉴权时设置）
+配置（utils/config.py / 环境变量）:
+  AGENT_BI_API_URL        — 覆盖默认接口地址（默认 https://fnb-qrcode.neargo.ai/v1/report/agent_bi）
+  AGENT_BI_API_KEY        — Bearer Token（可选，接口需要鉴权时设置）
+  AGENT_BI_DEFAULT_BRA_ID — 默认门店ID，前端未传入时自动使用（默认 B17612377308779358）
 """
 from __future__ import annotations
 
@@ -57,12 +58,16 @@ _METRIC_LABELS: dict[str, str] = {
 
 _VALID_METRICS      = frozenset(_METRIC_LABELS.keys())
 _VALID_AGGREGATIONS = frozenset({"SUM", "AVG", "MAX", "MIN", "COUNT"})
-_DEFAULT_API_URL    = "https://fnb-qrcode.neargo.ai/v1/report/agent_bi"
-
-
-def _default_bra_id() -> str | None:
-    """返回配置文件中的默认门店ID（AGENT_BI_DEFAULT_BRA_ID 环境变量）。"""
-    return os.environ.get("AGENT_BI_DEFAULT_BRA_ID") or None
+def _default_bra_id() -> str:
+    """返回配置的默认门店ID。
+    优先读取 utils.config.get_settings()，回落到内置默认值 B17612377308779358。
+    可通过 AGENT_BI_DEFAULT_BRA_ID 环境变量覆盖。
+    """
+    try:
+        from utils.config import get_settings
+        return get_settings().agent_bi_default_bra_id
+    except Exception:
+        return os.environ.get("AGENT_BI_DEFAULT_BRA_ID", "B17612377308779358")
 
 
 # ── 时间范围工具函数 ──────────────────────────────────────────────────────────
@@ -200,8 +205,16 @@ class AgentBiSkill:
         api_url: str | None = None,
         api_key: str | None = None,
     ) -> None:
-        self._api_url = api_url or os.environ.get("AGENT_BI_API_URL", _DEFAULT_API_URL)
-        self._api_key = api_key or os.environ.get("AGENT_BI_API_KEY", "")
+        try:
+            from utils.config import get_settings
+            cfg = get_settings()
+            default_url = cfg.agent_bi_api_url
+            default_key = cfg.agent_bi_api_key
+        except Exception:
+            default_url = "https://fnb-qrcode.neargo.ai/v1/report/agent_bi"
+            default_key = ""
+        self._api_url = api_url or default_url
+        self._api_key = api_key or default_key
 
     # ------------------------------------------------------------------
     # Public interface

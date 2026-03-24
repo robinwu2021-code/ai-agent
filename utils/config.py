@@ -150,8 +150,19 @@ class Settings(BaseSettings):
     api_port: int = Field(8000,      alias="API_PORT")
 
     # ── 智能报表（AgentBiSkill）────────────────────────────────
+    # 接口地址；可通过 AGENT_BI_API_URL 覆盖
+    agent_bi_api_url: str = Field(
+        "https://fnb-qrcode.neargo.ai/v1/report/agent_bi",
+        alias="AGENT_BI_API_URL",
+    )
+    # 接口鉴权 Token（可选）
+    agent_bi_api_key: str = Field("", alias="AGENT_BI_API_KEY")
     # 默认门店 ID；前端未传入 bra_id 时，Skill 自动使用此值
-    agent_bi_default_bra_id: str | None = Field(None, alias="AGENT_BI_DEFAULT_BRA_ID")
+    # 可通过 AGENT_BI_DEFAULT_BRA_ID 环境变量覆盖
+    agent_bi_default_bra_id: str = Field(
+        "B17612377308779358",
+        alias="AGENT_BI_DEFAULT_BRA_ID",
+    )
 
     # ── Agent 运行参数 ─────────────────────────────────────────────
     orchestrator_type: str = Field("react", alias="ORCHESTRATOR_TYPE")

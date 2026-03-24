@@ -410,8 +410,8 @@ class TestAgentBiExecute:
         assert captured_payload.get("braId") == "STORE_001"
 
     @pytest.mark.asyncio
-    async def test_query_without_bra_id_no_braid_in_payload(self):
-        """Story 2 — 不传 bra_id 时 payload 不含 braId。"""
+    async def test_query_without_bra_id_uses_default(self):
+        """Story 2 — 不传 bra_id 时，payload 自动使用配置的默认门店 B17612377308779358。"""
         captured_payload: dict = {}
 
         async def fake_post(url, json=None, headers=None, **_):
@@ -425,10 +425,11 @@ class TestAgentBiExecute:
             MockClient.return_value.__aenter__ = AsyncMock(return_value=mock_client)
             MockClient.return_value.__aexit__  = AsyncMock(return_value=False)
 
-            await skill.execute({"action": "query", "metrics": ["turnover"]})
+            result = await skill.execute({"action": "query", "metrics": ["turnover"]})
 
-        assert "braId" not in captured_payload
-        assert "bra_id" not in captured_payload
+        # 未传 bra_id 时，config.py 内置默认值 B17612377308779358 自动填充到 payload
+        assert captured_payload.get("braId") == "B17612377308779358"
+        assert result.get("bra_id") == "B17612377308779358"
 
     # ── Story 3: 多指标综合报表 ───────────────────────────────
 
