@@ -16,13 +16,17 @@ skills/hub/agent_bi/__init__.py — 智能报表 BI 查询 Skill
 """
 from __future__ import annotations
 
+import json
 import os
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import httpx
+import structlog
 
 from core.models import PermissionLevel, ToolDescriptor
+
+log = structlog.get_logger("agent_bi")
 
 
 # ── 指标中文标签映射 ──────────────────────────────────────────────────────────
@@ -254,7 +258,6 @@ class AgentBiSkill:
         range_end: int | None = None,
     ) -> dict[str, Any]:
         # ── 默认门店回落 ──────────────────────────────────────────────
-        # 前端未传入 bra_id 时，自动使用 AGENT_BI_DEFAULT_BRA_ID 配置
         if not bra_id:
             bra_id = _default_bra_id()
 
@@ -290,10 +293,17 @@ class AgentBiSkill:
         if range_end is not None:
             payload["rangeEnd"] = range_end
 
-        # ── HTTP 请求 ─────────────────────────────────────────────────
+        # ── HTTP 请求 + 日志 ──────────────────────────────────────────
         headers: dict[str, str] = {"Content-Type": "application/json"}
         if self._api_key:
             headers["Authorization"] = f"Bearer {self._api_key}"
+
+        log.info(
+            "agent_bi.request",
+            url=self._api_url,
+            payload=payload,
+            has_auth=bool(self._api_key),
+        )
 
         try:
             async with httpx.AsyncClient(timeout=30.0) as client:
@@ -302,40 +312,65 @@ class AgentBiSkill:
                     json=payload,
                     headers=headers,
                 )
+                http_status = resp.status_code
+                raw_body    = resp.text
+                log.info(
+                    "agent_bi.response",
+                    http_status=http_status,
+                    body_preview=raw_body[:500],
+                )
                 resp.raise_for_status()
                 result: dict[str, Any] = resp.json()
 
         except httpx.TimeoutException:
-            return {
-                "error": "请求超时，BI 接口响应时间过长，请稍后重试",
-                "type": "TimeoutError",
-            }
+            log.error("agent_bi.timeout", url=self._api_url)
+            return {"error": "请求超时，BI 接口响应时间过长，请稍后重试", "type": "TimeoutError"}
         except httpx.HTTPStatusError as exc:
+            log.error("agent_bi.http_error",
+                      status=exc.response.status_code,
+                      body=exc.response.text[:300])
             return {
                 "error": f"HTTP 错误: {exc.response.status_code}",
                 "type": "HTTPError",
                 "status_code": exc.response.status_code,
+                "body": exc.response.text[:300],
             }
         except httpx.RequestError as exc:
-            return {
-                "error": f"网络错误: {exc}",
-                "type": "NetworkError",
-            }
+            log.error("agent_bi.network_error", error=str(exc))
+            return {"error": f"网络错误: {exc}", "type": "NetworkError"}
         except Exception as exc:  # noqa: BLE001
+            log.error("agent_bi.unexpected_error", error=str(exc))
             return {"error": str(exc), "type": type(exc).__name__}
 
-        # ── 处理 API 错误码 ────────────────────────────────────────────
-        if result.get("code") != 0:
+        # ── 判断业务状态码 ─────────────────────────────────────────────
+        # 实际 API 使用 HTTP 200 + body.code=200 表示成功（文档写的是 0，已知差异）
+        api_code = result.get("code")
+        api_msg  = result.get("message", "")
+        _SUCCESS_CODES = {0, 200}  # 兼容文档(0) 和实际返回(200)
+
+        if api_code not in _SUCCESS_CODES:
+            log.warning("agent_bi.api_error", code=api_code, message=api_msg,
+                        full_result=result)
             return {
-                "error": result.get("message", "API 返回错误"),
-                "code":  result.get("code"),
-                "type":  "APIError",
+                "error":   api_msg or "API 返回错误",
+                "code":    api_code,
+                "type":    "APIError",
+                "detail":  result,
             }
 
         # ── 解析并丰富响应 ─────────────────────────────────────────────
-        raw_metrics: list[dict[str, Any]] = (
-            result.get("data") or {}
-        ).get("metrics", [])
+        data_block:  dict       = result.get("data") or {}
+        raw_metrics: list[dict] = data_block.get("metrics", [])
+
+        log.info(
+            "agent_bi.success",
+            bra_id=bra_id,
+            aggregation=aggregation,
+            range_start=range_start,
+            range_end=range_end,
+            row_count=len(raw_metrics),
+            sample=raw_metrics[:1],
+        )
 
         labeled: list[dict[str, Any]] = []
         for row in raw_metrics:
