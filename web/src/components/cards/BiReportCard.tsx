@@ -312,7 +312,9 @@ function LineTab({ rows, allKeys, prevRows, rangeStart, prevRangeStart, comparis
   // Multi-row: line chart (single period trend)
   if (rows.length > 1) {
     const lineData = rows.map((row, i) => {
-      const pt: Record<string, number | string> = { name: `#${i + 1}` }
+      // Use period_label if present (injected by LLM for multi-period queries)
+      const label = row['period_label'] != null ? String(row['period_label']) : `#${i + 1}`
+      const pt: Record<string, number | string> = { name: label }
       numericKeys.forEach(k => { pt[k] = getVal(row[k]) })
       return pt
     })
@@ -693,7 +695,9 @@ export default function BiReportCard({ data }: Props) {
   const [tab, setTab] = useState<BiChartTab>(hasComparison ? 'yoy_pop' : 'overview')
 
   const rows    = data.metrics ?? []
-  const allKeys = Array.from(new Set(rows.flatMap(r => Object.keys(r))))
+  // Exclude metadata fields that are not metrics
+  const META_KEYS = new Set(['period_label', 'bra_id', 'aggregation'])
+  const allKeys = Array.from(new Set(rows.flatMap(r => Object.keys(r)))).filter(k => !META_KEYS.has(k))
 
   if (!rows.length) return null
 

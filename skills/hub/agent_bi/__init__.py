@@ -321,8 +321,15 @@ class AgentBiSkill:
             return None
 
     @staticmethod
-    def _extract_rows(result: dict[str, Any] | None) -> list[dict[str, Any]]:
-        """从 API 响应中提取 metrics 列表，过滤掉 null 行。"""
+    def _extract_rows(
+        result: dict[str, Any] | None,
+        range_start: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """从 API 响应中提取 metrics 列表，过滤掉 null 行。
+
+        当返回多行（逐日数据）时，自动为每行注入 period_label（如 "12/14(周一)"），
+        供前端折线图 X 轴使用。
+        """
         if not result:
             return []
         _SUCCESS_CODES = {0, 200}
@@ -331,7 +338,19 @@ class AgentBiSkill:
             return []
         data_block = result.get("data") or {}
         raw: list = data_block.get("metrics", [])
-        return [r for r in raw if isinstance(r, dict)]
+        rows = [r for r in raw if isinstance(r, dict)]
+
+        # 多行时注入 period_label —— 让前端图表有可读的 X 轴标签
+        _WEEKDAY_ZH = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
+        if len(rows) > 1 and range_start is not None:
+            for i, row in enumerate(rows):
+                if "period_label" not in row:
+                    day_ts = range_start + i * 86_400_000
+                    dt = datetime.fromtimestamp(day_ts / 1000, tz=timezone.utc)
+                    weekday = _WEEKDAY_ZH[dt.weekday()]   # Mon=0
+                    row["period_label"] = f"{dt.month}/{dt.day}({weekday})"
+
+        return rows
 
     @staticmethod
     def _label_rows(raw_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -452,7 +471,7 @@ class AgentBiSkill:
                     "type": "APIError", "detail": curr_result}
 
         # ── 解析当期数据 ──────────────────────────────────────────────
-        raw_metrics  = self._extract_rows(curr_result)
+        raw_metrics  = self._extract_rows(curr_result, range_start=range_start)
         labeled      = self._label_rows(raw_metrics)
 
         log.info("agent_bi.success",
@@ -472,7 +491,7 @@ class AgentBiSkill:
 
         # ── 追加对比期数据 ────────────────────────────────────────────
         if comparison and prev_start is not None:
-            prev_raw     = self._extract_rows(prev_result)
+            prev_raw     = self._extract_rows(prev_result, range_start=prev_start)
             prev_labeled = self._label_rows(prev_raw)
             deltas       = self._compute_deltas(raw_metrics, prev_raw)
 

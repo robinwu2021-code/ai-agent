@@ -154,6 +154,8 @@ export type SSEEvent =
   | { type: 'agent_done'; agent: string; subtask_id: string; tokens: number }
   | { type: 'agent_error'; agent: string; subtask_id: string; error: string }
   | { type: 'agent_event'; agent: string; event: SSEEvent }
+  // BI data — emitted directly when agent_bi tool completes (no LLM text needed)
+  | { type: 'bi_data'; data: BiData }
   // Common
   | { type: 'delta'; text: string }
   | { type: 'done'; usage?: { total_tokens: number } }
