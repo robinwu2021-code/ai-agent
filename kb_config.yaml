@@ -1,0 +1,163 @@
+# kb_config.yaml — 知识库组件配置
+# 所有 backend 字段均可切换，未填写的字段使用内置默认值
+
+knowledge_base:
+
+  # ── 文档解析 ─────────────────────────────────────────────────────
+  parser:
+    backend: docling               # docling | unstructured | markitdown
+    docling:
+      do_ocr: true
+      do_table_structure: true
+      table_mode: accurate         # accurate | fast
+      ocr_lang: [zh, en]
+    unstructured:
+      strategy: hi_res             # hi_res | fast | auto
+      api_url: ""
+      api_key: ""
+    markitdown:
+      enable_plugins: true
+
+  # ── 分块策略 ─────────────────────────────────────────────────────
+  chunker:
+    strategy: auto                 # auto | structural | semantic | sentence | fixed
+    # auto: 有标题→structural，无标题→semantic
+    structural:
+      min_size: 100
+      max_size: 1500
+      levels: [1, 2, 3]
+      include_heading: true
+    semantic:
+      backend: chonkie
+      threshold: 0.5
+      target_size: 512
+      max_size: 800
+    sentence:
+      chunk_size: 512
+      chunk_overlap: 64
+    fixed:
+      chunk_size: 512
+      chunk_overlap: 64
+    contextual_enhancement:
+      enabled: false               # 开启后 LLM 为每个 chunk 生成上下文描述
+      use_prompt_cache: true
+      batch_size: 10
+      prompt: "请用1-2句话描述以下片段的主题和关键信息，不要复述原文：\n{chunk_text}"
+
+  # ── Embedding ────────────────────────────────────────────────────
+  embedder:
+    backend: qwen                  # qwen | openai | bge_local
+    qwen:
+      model: text-embedding-v3
+      dimensions: 1024
+      batch_size: 32
+      api_key: ""                  # 留空则读 DASHSCOPE_API_KEY 环境变量
+      base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    openai:
+      model: text-embedding-3-small
+      dimensions: 1536
+      batch_size: 100
+      api_key: ""
+      base_url: ""
+    bge_local:
+      model: BAAI/bge-m3
+      device: cpu
+      batch_size: 16
+
+  # ── 向量存储 ─────────────────────────────────────────────────────
+  vector_store:
+    backend: qdrant                # qdrant | milvus | chroma
+    qdrant:
+      mode: embedded               # embedded | server
+      path: ./data/qdrant
+      url: http://localhost:6333
+      collection: kb_chunks
+    milvus:
+      mode: lite                   # lite(本地文件) | standalone(服务器)
+      uri: ./data/milvus.db
+    chroma:
+      mode: persistent
+      path: ./data/chroma
+
+  # ── 关键词检索（BM25）───────────────────────────────────────────
+  keyword_store:
+    backend: memory                # elasticsearch | opensearch | memory
+    elasticsearch:
+      url: http://localhost:9200
+      index_prefix: kb_
+      username: ""
+      password: ""
+      analyzer: ik_max_word        # ik_max_word（中文）| standard
+    opensearch:
+      url: http://localhost:9200
+      index_prefix: kb_
+      username: ""
+      password: ""
+    memory:
+      persist: true
+      path: ./data/bm25.pkl
+
+  # ── 知识图谱 ─────────────────────────────────────────────────────
+  graph:
+    enabled: true
+    per_document: true             # 每个文档构建独立子图
+    workspace_level: true          # 整个 workspace 构建汇总图
+    store:
+      backend: sqlite              # neo4j | sqlite | memory
+      neo4j:
+        uri: bolt://localhost:7687
+        user: neo4j
+        password: password
+        database: neo4j
+      sqlite:
+        path: ./data/graph.db
+    builder:
+      extract_entities: true
+      extract_relations: true
+      resolve_entities: true
+      build_communities: true
+
+  # ── 重排序 ───────────────────────────────────────────────────────
+  reranker:
+    enabled: true
+    backend: llm                   # bge | cohere | llm | none
+    top_n: 5
+    bge:
+      model: BAAI/bge-reranker-v2-m3
+      device: cpu
+    cohere:
+      model: rerank-multilingual-v3.0
+      api_key: ""
+
+  # ── 混合检索融合参数 ─────────────────────────────────────────────
+  retrieval:
+    vector_top_k: 20
+    keyword_top_k: 20
+    graph_top_k: 10
+    fusion: rrf                    # rrf（Reciprocal Rank Fusion）| weighted
+    rrf_k: 60
+    weights:
+      vector: 0.5
+      keyword: 0.3
+      graph: 0.2
+    enable_graph_retrieval: true
+
+  # ── 权限管理 ─────────────────────────────────────────────────────
+  permissions:
+    enabled: true
+    db:
+      backend: sqlite
+      url: ./data/workspace.db
+
+  # ── 文件管理 ─────────────────────────────────────────────────────
+  file_management:
+    db_url: ./data/kb_files.db
+    storage:
+      base_path: ./data/files
+      keep_versions: 10            # 保留最近 N 个历史版本原始文件；0=不保留
+    summary:
+      enabled: true
+      generate_diff: true
+      max_input_chars: 3000
+    audit:
+      retention_days: 365          # 0 = 永久保留
