@@ -28,7 +28,8 @@ def run_live(request):
 @pytest.fixture(scope="session")
 def ollama_cfg():
     from utils.llm_config import load_from_yaml
-    configs, _ = load_from_yaml(YAML_PATH)
+    # load_from_yaml returns (configs, router_cfg, vs_cfg, mem_cfg)
+    configs, *_ = load_from_yaml(YAML_PATH)
     cfg = next((c for c in configs if c.alias == ALIAS), None)
     assert cfg is not None, f"llm.yaml 中未找到 alias='{ALIAS}'"
     return cfg

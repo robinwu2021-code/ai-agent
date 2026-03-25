@@ -1,5 +1,6 @@
 name: knowledge_graph_search
 version: "1.0"
+entrypoint: KnowledgeGraphSkill
 description: |
   在知识图谱中搜索实体和关系。当用户询问实体间的关联、因果关系、
   组织结构、人物关系、概念关联等需要多跳推理的问题时调用此工具。

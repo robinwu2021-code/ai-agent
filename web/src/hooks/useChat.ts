@@ -2,7 +2,12 @@
 import { useState, useCallback, useRef, useEffect } from 'react'
 import type { Message, SkillMode, SessionStats, ToolCall, DagStep, SubTaskInfo } from '@/types'
 import { streamChat } from '@/lib/api'
-import { genId, daysMidnightTs, todayMidnightTs } from '@/lib/utils'
+import {
+  genId,
+  todayMidnightTs, tomorrowMidnightTs, daysMidnightTs,
+  thisWeekStartTs, nextWeekStartTs, lastWeekStartTs,
+  thisMonthStartTs, nextMonthStartTs,
+} from '@/lib/utils'
 import { parseStructuredData } from '@/lib/parseStructuredData'
 import { useApp } from '@/contexts/AppContext'
 import type { ChatSession } from '@/contexts/AppContext'
@@ -39,6 +44,8 @@ export function useChat() {
   const [mode, setMode] = useState<SkillMode>('general')
   const [busy, setBusy] = useState(false)
   const [stats, setStats] = useState<SessionStats>({ calls: 0, totalTokens: 0, toolCalls: 0 })
+  /** 当前报表门店 ID；空字符串 = 全部门店（后端自动回落到默认配置） */
+  const [braId, setBraId] = useState<string>('')
 
   // Use a stable ref for session id; regenerated on clearSession
   const sessionId = useRef<string>('sess_' + genId())
@@ -127,12 +134,60 @@ export function useChat() {
       return updatedMessages
     })
 
-    // Build request — inject date context for BI queries
+    // Build request — inject date range anchors for BI queries so the LLM
+    // can pick rangeStart/rangeEnd directly without computing timestamps itself.
     let enrichedText = text
     if (mode === 'report') {
       const today = new Date()
-      const dateCtx = `（当前日期：${today.toLocaleDateString('zh-CN')}，今日凌晨时间戳：${todayMidnightTs()}，昨日凌晨时间戳：${daysMidnightTs(1)}，7天前凌晨时间戳：${daysMidnightTs(7)}）`
-      enrichedText = text + '\n' + dateCtx
+      const todayStart  = todayMidnightTs()
+      const weekStart   = thisWeekStartTs()
+      const monthStart  = thisMonthStartTs()
+      // YoY helpers: same period one year ago
+      const msPerYear = 365.25 * 24 * 3600 * 1000
+      const yoyOffset = Math.round(msPerYear)
+      // Day-of-week labels (Mon=0 … Sun=6)
+      const DAY_LABELS_ZH = ['周一', '周二', '周三', '周四', '周五', '周六', '周日']
+      const DAY_LABELS_EN = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
+      const lastWeekStart = lastWeekStartTs()
+
+      // Build per-day rows for last week and this week
+      const lastWeekDays = Array.from({ length: 7 }, (_, i) => {
+        const s = lastWeekStart + i * 86400000
+        return `last_week_${DAY_LABELS_EN[i].toLowerCase()}(${DAY_LABELS_ZH[i]}): rangeStart=${s}, rangeEnd=${s + 86400000}`
+      })
+      const thisWeekDays = Array.from({ length: 7 }, (_, i) => {
+        const s = weekStart + i * 86400000
+        return `this_week_${DAY_LABELS_EN[i].toLowerCase()}(${DAY_LABELS_ZH[i]}): rangeStart=${s}, rangeEnd=${s + 86400000}`
+      })
+
+      const dateCtx = [
+        `[BI date context — ${today.toISOString().slice(0, 10)}]`,
+        `RULE: for any single day, rangeEnd = rangeStart + 86400000 (exactly +24 h, never equal to rangeStart)`,
+        `-- Current periods --`,
+        `today:           rangeStart=${todayStart}, rangeEnd=${todayStart + 86400000}`,
+        `yesterday:       rangeStart=${todayStart - 86400000}, rangeEnd=${todayStart}`,
+        `this_week:       rangeStart=${weekStart}, rangeEnd=${nextWeekStartTs()}`,
+        `last_week:       rangeStart=${lastWeekStartTs()}, rangeEnd=${weekStart}`,
+        `last_7days:      rangeStart=${todayStart - 7 * 86400000}, rangeEnd=${todayStart + 86400000}`,
+        `this_month:      rangeStart=${monthStart}, rangeEnd=${nextMonthStartTs()}`,
+        `-- Daily timestamps for reference (ONE agent_bi call with full week range returns daily list automatically) --`,
+        ...lastWeekDays,
+        `-- This week daily timestamps --`,
+        ...thisWeekDays,
+        `-- 同比 (yoy) comparison periods — same period last year --`,
+        `yoy_today:       rangeStart=${todayStart - yoyOffset}, rangeEnd=${todayStart - yoyOffset + 86400000}`,
+        `yoy_yesterday:   rangeStart=${todayStart - 86400000 - yoyOffset}, rangeEnd=${todayStart - yoyOffset}`,
+        `yoy_this_week:   rangeStart=${weekStart - yoyOffset}, rangeEnd=${weekStart - yoyOffset + 7 * 86400000}`,
+        `yoy_this_month:  rangeStart=${monthStart - yoyOffset}, rangeEnd=${nextMonthStartTs() - yoyOffset}`,
+        `-- 环比 (pop) comparison periods — immediately preceding period --`,
+        `pop_today:       rangeStart=${todayStart - 86400000}, rangeEnd=${todayStart}`,
+        `pop_this_week:   rangeStart=${lastWeekStartTs()}, rangeEnd=${weekStart}`,
+        `pop_this_month:  rangeStart=${monthStart - yoyOffset / 12}, rangeEnd=${monthStart}`,
+        `-- Comparison instructions --`,
+        `When user asks for 同比 (year-over-year), set comparison="yoy". When user asks for 环比 (period-over-period), set comparison="pop".`,
+        `For daily breakdown (每天/日趋势/日明细): call agent_bi ONCE with the full date range (e.g. last_week rangeStart/rangeEnd). The API returns one row per day automatically. Do NOT call once per day.`,
+      ].join('\n')
+      enrichedText = text + '\n\n' + dateCtx
     }
 
     const req = {
@@ -142,6 +197,8 @@ export function useChat() {
       max_steps: 15,
       skills: SKILL_MAP[mode] ?? undefined,
       mode: mode === 'marketing' ? 'marketing' : undefined,
+      // bra_id passed as structured field; backend falls back to AGENT_BI_DEFAULT_BRA_ID
+      bra_id: mode === 'report' && braId.trim() ? braId.trim() : undefined,
       workspace_id: selectedWorkspace?.workspace_id,
       project_id: selectedProject?.project_id,
     }
@@ -152,6 +209,8 @@ export function useChat() {
       const dagStepMap = new Map<string, DagStep>()
       const subTaskMap = new Map<string, SubTaskInfo>()
       let toolCallsCount = 0
+      // Accumulate bi_data events (tool result, more reliable than LLM text JSON)
+      let pendingBiData: import('@/types').BiData | null = null
 
       for await (const ev of streamChat(req)) {
         if (ev.type === 'delta') {
@@ -173,6 +232,19 @@ export function useChat() {
             const next = prev.map(m =>
               m.id === asstId
                 ? { ...m, toolCalls: Array.from(toolMap.values()) }
+                : m
+            )
+            updatedMessages = next
+            return next
+          })
+
+        } else if (ev.type === 'bi_data') {
+          // Tool result arrived — render card immediately, don't wait for LLM text
+          pendingBiData = ev.data
+          setMessages(prev => {
+            const next = prev.map(m =>
+              m.id === asstId
+                ? { ...m, structuredData: { type: 'bi' as const, data: ev.data } }
                 : m
             )
             updatedMessages = next
@@ -279,7 +351,11 @@ export function useChat() {
           })
 
         } else if (ev.type === 'done') {
-          const structured = parseStructuredData(content)
+          // Prefer direct tool result (bi_data event) over LLM text JSON block.
+          // Fall back to parseStructuredData if no bi_data was received.
+          const structured = pendingBiData
+            ? { type: 'bi' as const, data: pendingBiData }
+            : parseStructuredData(content)
           setStats(s => ({
             calls: s.calls + 1,
             totalTokens: s.totalTokens + (ev.usage?.total_tokens ?? 0),
@@ -360,5 +436,8 @@ export function useChat() {
     stats,
     quickPrompts,
     sessionId: sessionId.current,
+    /** 当前报表门店 ID（空 = 使用后端默认） */
+    braId,
+    setBraId,
   }
 }
