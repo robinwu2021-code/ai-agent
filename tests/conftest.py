@@ -20,8 +20,20 @@ def pytest_addoption(parser):
         "--run-live",
         action="store_true",
         default=False,
-        help="运行需要真实外部服务的集成测试（如 Ollama、vLLM）",
+        help="运行需要真实外部服务的集成测试（如 Ollama、vLLM、本地 server）",
     )
+
+
+def pytest_configure(config):
+    config.addinivalue_line("markers", "live: requires a running server (--run-live)")
+
+
+def pytest_collection_modifyitems(config, items):
+    if not config.getoption("--run-live"):
+        skip = pytest.mark.skip(reason="需要运行中的服务，请传入 --run-live")
+        for item in items:
+            if "live" in item.keywords:
+                item.add_marker(skip)
 
 
 @pytest.fixture

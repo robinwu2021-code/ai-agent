@@ -1,271 +1,512 @@
 """
-skills/hub/agent_bi/__init__.py — 门店 BI 数据查询 Skill
+skills/hub/agent_bi/__init__.py — 智能报表 BI 查询 Skill
 
-通过 /v1/report/agent_bi 接口查询门店经营指标，支持：
-- 25+ 项业务指标（销售额/订单/会员/支付/退款等）
-- 日期快捷词（today/yesterday/last_7_days/this_month 等）
-- 多指标并查 + 聚合函数
+接口文档: POST https://fnb-qrcode.neargo.ai/v1/report/agent_bi
+请求体:
+  - braId      : 门店ID（可选，不传查全部）
+  - metrics    : 指标字段列表
+  - aggregation: 聚合函数 SUM/AVG/MAX/MIN/COUNT
+  - rangeStart : 13位毫秒时间戳，每日凌晨 00:00:00
+  - rangeEnd   : 13位毫秒时间戳，每日凌晨 00:00:00
 
-配置：
-  环境变量 AGENT_BI_BASE_URL — 接口基础地址，默认 http://localhost:8080
-  环境变量 AGENT_BI_TOKEN   — 可选 Bearer Token
+配置（utils/config.py / 环境变量）:
+  AGENT_BI_API_URL        — 覆盖默认接口地址（默认 https://fnb-qrcode.neargo.ai/v1/report/agent_bi）
+  AGENT_BI_API_KEY        — Bearer Token（可选，接口需要鉴权时设置）
+  AGENT_BI_DEFAULT_BRA_ID — 默认门店ID，前端未传入时自动使用（默认 B17612377308779358）
 """
 from __future__ import annotations
 
+import asyncio
 import os
-from datetime import date, timedelta, datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
+
+import httpx
+import structlog
 
 from core.models import PermissionLevel, ToolDescriptor
 
-# ── 默认指标（用户未指定时返回的核心指标）────────────────────────────
-_DEFAULT_METRICS = [
-    "turnover",
-    "order_quantity",
-    "average_order_price",
-    "customer_number",
-]
+log = structlog.get_logger("agent_bi")
 
-# ── 合法指标集合（用于校验）──────────────────────────────────────────
-_VALID_METRICS = {
-    "turnover", "actual_income", "actual_income_no_tips", "tips_amount",
-    "order_quantity", "average_order_price", "customer_number",
-    "dining_room_amount", "togo_amount", "store_delivery_amount",
-    "discount_amount", "discount_ratio",
-    "member_quantity", "new_member_number", "first_member_number",
-    "second_member_number", "regular_member_number",
-    "refund_amount", "refunded_quantity",
-    "pay_by_cash", "pay_by_card", "pay_by_online", "pay_by_savings", "pos_amount",
-    "amount_not_taxed", "vat",
-}
 
-# ── 指标中文说明（用于结果标注）─────────────────────────────────────
+# ── 指标中文标签映射 ──────────────────────────────────────────────────────────
+
 _METRIC_LABELS: dict[str, str] = {
-    "turnover":                "总销售额",
-    "actual_income":           "实际收入（含小费）",
-    "actual_income_no_tips":   "实际收入（不含小费）",
-    "tips_amount":             "小费总额",
-    "order_quantity":          "订单总数",
-    "average_order_price":     "平均订单金额",
-    "customer_number":         "顾客总数",
-    "dining_room_amount":      "堂食销售额",
-    "togo_amount":             "外带销售额",
-    "store_delivery_amount":   "门店配送销售额",
-    "discount_amount":         "折扣总额",
-    "discount_ratio":          "折扣比率",
-    "member_quantity":         "会员订单数",
-    "new_member_number":       "新注册会员数",
-    "first_member_number":     "首次消费顾客数",
-    "second_member_number":    "回头客数",
-    "regular_member_number":   "常客数",
-    "refund_amount":           "退款总额",
-    "refunded_quantity":       "退款订单数",
-    "pay_by_cash":             "现金支付金额",
-    "pay_by_card":             "卡支付金额",
-    "pay_by_online":           "在线支付金额",
-    "pay_by_savings":          "储值支付金额",
-    "pos_amount":              "POS卡支付金额",
-    "amount_not_taxed":        "不含税销售额",
-    "vat":                     "增值税",
+    "turnover":              "总销售额",
+    "actual_income":         "实际收入（含小费）",
+    "actual_income_no_tips": "实际收入（不含小费）",
+    "tips_amount":           "小费总额",
+    "order_quantity":        "订单总数",
+    "average_order_price":   "平均订单金额",
+    "customer_number":       "顾客总数",
+    "dining_room_amount":    "堂食销售额",
+    "togo_amount":           "外带销售额",
+    "store_delivery_amount": "门店配送销售额",
+    "discount_amount":       "折扣总额",
+    "discount_ratio":        "折扣比率",
+    "member_quantity":       "会员订单数",
+    "new_member_number":     "新注册会员数",
+    "first_member_number":   "首次消费顾客数",
+    "second_member_number":  "回头客数",
+    "regular_member_number": "常客数",
+    "refund_amount":         "退款总额",
+    "refunded_quantity":     "退款订单数",
+    "pay_by_cash":           "现金支付",
+    "pay_by_card":           "卡支付",
+    "pay_by_online":         "在线支付",
+    "pay_by_savings":        "储值支付",
+    "pos_amount":            "POS卡支付",
+    "amount_not_taxed":      "不含税销售额",
+    "vat":                   "增值税",
 }
 
-
-# ── 日期解析工具 ─────────────────────────────────────────────────────
-
-def _day_to_midnight_ms(d: date) -> int:
-    """将 date 转为当天 00:00:00 UTC 的 13 位毫秒时间戳。"""
-    dt = datetime(d.year, d.month, d.day, 0, 0, 0, tzinfo=timezone.utc)
-    return int(dt.timestamp() * 1000)
+_VALID_METRICS      = frozenset(_METRIC_LABELS.keys())
+_VALID_AGGREGATIONS = frozenset({"SUM", "AVG", "MAX", "MIN", "COUNT"})
 
 
-def _parse_date(s: str) -> date:
+def _default_bra_id() -> str:
+    """返回配置的默认门店ID。
+    优先读取 utils.config.get_settings()，回落到内置默认值 B17612377308779358。
+    可通过 AGENT_BI_DEFAULT_BRA_ID 环境变量覆盖。
     """
-    解析日期字符串，支持：
-    - ISO 格式：2024-03-01
-    - 快捷词：today / yesterday / last_7_days / last_30_days /
-              this_month / last_month
-    返回 (start_date, end_date) 二元组；快捷词会返回一个范围。
-    """
-    s = s.strip().lower()
-    today = date.today()
-
-    shortcuts = {
-        "today":       (today, today),
-        "yesterday":   (today - timedelta(days=1), today - timedelta(days=1)),
-        "last_7_days": (today - timedelta(days=6), today),
-        "last_30_days":(today - timedelta(days=29), today),
-        "this_month":  (today.replace(day=1), today),
-        "last_month":  (
-            (today.replace(day=1) - timedelta(days=1)).replace(day=1),
-            today.replace(day=1) - timedelta(days=1),
-        ),
-    }
-    if s in shortcuts:
-        return shortcuts[s]  # type: ignore[return-value]
-
-    # ISO 格式
     try:
-        d = date.fromisoformat(s)
-        return d, d
-    except ValueError:
-        raise ValueError(f"无法解析日期 '{s}'，支持格式：YYYY-MM-DD 或 today/yesterday/last_7_days/last_30_days/this_month/last_month")
+        from utils.config import get_settings
+        return get_settings().agent_bi_default_bra_id
+    except Exception:
+        return os.environ.get("AGENT_BI_DEFAULT_BRA_ID", "B17612377308779358")
 
 
-def _resolve_range(date_start: str | None, date_end: str | None) -> tuple[int, int]:
-    """返回 (range_start_ms, range_end_ms)，均为 13 位时间戳（当天凌晨）。"""
-    today = date.today()
+# ── 时间范围工具函数 ──────────────────────────────────────────────────────────
 
-    if date_start:
-        s_start, s_end = _parse_date(date_start)
+def _midnight_ms(dt: datetime) -> int:
+    """返回某天凌晨 00:00:00 的 13 位毫秒时间戳。"""
+    midnight = dt.replace(hour=0, minute=0, second=0, microsecond=0)
+    return int(midnight.timestamp() * 1000)
+
+
+def today_range(tz: timezone = timezone.utc) -> tuple[int, int]:
+    now   = datetime.now(tz)
+    start = _midnight_ms(now)
+    end   = _midnight_ms(now + timedelta(days=1))
+    return start, end
+
+
+def yesterday_range(tz: timezone = timezone.utc) -> tuple[int, int]:
+    now   = datetime.now(tz)
+    start = _midnight_ms(now - timedelta(days=1))
+    end   = _midnight_ms(now)
+    return start, end
+
+
+def week_range(tz: timezone = timezone.utc) -> tuple[int, int]:
+    now    = datetime.now(tz)
+    monday = now - timedelta(days=now.weekday())
+    start  = _midnight_ms(monday)
+    end    = _midnight_ms(monday + timedelta(weeks=1))
+    return start, end
+
+
+def last_week_range(tz: timezone = timezone.utc) -> tuple[int, int]:
+    now          = datetime.now(tz)
+    this_monday  = now - timedelta(days=now.weekday())
+    last_monday  = this_monday - timedelta(weeks=1)
+    start        = _midnight_ms(last_monday)
+    end          = _midnight_ms(this_monday)
+    return start, end
+
+
+def month_range(tz: timezone = timezone.utc) -> tuple[int, int]:
+    now       = datetime.now(tz)
+    first_day = now.replace(day=1)
+    start     = _midnight_ms(first_day)
+    if now.month == 12:
+        next_month = now.replace(year=now.year + 1, month=1, day=1)
     else:
-        s_start = s_end = today  # 默认今天
-
-    if date_end:
-        _, e_end = _parse_date(date_end)
-    else:
-        e_end = s_end  # date_end 缺省时与 date_start 快捷词展开结果的 end 相同
-
-    # rangeEnd 按 API 要求也取凌晨时间戳（表示"到该天结束前"）
-    return _day_to_midnight_ms(s_start), _day_to_midnight_ms(e_end)
+        next_month = now.replace(month=now.month + 1, day=1)
+    end = _midnight_ms(next_month)
+    return start, end
 
 
-# ── Skill 主体 ───────────────────────────────────────────────────────
+def _yoy_period(start_ms: int, end_ms: int) -> tuple[int, int]:
+    """同比：返回去年同期的时间范围（精确到天）。"""
+    def shift_year(ms: int) -> int:
+        dt = datetime.fromtimestamp(ms / 1000, tz=timezone.utc)
+        try:
+            shifted = dt.replace(year=dt.year - 1)
+        except ValueError:          # Feb 29 → Feb 28
+            shifted = dt.replace(year=dt.year - 1, day=28)
+        return int(shifted.timestamp() * 1000)
 
-class AgentBISkill:
+    return shift_year(start_ms), shift_year(end_ms)
+
+
+def _pop_period(start_ms: int, end_ms: int) -> tuple[int, int]:
+    """环比：返回紧前同等时长的时间范围。"""
+    duration = end_ms - start_ms
+    return start_ms - duration, start_ms
+
+
+# ── Skill 主类 ───────────────────────────────────────────────────────────────
+
+class AgentBiSkill:
+    """商家 BI 报表查询 Skill。
+
+    通过对话框调用，支持按门店、时间范围、聚合函数查询多维度业务指标。
+    支持同比（yoy）和环比（pop）对比分析。
+    接口地址: https://fnb-qrcode.neargo.ai/v1/report/agent_bi
+    """
+
     descriptor = ToolDescriptor(
         name="agent_bi",
         description=(
-            "门店 BI 数据查询工具。根据门店 ID、日期范围和指标列表，"
-            "调用报表接口返回销售额、订单量、客单价、会员数等经营数据。"
-            "日期支持 today/yesterday/last_7_days/this_month 等快捷词，"
-            "也支持 YYYY-MM-DD 格式。"
+            # 中文：让 LLM 在中文对话中也能识别
+            "查询门店BI报表数据（销售额/营业额、订单数、顾客数、支付方式、会员、退款等）。"
+            "当用户询问销售数据、营业额、订单量、客流量等门店经营指标时，必须调用此工具。"
+            "支持同比（yoy，与去年同期对比）和环比（pop，与上一时段对比）分析。\n"
+            # English: for multi-language support
+            "Query merchant BI report data: turnover/sales, orders, customers, payments, members, refunds. "
+            "Call this tool whenever the user asks about store sales, revenue, order count, or any business metrics. "
+            "Supports year-over-year (yoy/同比) and period-over-period (pop/环比) comparison. "
+            # Parameter guidance
+            "bra_id: copy from [BI store context] in system prompt, or omit to use the configured default store. "
+            "range_start/range_end: use the ms-timestamp pairs from [BI date context] in the user message. "
+            "comparison: set to 'yoy' for 同比 (vs. same period last year), 'pop' for 环比 (vs. immediately preceding period). "
+            "Respond in the same language the user used."
         ),
         input_schema={
             "type": "object",
             "properties": {
-                "store_id": {
+                "action": {
                     "type": "string",
-                    "description": "门店 ID（braId），不传则查所有门店汇总",
+                    "enum": ["query"],
+                    "description": "Operation type, currently only 'query' is supported.",
                 },
                 "metrics": {
                     "type": "array",
-                    "items": {"type": "string"},
+                    "items": {
+                        "type": "string",
+                        "enum": sorted(_VALID_METRICS),
+                    },
+                    "minItems": 1,
                     "description": (
-                        "指标列表，如 [\"turnover\", \"order_quantity\"]。"
-                        "为空时默认返回：turnover/order_quantity/average_order_price/customer_number"
+                        "List of metric fields to query (at least one). "
+                        "Available values: " + ", ".join(sorted(_VALID_METRICS))
+                    ),
+                },
+                "bra_id": {
+                    "type": "string",
+                    "description": (
+                        "Store ID. Copy the value from '[BI store context] Current store ID: <value>' "
+                        "in the system prompt. Omit this field if no store context is present."
                     ),
                 },
                 "aggregation": {
                     "type": "string",
-                    "enum": ["SUM", "AVG", "MAX", "MIN", "COUNT"],
-                    "description": "聚合函数，默认 SUM",
+                    "enum": sorted(_VALID_AGGREGATIONS),
+                    "default": "SUM",
+                    "description": "Aggregation function (default SUM).",
                 },
-                "date_start": {
-                    "type": "string",
+                "range_start": {
+                    "type": "integer",
                     "description": (
-                        "查询开始日期，如 \"2024-03-01\" 或 today/yesterday/"
-                        "last_7_days/last_30_days/this_month/last_month"
+                        "Range start: 13-digit ms timestamp at midnight 00:00:00. "
+                        "Use the rangeStart value from the matching entry in [BI date context]. "
+                        "For a specific date not in the context: convert that date to its midnight ms timestamp."
                     ),
                 },
-                "date_end": {
+                "range_end": {
+                    "type": "integer",
+                    "description": (
+                        "Range end: 13-digit ms timestamp at midnight 00:00:00. "
+                        "RULE — for a single day: range_end = range_start + 86400000 (exactly +24 h). "
+                        "Use the rangeEnd value from [BI date context], or compute: rangeStart + 86400000. "
+                        "Never set range_end equal to range_start (that is a zero-length window)."
+                    ),
+                },
+                "comparison": {
                     "type": "string",
-                    "description": "查询结束日期（含），省略时与 date_start 相同",
+                    "enum": ["yoy", "pop"],
+                    "description": (
+                        "Comparison mode (optional). "
+                        "'yoy' = 同比: compare current period vs same period last year. "
+                        "'pop' = 环比: compare current period vs immediately preceding period of same length. "
+                        "Only set when the user explicitly asks for 同比/环比 analysis. "
+                        "The response will include both current and previous period data plus delta percentages."
+                    ),
                 },
             },
-            "required": [],
+            "required": ["action", "metrics"],
         },
         source="skill",
-        permission=PermissionLevel.READ,
-        timeout_ms=10_000,
-        tags=["bi", "report", "analytics", "sales", "store"],
+        permission=PermissionLevel.NETWORK,
+        timeout_ms=30_000,
+        tags=["report", "bi", "analytics", "business", "sales", "comparison"],
     )
 
-    def __init__(self) -> None:
-        self._base_url = os.environ.get("AGENT_BI_BASE_URL", "http://localhost:8080").rstrip("/")
-        self._token    = os.environ.get("AGENT_BI_TOKEN", "")
-
-    async def execute(self, arguments: dict) -> dict[str, Any]:
-        store_id    = arguments.get("store_id") or None
-        raw_metrics = arguments.get("metrics") or []
-        aggregation = (arguments.get("aggregation") or "SUM").upper()
-        date_start  = arguments.get("date_start") or None
-        date_end    = arguments.get("date_end") or None
-
-        # 校验并过滤指标
-        if raw_metrics:
-            invalid = [m for m in raw_metrics if m not in _VALID_METRICS]
-            if invalid:
-                return {"error": f"无效指标: {invalid}，请从支持列表中选择"}
-            metrics = raw_metrics
-        else:
-            metrics = _DEFAULT_METRICS
-
-        # 解析时间范围
+    def __init__(
+        self,
+        api_url: str | None = None,
+        api_key: str | None = None,
+    ) -> None:
         try:
-            range_start, range_end = _resolve_range(date_start, date_end)
-        except ValueError as e:
-            return {"error": str(e)}
+            from utils.config import get_settings
+            cfg = get_settings()
+            default_url = cfg.agent_bi_api_url
+            default_key = cfg.agent_bi_api_key
+        except Exception:
+            default_url = "https://fnb-qrcode.neargo.ai/v1/report/agent_bi"
+            default_key = ""
+        self._api_url = api_url or default_url
+        self._api_key = api_key or default_key
 
-        # 构建请求体
-        payload: dict[str, Any] = {
-            "metrics":     metrics,
-            "aggregation": aggregation,
-            "rangeStart":  range_start,
-            "rangeEnd":    range_end,
-        }
-        if store_id:
-            payload["braId"] = store_id
+    # ------------------------------------------------------------------
+    # Public interface
+    # ------------------------------------------------------------------
 
-        # 发起 HTTP 请求
-        try:
-            result = await self._call_api(payload)
-        except Exception as e:
-            return {"error": f"API 请求失败: {e}"}
-
-        # 解析响应
-        code = result.get("code", -1)
-        if code != 0:
-            return {
-                "error":   result.get("message", "API 返回错误"),
-                "code":    code,
-                "payload": payload,
-            }
-
-        raw_metrics_list: list[dict] = (result.get("data") or {}).get("metrics") or []
-
-        # 附加中文标签，方便 LLM 直接呈现
-        labeled: list[dict] = []
-        for row in raw_metrics_list:
-            labeled_row = {
-                k: {"value": v, "label": _METRIC_LABELS.get(k, k)}
-                for k, v in row.items()
-            }
-            labeled.append(labeled_row)
-
+    async def execute(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        """Skill 统一入口，由 SkillRegistry 调用。"""
+        action = arguments.get("action", "query")
+        if action == "query":
+            return await self._query(
+                metrics=arguments.get("metrics", []),
+                bra_id=arguments.get("bra_id"),
+                aggregation=arguments.get("aggregation", "SUM"),
+                range_start=arguments.get("range_start"),
+                range_end=arguments.get("range_end"),
+                comparison=arguments.get("comparison"),
+            )
         return {
-            "store_id":   store_id or "（全部门店）",
-            "date_range": {
-                "start": date_start or "today",
-                "end":   date_end or date_start or "today",
-            },
-            "aggregation": aggregation,
-            "metrics":     metrics,
-            "data":        labeled,
-            "raw":         raw_metrics_list,
+            "error": f"不支持的操作: {action!r}，目前仅支持: query",
+            "type": "InvalidAction",
         }
 
-    async def _call_api(self, payload: dict) -> dict:
-        """向 /v1/report/agent_bi 发起 POST 请求，返回响应 JSON。"""
-        import json
-        import urllib.request
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
 
-        url     = f"{self._base_url}/v1/report/agent_bi"
-        body    = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        headers = {"Content-Type": "application/json"}
-        if self._token:
-            headers["Authorization"] = f"Bearer {self._token}"
+    def _build_headers(self) -> dict[str, str]:
+        headers: dict[str, str] = {"Content-Type": "application/json"}
+        if self._api_key:
+            headers["Authorization"] = f"Bearer {self._api_key}"
+        return headers
 
-        req = urllib.request.Request(url, data=body, headers=headers, method="POST")
-        # timeout=9s（略低于 skill timeout_ms=10000）
-        with urllib.request.urlopen(req, timeout=9) as resp:
-            return json.loads(resp.read().decode("utf-8"))
+    async def _call_api_raw(
+        self,
+        payload: dict[str, Any],
+        headers: dict[str, str],
+        label: str = "current",
+    ) -> dict[str, Any] | None:
+        """发起单次 API 请求并返回原始 result dict；失败返回 None。"""
+        log.info("agent_bi.request", label=label, url=self._api_url, payload=payload)
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                resp = await client.post(self._api_url, json=payload, headers=headers)
+                log.info("agent_bi.response", label=label,
+                         http_status=resp.status_code,
+                         body_preview=resp.text[:500])
+                resp.raise_for_status()
+                return resp.json()
+        except httpx.TimeoutException:
+            log.error("agent_bi.timeout", label=label, url=self._api_url)
+            return None
+        except httpx.HTTPStatusError as exc:
+            log.error("agent_bi.http_error", label=label,
+                      status=exc.response.status_code, body=exc.response.text[:300])
+            return None
+        except httpx.RequestError as exc:
+            log.error("agent_bi.network_error", label=label, error=str(exc))
+            return None
+        except Exception as exc:  # noqa: BLE001
+            log.error("agent_bi.unexpected_error", label=label, error=str(exc))
+            return None
+
+    @staticmethod
+    def _extract_rows(
+        result: dict[str, Any] | None,
+        range_start: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """从 API 响应中提取 metrics 列表，过滤掉 null 行。
+
+        当返回多行（逐日数据）时，自动为每行注入 period_label（如 "12/14(周一)"），
+        供前端折线图 X 轴使用。
+        """
+        if not result:
+            return []
+        _SUCCESS_CODES = {0, 200}
+        api_code = result.get("code")
+        if api_code not in _SUCCESS_CODES:
+            return []
+        data_block = result.get("data") or {}
+        raw: list = data_block.get("metrics", [])
+        rows = [r for r in raw if isinstance(r, dict)]
+
+        # 多行时注入 period_label —— 让前端图表有可读的 X 轴标签
+        _WEEKDAY_ZH = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
+        if len(rows) > 1 and range_start is not None:
+            for i, row in enumerate(rows):
+                if "period_label" not in row:
+                    day_ts = range_start + i * 86_400_000
+                    dt = datetime.fromtimestamp(day_ts / 1000, tz=timezone.utc)
+                    weekday = _WEEKDAY_ZH[dt.weekday()]   # Mon=0
+                    row["period_label"] = f"{dt.month}/{dt.day}({weekday})"
+
+        return rows
+
+    @staticmethod
+    def _label_rows(raw_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """为每个指标值附加中文 label。"""
+        return [
+            {k: {"value": v, "label": _METRIC_LABELS.get(k, k)} for k, v in row.items()}
+            for row in raw_rows
+        ]
+
+    @staticmethod
+    def _compute_deltas(
+        current_rows: list[dict[str, Any]],
+        prev_rows: list[dict[str, Any]],
+    ) -> dict[str, dict[str, Any]]:
+        """计算同比/环比变化量和变化率。"""
+        if not current_rows or not prev_rows:
+            return {}
+        curr = current_rows[0]
+        prev = prev_rows[0]
+        deltas: dict[str, dict[str, Any]] = {}
+        for k in curr:
+            cv = curr[k]
+            pv = prev.get(k)
+            curr_val = float(cv) if isinstance(cv, (int, float)) else 0.0
+            prev_val = float(pv) if isinstance(pv, (int, float)) else 0.0
+            delta = curr_val - prev_val
+            delta_pct = round(delta / prev_val * 100, 2) if prev_val != 0 else None
+            deltas[k] = {"delta": round(delta, 4), "delta_pct": delta_pct}
+        return deltas
+
+    # ------------------------------------------------------------------
+    # Core query
+    # ------------------------------------------------------------------
+
+    async def _query(
+        self,
+        metrics: list[str],
+        bra_id: str | None = None,
+        aggregation: str = "SUM",
+        range_start: int | None = None,
+        range_end: int | None = None,
+        comparison: str | None = None,   # 'yoy' | 'pop'
+    ) -> dict[str, Any]:
+        # ── 默认门店回落 ──────────────────────────────────────────────
+        if not bra_id:
+            bra_id = _default_bra_id()
+
+        # ── 参数校验 ─────────────────────────────────────────────────
+        if not metrics:
+            return {"error": "metrics 不能为空，请至少指定一个指标",
+                    "valid_metrics": sorted(_VALID_METRICS)}
+
+        invalid_metrics = [m for m in metrics if m not in _VALID_METRICS]
+        if invalid_metrics:
+            return {"error": f"无效指标: {invalid_metrics}",
+                    "valid_metrics": sorted(_VALID_METRICS)}
+
+        if aggregation not in _VALID_AGGREGATIONS:
+            return {"error": f"无效聚合函数: {aggregation!r}",
+                    "valid_aggregations": sorted(_VALID_AGGREGATIONS)}
+
+        if comparison and comparison not in ("yoy", "pop"):
+            return {"error": f"无效对比类型: {comparison!r}，支持: yoy（同比）、pop（环比）",
+                    "type": "InvalidComparison"}
+
+        # ── 单日时间范围自动修复 ──────────────────────────────────────
+        _ONE_DAY_MS = 86_400_000
+        if range_start is not None:
+            if range_end is None or range_end <= range_start:
+                range_end = range_start + _ONE_DAY_MS
+                log.info("agent_bi.range_end_auto_fixed",
+                         range_start=range_start, range_end=range_end)
+
+        # ── 构建当期请求体 ────────────────────────────────────────────
+        payload: dict[str, Any] = {"metrics": metrics, "aggregation": aggregation}
+        if bra_id:
+            payload["braId"] = bra_id
+        if range_start is not None:
+            payload["rangeStart"] = range_start
+        if range_end is not None:
+            payload["rangeEnd"] = range_end
+
+        headers = self._build_headers()
+
+        # ── 发起请求（含同比/环比并发） ───────────────────────────────
+        prev_start: int | None = None
+        prev_end:   int | None = None
+
+        if comparison and range_start is not None and range_end is not None:
+            if comparison == "yoy":
+                prev_start, prev_end = _yoy_period(range_start, range_end)
+            else:  # pop
+                prev_start, prev_end = _pop_period(range_start, range_end)
+
+            prev_payload = {**payload, "rangeStart": prev_start, "rangeEnd": prev_end}
+            log.info("agent_bi.comparison_periods",
+                     comparison=comparison,
+                     current=(range_start, range_end),
+                     previous=(prev_start, prev_end))
+
+            curr_result, prev_result = await asyncio.gather(
+                self._call_api_raw(payload, headers, label="current"),
+                self._call_api_raw(prev_payload, headers, label="previous"),
+            )
+        else:
+            curr_result = await self._call_api_raw(payload, headers, label="current")
+            prev_result = None
+
+        # ── 检查当期状态码 ────────────────────────────────────────────
+        if curr_result is None:
+            return {"error": "API 请求失败，请检查网络或稍后重试", "type": "NetworkError"}
+
+        api_code = curr_result.get("code")
+        api_msg  = curr_result.get("message", "")
+        if api_code not in {0, 200}:
+            log.warning("agent_bi.api_error", code=api_code, message=api_msg)
+            return {"error": api_msg or "API 返回错误", "code": api_code,
+                    "type": "APIError", "detail": curr_result}
+
+        # ── 解析当期数据 ──────────────────────────────────────────────
+        raw_metrics  = self._extract_rows(curr_result, range_start=range_start)
+        labeled      = self._label_rows(raw_metrics)
+
+        log.info("agent_bi.success",
+                 bra_id=bra_id, aggregation=aggregation,
+                 range_start=range_start, range_end=range_end,
+                 row_count=len(raw_metrics), comparison=comparison)
+
+        response: dict[str, Any] = {
+            "success":     True,
+            "aggregation": aggregation,
+            "bra_id":      bra_id,
+            "range_start": range_start,
+            "range_end":   range_end,
+            "metrics":     labeled,
+            "raw_metrics": raw_metrics,
+        }
+
+        # ── 追加对比期数据 ────────────────────────────────────────────
+        if comparison and prev_start is not None:
+            prev_raw     = self._extract_rows(prev_result, range_start=prev_start)
+            prev_labeled = self._label_rows(prev_raw)
+            deltas       = self._compute_deltas(raw_metrics, prev_raw)
+
+            response.update({
+                "comparison_type":      comparison,
+                "previous_range_start": prev_start,
+                "previous_range_end":   prev_end,
+                "previous_metrics":     prev_labeled,
+                "previous_raw_metrics": prev_raw,
+                "deltas":               deltas,
+            })
+
+            log.info("agent_bi.comparison_done",
+                     comparison=comparison,
+                     prev_rows=len(prev_raw),
+                     delta_keys=list(deltas.keys()))
+
+        return response

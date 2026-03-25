@@ -20,6 +20,7 @@ from core.models import (
     AgentConfig, LLMResponse, Message, MessageRole,
     ToolCall, ToolDescriptor,
 )
+from llm.call_logger import get_call_logger
 
 log = structlog.get_logger(__name__)
 
@@ -83,6 +84,7 @@ class AnthropicEngine:
         timeout_sec:    float      = 120.0,
         max_retries:    int        = 3,
         http_proxy:     str | None = None,
+        alias:          str        = "anthropic",   # engine alias for logging
     ):
         try:
             import anthropic
@@ -100,11 +102,13 @@ class AnthropicEngine:
         except ImportError:
             raise RuntimeError("请安装 anthropic：pip install anthropic")
 
-        self._default_model  = default_model
+        self._default_model   = default_model
         self._summarize_model = summarize_model or default_model
-        self._max_tokens     = max_tokens
+        self._max_tokens      = max_tokens
+        self._alias           = alias   # stored for call_logger
 
         log.info("anthropic_engine.init",
+                 alias=alias,
                  model=default_model,
                  summarize_model=self._summarize_model,
                  max_tokens=max_tokens,
@@ -120,17 +124,26 @@ class AnthropicEngine:
         tools: list[ToolDescriptor],
         config: AgentConfig,
     ) -> LLMResponse:
+        model = self._resolve_model(config)
+        clog  = get_call_logger()
+        t0    = clog.log_request("anthropic", self._alias, model, "chat",
+                                  messages, tools, config)
+
         system, api_msgs = _messages_to_anthropic(messages)
         api_tools = _descriptors_to_anthropic(tools)
         kwargs: dict[str, Any] = {
-            "model":      self._resolve_model(config),
+            "model":      model,
             "max_tokens": self._max_tokens,
             "messages":   api_msgs,
         }
         if system:    kwargs["system"] = system
         if api_tools: kwargs["tools"]  = api_tools
 
-        resp = await self._client.messages.create(**kwargs)
+        try:
+            resp = await self._client.messages.create(**kwargs)
+        except Exception as exc:
+            clog.log_error("anthropic", self._alias, model, "chat", t0, exc)
+            raise
 
         tool_calls, content_text = [], None
         for block in resp.content:
@@ -139,12 +152,14 @@ class AnthropicEngine:
             elif block.type == "tool_use":
                 tool_calls.append(ToolCall(id=block.id, tool_name=block.name,
                                            arguments=block.input or {}))
-        return LLMResponse(
+        result = LLMResponse(
             content=content_text, tool_calls=tool_calls,
             usage={"prompt_tokens": resp.usage.input_tokens,
                    "completion_tokens": resp.usage.output_tokens},
             model=resp.model,
         )
+        clog.log_response("anthropic", self._alias, model, "chat", t0, result)
+        return result
 
     async def stream_chat(
         self,
@@ -152,19 +167,33 @@ class AnthropicEngine:
         tools: list[ToolDescriptor],
         config: AgentConfig,
     ) -> AsyncIterator[str]:
+        model = self._resolve_model(config)
+        clog  = get_call_logger()
+        t0    = clog.log_stream_start("anthropic", self._alias, model, "stream_chat",
+                                       messages, tools, config)
+
         system, api_msgs = _messages_to_anthropic(messages)
         api_tools = _descriptors_to_anthropic(tools)
         kwargs: dict[str, Any] = {
-            "model":      self._resolve_model(config),
+            "model":      model,
             "max_tokens": self._max_tokens,
             "messages":   api_msgs,
         }
         if system:    kwargs["system"] = system
         if api_tools: kwargs["tools"]  = api_tools
 
-        async with self._client.messages.stream(**kwargs) as stream:
-            async for text in stream.text_stream:
-                yield text
+        total_chars = 0
+        try:
+            async with self._client.messages.stream(**kwargs) as stream:
+                async for text in stream.text_stream:
+                    total_chars += len(text)
+                    yield text
+        except Exception as exc:
+            clog.log_error("anthropic", self._alias, model, "stream_chat", t0, exc)
+            raise
+        finally:
+            clog.log_stream_end("anthropic", self._alias, model, "stream_chat",
+                                 t0, total_chars)
 
     async def embed(self, text: str) -> list[float]:
         # Anthropic 无 embedding API，回退哈希向量（生产请换 OpenAI embedding）
@@ -207,6 +236,7 @@ class OpenAIEngine:
         # Azure 专用
         is_azure:        bool       = False,
         azure_api_version: str      = "2024-02-01",
+        alias:           str        = "openai",   # engine alias for logging
     ):
         try:
             import httpx
@@ -234,12 +264,14 @@ class OpenAIEngine:
         except ImportError:
             raise RuntimeError("请安装 openai：pip install openai")
 
-        self._default_model  = default_model
+        self._default_model   = default_model
         self._embedding_model = embedding_model
         self._summarize_model = summarize_model or default_model
-        self._max_tokens     = max_tokens
+        self._max_tokens      = max_tokens
+        self._alias           = alias   # stored for call_logger
 
         log.info("openai_engine.init",
+                 alias=alias,
                  base_url=base_url or "(default)",
                  model=default_model,
                  embedding_model=embedding_model,
@@ -280,6 +312,11 @@ class OpenAIEngine:
         tools: list[ToolDescriptor],
         config: AgentConfig,
     ) -> LLMResponse:
+        model = self._resolve_model(config)
+        clog  = get_call_logger()
+        t0    = clog.log_request("openai", self._alias, model, "chat",
+                                  messages, tools, config)
+
         api_msgs  = self._to_openai_messages(messages)
         api_tools = [
             {"type": "function", "function": {
@@ -289,15 +326,19 @@ class OpenAIEngine:
         ] if tools else []
 
         kwargs: dict[str, Any] = {
-            "model":      self._resolve_model(config),
+            "model":      model,
             "messages":   api_msgs,
             "max_tokens": self._max_tokens,
         }
         if api_tools: kwargs["tools"] = api_tools
 
-        resp   = await self._client.chat.completions.create(**kwargs)
-        choice = resp.choices[0].message
+        try:
+            resp = await self._client.chat.completions.create(**kwargs)
+        except Exception as exc:
+            clog.log_error("openai", self._alias, model, "chat", t0, exc)
+            raise
 
+        choice = resp.choices[0].message
         tool_calls = []
         if choice.tool_calls:
             for tc in choice.tool_calls:
@@ -306,12 +347,14 @@ class OpenAIEngine:
                     arguments=json.loads(tc.function.arguments or "{}"),
                 ))
 
-        return LLMResponse(
+        result = LLMResponse(
             content=choice.content, tool_calls=tool_calls,
             usage={"prompt_tokens":     resp.usage.prompt_tokens,
                    "completion_tokens": resp.usage.completion_tokens},
             model=resp.model,
         )
+        clog.log_response("openai", self._alias, model, "chat", t0, result)
+        return result
 
     async def stream_chat(
         self,
@@ -319,28 +362,92 @@ class OpenAIEngine:
         tools: list[ToolDescriptor],
         config: AgentConfig,
     ) -> AsyncIterator[str]:
+        model = self._resolve_model(config)
+        clog  = get_call_logger()
+        t0    = clog.log_stream_start("openai", self._alias, model, "stream_chat",
+                                       messages, tools, config)
+
         api_msgs = self._to_openai_messages(messages)
-        stream   = await self._client.chat.completions.create(
-            model=self._resolve_model(config),
-            messages=api_msgs,
-            max_tokens=self._max_tokens,
-            stream=True,
-        )
-        async for chunk in stream:
-            delta = chunk.choices[0].delta.content
-            if delta:
-                yield delta
+        total_chars = 0
+        try:
+            stream = await self._client.chat.completions.create(
+                model=model,
+                messages=api_msgs,
+                max_tokens=self._max_tokens,
+                stream=True,
+            )
+            async for chunk in stream:
+                delta = chunk.choices[0].delta.content
+                if delta:
+                    total_chars += len(delta)
+                    yield delta
+        except Exception as exc:
+            clog.log_error("openai", self._alias, model, "stream_chat", t0, exc)
+            raise
+        finally:
+            clog.log_stream_end("openai", self._alias, model, "stream_chat",
+                                 t0, total_chars)
 
     async def embed(self, text: str) -> list[float]:
-        if not self._embedding_model:
-            log.warning("openai_engine.embed.no_model")
-            import hashlib
+        import hashlib
+        import time
+
+        def _hash_fallback() -> list[float]:
+            """当无真实 embedding 模型时用 MD5 哈希填充 1536 维向量（仅供检索降级）。"""
             h = hashlib.md5(text.encode()).digest()
-            return [b / 255.0 for b in h] * 96
-        resp = await self._client.embeddings.create(
-            model=self._embedding_model, input=text
+            base = [b / 255.0 for b in h]          # 16 维
+            return (base * 96)[:1536]               # 复制到 1536 维
+
+        if not self._embedding_model:
+            log.warning(
+                "openai_engine.embed.no_model_hash_fallback",
+                text_len=len(text),
+                text_preview=text[:80],
+            )
+            return _hash_fallback()
+
+        # ── 请求日志 ──────────────────────────────────────────────────
+        t0 = time.perf_counter()
+        log.debug(
+            "openai_engine.embed.request",
+            model=self._embedding_model,
+            text_len=len(text),
+            text_preview=text[:120],
         )
-        return resp.data[0].embedding
+
+        try:
+            resp = await self._client.embeddings.create(
+                model=self._embedding_model, input=text
+            )
+            elapsed_ms = (time.perf_counter() - t0) * 1000
+            vec = resp.data[0].embedding
+
+            # ── 响应日志 ──────────────────────────────────────────────
+            log.debug(
+                "openai_engine.embed.response",
+                model=self._embedding_model,
+                dims=len(vec),
+                elapsed_ms=round(elapsed_ms, 1),
+                usage_tokens=getattr(resp.usage, "total_tokens", None),
+                vec_preview=[round(v, 6) for v in vec[:6]],  # 前 6 维供核查
+            )
+            return vec
+
+        except Exception as exc:
+            elapsed_ms = (time.perf_counter() - t0) * 1000
+            # ── 异常日志 ──────────────────────────────────────────────
+            # 模型不存在（Ollama 404）或网络错误时降级到 hash fallback
+            # 向量相似度失效，检索退化为 BM25-only，但不阻断请求
+            log.warning(
+                "openai_engine.embed.failed_hash_fallback",
+                model=self._embedding_model,
+                elapsed_ms=round(elapsed_ms, 1),
+                error=str(exc),
+                error_type=type(exc).__name__,
+                text_len=len(text),
+                text_preview=text[:80],
+            )
+            return _hash_fallback()
 
     async def summarize(self, text: str, max_tokens: int) -> str:
         resp = await self._client.chat.completions.create(

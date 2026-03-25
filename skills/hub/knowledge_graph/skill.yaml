@@ -1,0 +1,34 @@
+name: knowledge_graph_search
+version: "1.0"
+entrypoint: KnowledgeGraphSkill
+description: |
+  在知识图谱中搜索实体和关系。当用户询问实体间的关联、因果关系、
+  组织结构、人物关系、概念关联等需要多跳推理的问题时调用此工具。
+  适合回答"A和B有什么关系"、"X的上级是谁"、"Y属于哪个组织"等问题。
+tags: [knowledge, graph, reasoning, entities]
+parameters:
+  type: object
+  required: [query]
+  properties:
+    query:
+      type: string
+      description: 用户问题或搜索关键词
+    mode:
+      type: string
+      enum: [local, global, path]
+      default: local
+      description: |
+        检索模式：
+        local  - 局部子图检索（默认，适合具体实体问题）
+        global - 全局社区摘要检索（适合宏观概括性问题）
+        path   - 路径查询（适合"A和B的关系"类问题，需要两个实体）
+    kb_id:
+      type: string
+      description: 知识库ID，默认使用全局知识库
+      default: global
+    hops:
+      type: integer
+      description: 局部检索的跳数（1-3），默认2
+      default: 2
+      minimum: 1
+      maximum: 3

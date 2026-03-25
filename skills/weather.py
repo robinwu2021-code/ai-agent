@@ -251,33 +251,61 @@ class WttrInAdapter:
 
     BASE = "https://wttr.in"
 
+    @staticmethod
+    def _ampm_to_hhmm(s: str) -> str:
+        """将 wttr.in 返回的 '07:03 AM' / '07:18 PM' 转为 24 小时 'HH:MM'。"""
+        s = s.strip()
+        try:
+            dt = datetime.strptime(s, "%I:%M %p")
+            return dt.strftime("%H:%M")
+        except ValueError:
+            # 已经是 HH:MM 或格式未知，原样返回
+            return s
+
+    @staticmethod
+    def _desc(node: dict) -> str:
+        """优先使用 lang_zh（中文），回退到 weatherDesc（英文）。"""
+        zh = node.get("lang_zh")
+        if zh and isinstance(zh, list) and zh[0].get("value"):
+            return zh[0]["value"]
+        en = node.get("weatherDesc")
+        if en and isinstance(en, list):
+            return en[0].get("value", "")
+        return ""
+
     async def current(self, city: str, units: str = "metric") -> WeatherCondition:
         import httpx
-        # wttr.in 支持 JSON 格式
         url = f"{self.BASE}/{city}"
-        params = {"format": "j1"}
+        # lang=zh 使 wttr.in 在 lang_zh 字段中返回中文天气描述
+        params = {"format": "j1", "lang": "zh"}
         async with httpx.AsyncClient(timeout=10) as client:
             r = await client.get(url, params=params)
             r.raise_for_status()
             d = r.json()
 
-        cur = d["current_condition"][0]
+        cur  = d["current_condition"][0]
         area = d["nearest_area"][0]
         country = area["country"][0]["value"]
-        city_name = area["areaName"][0]["value"]
+        # Bug fix #1: areaName 返回地图 tile 名（如 "Pihsien"），直接用查询城市名
+        city_name = city
 
         temp_c   = float(cur["temp_C"])
         feels_c  = float(cur["FeelsLikeC"])
         humidity = int(cur["humidity"])
         wind_ms  = float(cur["windspeedKmph"]) / 3.6
         wind_deg = float(cur["winddirDegree"])
-        desc     = cur["weatherDesc"][0]["value"]
+        # Bug fix #2: 优先取中文描述（lang_zh），无则退回英文
+        desc     = self._desc(cur)
         vis_m    = int(cur["visibility"]) * 1000
         pressure = int(cur["pressure"])
         uv       = float(cur.get("uvIndex", 0))
 
-        # 日出日落（从当日天气里取）
-        today = d["weather"][0]
+        # Bug fix #3: 日出日落由 "07:03 AM" 格式转为 24 小时 "07:03"
+        today  = d["weather"][0]
+        astro  = today.get("astronomy", [{}])[0]
+        sunrise = self._ampm_to_hhmm(astro.get("sunrise", "--:--"))
+        sunset  = self._ampm_to_hhmm(astro.get("sunset",  "--:--"))
+
         return WeatherCondition(
             city=city_name,
             country=country,
@@ -290,15 +318,16 @@ class WttrInAdapter:
             visibility=vis_m,
             pressure=pressure,
             uv_index=uv,
-            sunrise=today.get("astronomy", [{}])[0].get("sunrise", "--:--"),
-            sunset=today.get("astronomy", [{}])[0].get("sunset", "--:--"),
+            sunrise=sunrise,
+            sunset=sunset,
             timestamp=datetime.now(timezone.utc).isoformat(),
         )
 
     async def forecast(self, city: str, days: int, units: str = "metric") -> list[DailyForecast]:
         import httpx
         url = f"{self.BASE}/{city}"
-        params = {"format": "j1"}
+        # Bug fix #2: 同样加 lang=zh 以获取中文天气描述
+        params = {"format": "j1", "lang": "zh"}
         async with httpx.AsyncClient(timeout=10) as client:
             r = await client.get(url, params=params)
             r.raise_for_status()
@@ -306,14 +335,13 @@ class WttrInAdapter:
 
         result = []
         for day in d["weather"][:days]:
-            hourly = day.get("hourly", [{}])
-            temps  = [float(h["tempC"]) for h in hourly] or [
-                float(day["mintempC"]), float(day["maxtempC"])
-            ]
-            precip = max(float(h.get("chanceofrain", 0)) for h in hourly) if hourly else 0
+            hourly  = day.get("hourly", [])
+            precip  = max(float(h.get("chanceofrain", 0)) for h in hourly) if hourly else 0
             wind_ms = max(float(h.get("windspeedKmph", 0)) for h in hourly) / 3.6 if hourly else 0
-            desc   = hourly[len(hourly) // 2]["weatherDesc"][0]["value"] if hourly else ""
-            uv     = float(day.get("uvIndex", 0))
+            # Bug fix #2: 中日预报描述也取中文
+            mid     = hourly[len(hourly) // 2] if hourly else {}
+            desc    = self._desc(mid)
+            uv      = float(day.get("uvIndex", 0))
 
             result.append(DailyForecast(
                 date=day["date"],

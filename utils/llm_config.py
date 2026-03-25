@@ -105,6 +105,283 @@ import structlog
 
 log = structlog.get_logger(__name__)
 
+
+# ═══════════════════════════════════════════════════════════════════
+# VectorStoreConfig — 向量数据库配置
+# ═══════════════════════════════════════════════════════════════════
+
+@dataclass
+class VectorStoreConfig:
+    """
+    向量数据库后端配置。
+
+    llm.yaml 中的 vector_store 节会解析为此对象。
+    .env / 环境变量作为兜底（通过 Settings.build_vector_store() 构建）。
+
+    YAML 示例：
+        vector_store:
+          backend: milvus
+          milvus:
+            uri: http://192.168.1.100:19530
+            token: ${MILVUS_TOKEN}        # 支持 ${ENV_VAR} 插值
+            collection: kb_chunks
+            vector_size: 1536
+            index_type: HNSW              # HNSW | DISKANN
+          # qdrant:                       # 备用后端（可选）
+          #   url: http://192.168.1.101:6333
+          #   api_key: ${QDRANT_API_KEY}
+          #   vector_size: 1536
+    """
+    backend:     str = "sqlite"   # milvus | qdrant | sqlite
+
+    # Milvus
+    milvus_uri:          str = ""
+    milvus_token:        str = ""
+    milvus_collection:   str = "kb_chunks"
+    milvus_vector_size:  int = 1536
+    milvus_index_type:   str = "HNSW"   # HNSW | DISKANN
+
+    # Qdrant
+    qdrant_url:          str = ""
+    qdrant_path:         str = "./data/qdrant"
+    qdrant_api_key:      str = ""
+    qdrant_collection:   str = "kb_chunks"
+    qdrant_vector_size:  int = 1536
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "VectorStoreConfig":
+        """
+        从 YAML vector_store 节构造，支持 ${ENV_VAR} 插值。
+        """
+        def _expand(v: Any) -> Any:
+            if isinstance(v, str):
+                return re.sub(
+                    r"\$\{([^}]+)\}",
+                    lambda m: os.environ.get(m.group(1), ""),
+                    v,
+                )
+            return v
+
+        backend = str(d.get("backend", "sqlite")).lower()
+        cfg = cls(backend=backend)
+
+        # Milvus 子节
+        mv: dict = d.get("milvus") or {}
+        if mv:
+            cfg.milvus_uri         = _expand(mv.get("uri",         ""))
+            cfg.milvus_token       = _expand(mv.get("token",       ""))
+            cfg.milvus_collection  = _expand(mv.get("collection",  "kb_chunks"))
+            cfg.milvus_vector_size = int(mv.get("vector_size",     1536))
+            cfg.milvus_index_type  = str(mv.get("index_type",      "HNSW")).upper()
+
+        # Qdrant 子节
+        qd: dict = d.get("qdrant") or {}
+        if qd:
+            cfg.qdrant_url         = _expand(qd.get("url",        ""))
+            cfg.qdrant_path        = _expand(qd.get("path",       "./data/qdrant"))
+            cfg.qdrant_api_key     = _expand(qd.get("api_key",    ""))
+            cfg.qdrant_collection  = _expand(qd.get("collection", "kb_chunks"))
+            cfg.qdrant_vector_size = int(qd.get("vector_size",    1536))
+
+        return cfg
+
+    def build(self) -> Any:
+        """
+        根据 backend 字段实例化对应的 VectorStore 对象。
+        返回 MilvusVectorStore | QdrantVectorStore | None（sqlite 时）。
+        """
+        if self.backend == "milvus":
+            from rag.milvus_store import MilvusVectorStore
+            if not self.milvus_uri:
+                raise ValueError(
+                    "vector_store.milvus.uri 不能为空，"
+                    "请在 llm.yaml 或 MILVUS_URI 环境变量中配置"
+                )
+            return MilvusVectorStore(
+                uri=self.milvus_uri,
+                token=self.milvus_token,
+                collection=self.milvus_collection,
+                vector_size=self.milvus_vector_size,
+                index_type=self.milvus_index_type,
+            )
+        if self.backend == "qdrant":
+            from rag.qdrant_store import QdrantVectorStore
+            if self.qdrant_url:
+                return QdrantVectorStore(
+                    url=self.qdrant_url,
+                    api_key=self.qdrant_api_key or None,
+                    collection=self.qdrant_collection,
+                    vector_size=self.qdrant_vector_size,
+                )
+            return QdrantVectorStore(
+                path=self.qdrant_path,
+                collection=self.qdrant_collection,
+                vector_size=self.qdrant_vector_size,
+            )
+        return None  # sqlite fallback
+
+
+# ═══════════════════════════════════════════════════════════════════
+# MemoryConfig — 记忆模块配置
+# ═══════════════════════════════════════════════════════════════════
+
+@dataclass
+class MemorySTMConfig:
+    """短期记忆 (STM) 配置。"""
+    backend:     str = "in_memory"     # redis | in_memory
+    redis_url:   str = "redis://localhost:6379"
+    ttl_idle:    int = 1800            # 不活跃过期（秒）
+    ttl_max:     int = 86400           # 最长保留（秒）
+    session_link: bool = True          # 同用户跨 session 桥接
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "MemorySTMConfig":
+        def _e(v: Any) -> Any:
+            return re.sub(r"\$\{([^}]+)\}", lambda m: os.environ.get(m.group(1), ""), v) \
+                if isinstance(v, str) else v
+        return cls(
+            backend      = str(d.get("backend",      "in_memory")),
+            redis_url    = _e(d.get("redis_url",     "redis://localhost:6379")),
+            ttl_idle     = int(d.get("ttl_idle",     1800)),
+            ttl_max      = int(d.get("ttl_max",      86400)),
+            session_link = bool(d.get("session_link", True)),
+        )
+
+
+@dataclass
+class MemoryLTMConfig:
+    """
+    长期记忆 (LTM) 配置。
+
+    关键设计：llm_engine / embed_engine 引用 llm.yaml engines 节中已定义的 alias，
+    不重复填写连接参数。切换 Ollama → vLLM → Claude 只需改 alias 名。
+
+    示例：
+      ltm:
+        backend: mem0
+        llm_engine: ollama-qwen3    # 本地 Ollama
+        # llm_engine: vllm-qwen3   # 切换到 vLLM
+        # llm_engine: claude-fast  # 切换到云端 Claude
+        embed_engine: ollama-embed
+    """
+    backend:     str = "in_memory"    # mem0 | milvus | qdrant | zep | in_memory
+
+    # ── 引擎 alias（引用 engines: 节）──────────────────────────
+    # 解析时由 MemoryFactory 根据 alias 从 LLMRouter 取具体 engine 实例
+    llm_engine:   str = ""            # 用于 mem0 内部 LLM 调用（提取/去重判断）
+    embed_engine: str = ""            # 用于向量化（搜索和写入）
+
+    # ── 向量库 ───────────────────────────────────────────────────
+    use_global_vector_store: bool = True  # True → 复用顶层 vector_store 节
+    collection:              str  = "agent_memory"  # 与 KB kb_chunks 隔离
+
+    # ── mem0 专项 ────────────────────────────────────────────────
+    mem0_dedup_threshold: float = 0.85
+    mem0_max_memories:    int   = 10_000
+
+    # ── Zep 专项 ─────────────────────────────────────────────────
+    zep_server_url: str = ""
+    zep_api_key:    str = ""
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "MemoryLTMConfig":
+        def _e(v: Any) -> Any:
+            return re.sub(r"\$\{([^}]+)\}", lambda m: os.environ.get(m.group(1), ""), v) \
+                if isinstance(v, str) else v
+        mem0_raw = d.get("mem0") or {}
+        return cls(
+            backend                  = str(d.get("backend",    "in_memory")),
+            llm_engine               = str(d.get("llm_engine",  "")),
+            embed_engine             = str(d.get("embed_engine", "")),
+            use_global_vector_store  = bool(d.get("use_global_vector_store", True)),
+            collection               = str(d.get("collection",  "agent_memory")),
+            mem0_dedup_threshold     = float(mem0_raw.get("dedup_threshold", 0.85)),
+            mem0_max_memories        = int(mem0_raw.get("max_memories", 10_000)),
+            zep_server_url           = _e(d.get("zep_server_url", "")),
+            zep_api_key              = _e(d.get("zep_api_key",    "")),
+        )
+
+
+@dataclass
+class MemoryWorkingConfig:
+    """工作记忆（Context 组装）配置。"""
+    summarize_engine:     str   = ""       # 历史压缩用的引擎 alias（空→用 default）
+    token_budget:         int   = 12_000
+    compress_threshold:   int   = 1_500    # 历史超此 token 触发摘要
+    ltm_score_min:        float = 0.05     # LTM 召回最低分阈值
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "MemoryWorkingConfig":
+        return cls(
+            summarize_engine   = str(d.get("summarize_engine",   "")),
+            token_budget       = int(d.get("token_budget",       12_000)),
+            compress_threshold = int(d.get("compress_threshold", 1_500)),
+            ltm_score_min      = float(d.get("ltm_score_min",    0.05)),
+        )
+
+
+@dataclass
+class MemoryConsolidationConfig:
+    """记忆固化配置。"""
+    engine:             str   = ""    # 固化 LLM alias（空→用 default）
+    incremental_every:  int   = 10    # 每 N 条消息触发增量固化
+    segment_size:       int   = 20    # 每次处理的消息段大小
+    min_importance:     float = 0.2   # 低于此分数的 fact 丢弃
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "MemoryConsolidationConfig":
+        return cls(
+            engine            = str(d.get("engine",            "")),
+            incremental_every = int(d.get("incremental_every", 10)),
+            segment_size      = int(d.get("segment_size",      20)),
+            min_importance    = float(d.get("min_importance",  0.2)),
+        )
+
+
+@dataclass
+class MemoryConfig:
+    """
+    完整的记忆系统配置（llm.yaml memory: 节）。
+
+    所有 engine alias 引用 llm.yaml engines: 节中已定义的实例，
+    无需重复填写 URL / API key / 模型名等连接参数。
+
+    多后端切换示例（仅改 alias，其余不变）：
+      本地 Ollama:  llm_engine: ollama-qwen3
+      本地 vLLM:    llm_engine: vllm-qwen3
+      云端 Claude:  llm_engine: claude-fast
+      云端 OpenAI:  llm_engine: gpt-4o-mini   （在 engines: 节新增即可）
+    """
+    stm:           MemorySTMConfig           = field(default_factory=MemorySTMConfig)
+    ltm:           MemoryLTMConfig           = field(default_factory=MemoryLTMConfig)
+    working:       MemoryWorkingConfig       = field(default_factory=MemoryWorkingConfig)
+    consolidation: MemoryConsolidationConfig = field(default_factory=MemoryConsolidationConfig)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "MemoryConfig":
+        return cls(
+            stm           = MemorySTMConfig.from_dict(d.get("stm")           or {}),
+            ltm           = MemoryLTMConfig.from_dict(d.get("ltm")           or {}),
+            working       = MemoryWorkingConfig.from_dict(d.get("working")   or {}),
+            consolidation = MemoryConsolidationConfig.from_dict(
+                              d.get("consolidation") or {}),
+        )
+
+    def build(
+        self,
+        router: Any,               # LLMRouter 实例
+        vs_cfg: "VectorStoreConfig | None" = None,
+    ) -> "MemorySystem":
+        """
+        根据配置构建完整 MemorySystem。
+
+        router:  已初始化的 LLMRouter，供所有引擎 alias 解析使用。
+        vs_cfg:  全局 VectorStoreConfig（当 ltm.use_global_vector_store=True 时使用）。
+        """
+        from memory.factory import MemoryFactory
+        return MemoryFactory.build(self, router, vs_cfg)
+
+
 # ── SDK 类型 ──────────────────────────────────────────────────────
 SdkType = Literal["anthropic", "openai_compatible"]
 
@@ -112,12 +389,26 @@ SdkType = Literal["anthropic", "openai_compatible"]
 SDK_DEFAULTS: dict[str, dict[str, str]] = {
     "anthropic": {
         "default_model":   "claude-sonnet-4-20250514",
-        "embedding_model": "",          # Anthropic 无原生 embedding API
+        "embedding_model": "",   # Anthropic 无原生 embedding API，退化 hash
     },
     "openai_compatible": {
         "default_model":   "gpt-4o",
-        "embedding_model": "text-embedding-3-small",
+        # ⚠️  不再预设 text-embedding-3-small：
+        #   该模型仅 OpenAI/Azure 支持，Ollama/DeepSeek/vLLM 等均无此模型。
+        #   实例若需 embedding，应在 LLMConfig.embedding_model 或 llm.yaml 中
+        #   显式声明（如 qwen3-embedding:8b / text-embedding-3-small）。
+        #   未声明时 embed() 退化为 hash-fallback，检索仍可用（BM25 兜底）。
+        "embedding_model": "",
     },
+}
+
+# ── 已知厂商的 embedding 模型推荐值（供文档参考，不自动使用）──────
+_VENDOR_EMBED_SUGGESTIONS: dict[str, str] = {
+    "openai":   "text-embedding-3-small",
+    "azure":    "text-embedding-3-small",
+    "ollama":   "qwen3-embedding:8b",    # ollama pull qwen3-embedding:8b
+    "deepseek": "",                       # DeepSeek 暂无官方 embedding API
+    "groq":     "",
 }
 
 # ── 知名厂商的 base_url（手工配置时可直接引用）────────────────────
@@ -212,6 +503,7 @@ class LLMConfig:
                 timeout_sec     = self.timeout_sec,
                 max_retries     = self.max_retries,
                 http_proxy      = self.http_proxy,
+                alias           = self.alias,   # pass alias for call logging
             )
 
         if self.sdk == "openai_compatible":
@@ -227,6 +519,7 @@ class LLMConfig:
                 http_proxy        = self.http_proxy,
                 is_azure          = self.is_azure,
                 azure_api_version = self.azure_api_version,
+                alias             = self.alias,   # pass alias for call logging
             )
 
         raise ValueError(
@@ -432,11 +725,13 @@ def _expand_env(value: Any) -> Any:
 
 def load_from_yaml(
     path: str | Path = "llm.yaml",
-) -> tuple[list[LLMConfig], RouterConfig]:
+) -> tuple[list[LLMConfig], RouterConfig, VectorStoreConfig | None, MemoryConfig | None]:
     """
-    从 YAML 文件加载引擎实例列表和路由规则。
+    从 YAML 文件加载引擎实例列表、路由规则、向量数据库配置和记忆系统配置。
 
-    返回 (engines, router_cfg)。
+    返回 (engines, router_cfg, vs_cfg, memory_cfg)。
+      vs_cfg     为 None 时表示 YAML 中没有 vector_store 节。
+      memory_cfg 为 None 时表示 YAML 中没有 memory 节。
     YAML 格式见项目根目录的 llm.yaml 示例。
 
     异常：
@@ -470,11 +765,33 @@ def load_from_yaml(
     router_raw: dict = raw.get("router") or {}
     router_cfg = RouterConfig.from_dict(router_raw, default_alias)
 
+    # ── 解析 vector_store（可选节）───────────────────────────────
+    vs_cfg: VectorStoreConfig | None = None
+    vs_raw: dict = raw.get("vector_store") or {}
+    if vs_raw:
+        vs_cfg = VectorStoreConfig.from_dict(vs_raw)
+        log.info("llm_config.vector_store_loaded",
+                 backend=vs_cfg.backend,
+                 milvus_uri=vs_cfg.milvus_uri or "(none)")
+
+    # ── 解析 memory（可选节）─────────────────────────────────────
+    mem_cfg: MemoryConfig | None = None
+    mem_raw: dict = raw.get("memory") or {}
+    if mem_raw:
+        mem_cfg = MemoryConfig.from_dict(mem_raw)
+        log.info("llm_config.memory_loaded",
+                 stm_backend=mem_cfg.stm.backend,
+                 ltm_backend=mem_cfg.ltm.backend,
+                 llm_engine=mem_cfg.ltm.llm_engine or "(default)",
+                 embed_engine=mem_cfg.ltm.embed_engine or "(default)")
+
     log.info(
         "llm_config.yaml_loaded",
-        path      = str(p.resolve()),
-        engines   = [c.alias for c in configs],
-        default   = router_cfg.default,
-        fallback  = router_cfg.fallback,
+        path         = str(p.resolve()),
+        engines      = [c.alias for c in configs],
+        default      = router_cfg.default,
+        fallback     = router_cfg.fallback,
+        vector_store = vs_cfg.backend if vs_cfg else "none",
+        memory_ltm   = mem_cfg.ltm.backend if mem_cfg else "none",
     )
-    return configs, router_cfg
+    return configs, router_cfg, vs_cfg, mem_cfg

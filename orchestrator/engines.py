@@ -111,9 +111,16 @@ class ReactOrchestrator:
                     ))
                     await self._stm.append_message(task.id, task.history[-1])
 
-                    yield {"type": "step", "step": step_num,
-                           "tool": tc.tool_name, "status": "done",
-                           "error": tool_result.error}
+                    step_ev: dict = {
+                        "type": "step", "step": step_num,
+                        "tool": tc.tool_name, "status": "done",
+                        "error": tool_result.error,
+                    }
+                    # Include structured content for tools that return rich data
+                    # (used by frontend to render cards without relying on LLM text)
+                    if not tool_result.error and isinstance(tool_result.content, dict):
+                        step_ev["result"] = tool_result.content
+                    yield step_ev
 
                 await self._stm.save_task(task)
 

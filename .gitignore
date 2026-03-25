@@ -37,3 +37,14 @@ htmlcov/
 # OS
 .DS_Store
 Thumbs.db
+
+# SQLite runtime databases (generated at startup, not for VCS)
+*.db
+*.db-shm
+*.db-wal
+
+# LLM call logs (runtime output)
+logs/
+
+# TypeScript build cache
+web/tsconfig.tsbuildinfo

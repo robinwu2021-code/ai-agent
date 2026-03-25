@@ -37,9 +37,13 @@ class AgentContainer:
     quota_manager:      Any = None
     model_downgrader:   Any = None
     tenant_manager:     Any = None
+    workspace_manager:  Any = None   # WorkspaceManager（多用户工作区）
     prompt_renderer:    Any = None
     feedback_store:     Any = None
     task_queue:         Any = None
+    # ── 知识图谱 ──────────────────────────────────────────────────
+    kg_store:           Any = None   # KGStore（SQLite / Neo4j）
+    graph_builder:      Any = None   # GraphBuilder
 
     def _effective_router(self) -> Any:
         """返回 LLMRouter（若只设了 llm_engine，自动包装为单引擎 Router）。"""
@@ -50,6 +54,9 @@ class AgentContainer:
             self.llm_router = single_engine_router(self.llm_engine)
             return self.llm_router
         raise RuntimeError("Container: neither llm_router nor llm_engine is set")
+
+    # ── 多 Agent 编排专用字段 ─────────────────────────────────────
+    agent_specs:        Any = None   # list[AgentSpec]，用于 multiagent 模式
 
     def build(self) -> "AgentContainer":
         from memory.consolidation import MemoryConsolidator
@@ -71,6 +78,16 @@ class AgentContainer:
             )
             if self.orchestrator_type == "plan_execute":
                 self.orchestrator = PlanExecuteOrchestrator(**kwargs)
+            elif self.orchestrator_type == "dag":
+                from orchestrator.dag import DAGOrchestrator
+                self.orchestrator = DAGOrchestrator(**kwargs)
+            elif self.orchestrator_type == "multiagent":
+                from multiagent.orchestrator import MultiAgentOrchestrator
+                specs = self.agent_specs or []
+                self.orchestrator = MultiAgentOrchestrator(
+                    container_components=kwargs,
+                    agent_specs=specs,
+                )
             else:
                 self.orchestrator = ReactOrchestrator(**kwargs)
 

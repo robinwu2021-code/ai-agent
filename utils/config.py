@@ -131,9 +131,38 @@ class Settings(BaseSettings):
     use_redis:  bool = Field(False,                    alias="USE_REDIS")
     use_qdrant: bool = Field(False,                    alias="USE_QDRANT")
 
+    # ── 向量数据库后端（llm.yaml vector_store 节优先，以下为环境变量兜底）──
+    # 选择后端：milvus | qdrant | sqlite（默认 sqlite，向后兼容）
+    vector_backend:      str = Field("sqlite",          alias="VECTOR_BACKEND")
+    # Milvus
+    milvus_uri:          str = Field("",                alias="MILVUS_URI")
+    milvus_token:        str = Field("",                alias="MILVUS_TOKEN")
+    milvus_collection:   str = Field("kb_chunks",       alias="MILVUS_COLLECTION")
+    milvus_vector_size:  int = Field(1536,              alias="MILVUS_VECTOR_SIZE")
+    milvus_index_type:   str = Field("HNSW",            alias="MILVUS_INDEX_TYPE")
+    # Qdrant（env var 兜底，llm.yaml qdrant 节优先）
+    qdrant_path:         str = Field("./data/qdrant",   alias="QDRANT_PATH")
+    qdrant_api_key:      str = Field("",                alias="QDRANT_API_KEY")
+    qdrant_vector_size:  int = Field(1536,              alias="QDRANT_VECTOR_SIZE")
+
     # ── API 服务器 ────────────────────────────────────────────────
     api_host: str = Field("0.0.0.0", alias="API_HOST")
     api_port: int = Field(8000,      alias="API_PORT")
+
+    # ── 智能报表（AgentBiSkill）────────────────────────────────
+    # 接口地址；可通过 AGENT_BI_API_URL 覆盖
+    agent_bi_api_url: str = Field(
+        "https://fnb-qrcode.neargo.ai/v1/report/agent_bi",
+        alias="AGENT_BI_API_URL",
+    )
+    # 接口鉴权 Token（可选）
+    agent_bi_api_key: str = Field("", alias="AGENT_BI_API_KEY")
+    # 默认门店 ID；前端未传入 bra_id 时，Skill 自动使用此值
+    # 可通过 AGENT_BI_DEFAULT_BRA_ID 环境变量覆盖
+    agent_bi_default_bra_id: str = Field(
+        "B17612377308779358",
+        alias="AGENT_BI_DEFAULT_BRA_ID",
+    )
 
     # ── Agent 运行参数 ─────────────────────────────────────────────
     orchestrator_type: str = Field("react", alias="ORCHESTRATOR_TYPE")
@@ -144,12 +173,74 @@ class Settings(BaseSettings):
     log_level: str  = Field("INFO",  alias="LOG_LEVEL")
     json_logs: bool = Field(False,   alias="JSON_LOGS")
 
+    # ── LLM 调用全链路日志 ────────────────────────────────────────
+    # 每次 chat / stream_chat / embed 均会产生 request / response / error 三类事件
+    llm_call_log_enabled:      bool  = Field(True,                    alias="LLM_CALL_LOG_ENABLED")
+    llm_call_log_level:        str   = Field("DEBUG",                 alias="LLM_CALL_LOG_LEVEL")
+    llm_call_log_file:         str   = Field("logs/llm_calls.jsonl",  alias="LLM_CALL_LOG_FILE")
+    llm_call_log_max_bytes:    int   = Field(10 * 1024 * 1024,        alias="LLM_CALL_LOG_MAX_BYTES")
+    llm_call_log_backup_count: int   = Field(5,                       alias="LLM_CALL_LOG_BACKUP_COUNT")
+    llm_call_log_msg_preview:  int   = Field(500,                     alias="LLM_CALL_LOG_MSG_PREVIEW")
+
     model_config = {
         "env_file":          ".env",
         "env_file_encoding": "utf-8",
         "populate_by_name":  True,
         "extra":             "ignore",
     }
+
+    # ── 向量数据库后端构建 ────────────────────────────────────────
+
+    def build_vector_store(self) -> Any:
+        """
+        构建向量数据库后端实例。
+
+        优先级：
+          1. llm.yaml vector_store 节（最高，含 ${ENV_VAR} 插值）
+          2. VECTOR_BACKEND / MILVUS_* / QDRANT_* 环境变量（兜底）
+          3. 无配置 → 返回 None（退回 SQLite 模式）
+
+        返回：MilvusVectorStore | QdrantVectorStore | None
+        """
+        from utils.llm_config import VectorStoreConfig, load_from_yaml
+        from pathlib import Path
+
+        # 优先级 1：llm.yaml vector_store 节
+        if self.llm_config_file:
+            yaml_path = Path(self.llm_config_file)
+            if yaml_path.exists():
+                try:
+                    _, _, vs_cfg, _ = load_from_yaml(yaml_path)
+                    if vs_cfg and vs_cfg.backend != "sqlite":
+                        return vs_cfg.build()
+                except Exception as exc:
+                    log.warning("settings.build_vector_store.yaml_failed",
+                                error=str(exc))
+
+        # 优先级 2：环境变量兜底
+        backend = self.vector_backend.lower().strip()
+        if backend == "milvus":
+            vs_cfg = VectorStoreConfig(
+                backend            = "milvus",
+                milvus_uri         = self.milvus_uri,
+                milvus_token       = self.milvus_token,
+                milvus_collection  = self.milvus_collection,
+                milvus_vector_size = self.milvus_vector_size,
+                milvus_index_type  = self.milvus_index_type,
+            )
+            return vs_cfg.build()
+
+        if backend == "qdrant":
+            vs_cfg = VectorStoreConfig(
+                backend            = "qdrant",
+                qdrant_url         = self.qdrant_url if self.use_qdrant else "",
+                qdrant_path        = self.qdrant_path,
+                qdrant_api_key     = self.qdrant_api_key,
+                qdrant_vector_size = self.qdrant_vector_size,
+            )
+            return vs_cfg.build()
+
+        return None   # sqlite fallback
 
     # ── 单引擎 LLMConfig 构建 ─────────────────────────────────────
 
@@ -229,7 +320,7 @@ class Settings(BaseSettings):
             from pathlib import Path
             yaml_path = Path(self.llm_config_file)
             if yaml_path.exists():
-                configs, router_cfg = load_from_yaml(yaml_path)
+                configs, router_cfg, _vs, _mem = load_from_yaml(yaml_path)
                 return self._build_router_from_configs(configs, router_cfg)
             else:
                 log.debug("router.yaml_not_found",
