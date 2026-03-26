@@ -1,19 +1,17 @@
 """
 rag/kb_manager.py — 知识库统一入口（Facade）
 
-组装所有可插拔组件，对外提供简洁的操作接口：
-  - upload_file / update_file / delete_file / restore_version
-  - query
-  - list_files / get_file / get_history / get_audit_log
-  - create_directory / grant_permission / check_access
+配置优先级（由高到低）：
+  1. llm.yaml — LLM 引擎连接参数、向量库连接参数、embedding 引擎
+  2. kb_config.yaml — KB 业务逻辑（解析策略 / 分块策略 / 检索参数 / alias 引用）
 
 组件依赖图：
   KBManager
     ├── IngestionPipeline
     │     ├── Parser（docling/unstructured/markitdown）
     │     ├── SmartChunker（structural/semantic/sentence/fixed + contextual）
-    │     ├── Embedder（qwen/openai/bge_local）
-    │     ├── VectorStore（qdrant/milvus/chroma）
+    │     ├── Embedder（由 llm.yaml router.embed 或 kb_config.llm.embed_engine 决定）
+    │     ├── VectorStore（由 llm.yaml vector_store 或 kb_config.vector_store 决定）
     │     ├── KeywordStore（elasticsearch/opensearch/memory）
     │     └── GraphBuilder（可选）
     ├── QueryPipeline
@@ -48,7 +46,7 @@ class KBManager:
     知识库统一入口。
 
     用法：
-        mgr = await KBManager.create()            # 用 kb_config.yaml 自动组装
+        mgr = await KBManager.create()            # 自动读取 llm.yaml + kb_config.yaml
         file = await mgr.upload_file(
             file_path="report.pdf",
             workspace_id="ws_01",
@@ -86,6 +84,7 @@ class KBManager:
         Args:
             config:  KBConfig 实例，默认读取 kb_config.yaml
             llm_fn:  摘要 / 重排序所用 LLM，签名 async (system, user) -> str
+                     留空时自动从 llm.yaml 解析 summarize_engine 对应引擎
         """
         cfg = config or get_kb_config()
 
@@ -93,15 +92,19 @@ class KBManager:
         from rag.parsers.factory import ParserFactory
         parser = ParserFactory.create(cfg.parser)
 
+        # ── LLM 函数（摘要 / 图谱 / 重排序）─────────────────────────
+        if llm_fn is None:
+            llm_fn = cls._resolve_llm_fn(cfg)
+
         # ── 分块器 ─────────────────────────────────────────────────
         from rag.chunkers.factory import ChunkerFactory
         chunker = ChunkerFactory.create(cfg.chunker, llm_fn=llm_fn)
 
-        # ── Embedder ───────────────────────────────────────────────
+        # ── Embedder（优先 llm.yaml router.embed）─────────────────
         from rag.embedders.factory import EmbedderFactory
-        embedder = EmbedderFactory.create(cfg.embedder)
+        embedder = EmbedderFactory.create_from_kb_config(cfg.llm)
 
-        # ── 向量存储（复用现有 QdrantVectorStore / MilvusVectorStore）─
+        # ── 向量存储（优先 llm.yaml vector_store）────────────────
         vector_store = await cls._create_vector_store(cfg)
 
         # ── 关键词存储 ─────────────────────────────────────────────
@@ -109,7 +112,7 @@ class KBManager:
         keyword_store = KeywordStoreFactory.create(cfg.keyword_store)
         await keyword_store.initialize()
 
-        # ── 图谱（可选，使用现有 GraphBuilder）───────────────────────
+        # ── 图谱（可选）──────────────────────────────────────────
         graph_builder = None
         graph_retriever = None
         if cfg.graph.enabled:
@@ -167,13 +170,15 @@ class KBManager:
             final_top_k=cfg.reranker.top_n,
         )
 
-        log.info("kb_manager.created",
-                 parser=cfg.parser.backend,
-                 chunker=cfg.chunker.strategy,
-                 embedder=cfg.embedder.backend,
-                 vector_store=cfg.vector_store.backend,
-                 keyword_store=cfg.keyword_store.backend,
-                 graph=cfg.graph.enabled)
+        log.info(
+            "kb_manager.created",
+            parser=cfg.parser.backend,
+            chunker=cfg.chunker.strategy,
+            embed_engine=cfg.llm.embed_engine or "(router.embed)",
+            vector_store_backend=cfg.vector_store.backend,
+            keyword_store=cfg.keyword_store.backend,
+            graph=cfg.graph.enabled,
+        )
 
         return cls(
             ingestion=ingestion,
@@ -202,7 +207,6 @@ class KBManager:
             operator=operator,
             change_description=change_description,
         )
-        # 异步触发索引（不阻塞返回）
         import asyncio
         asyncio.create_task(self._ingestion.ingest(
             file_path=file_path,
@@ -221,7 +225,6 @@ class KBManager:
         change_description: str = "",
     ):
         """更新文件内容并触发重索引。"""
-        # 获取旧摘要用于 diff
         old_file = await self._files._store.get_file(file_id)
         prev_summary = old_file.summary if old_file else ""
 
@@ -231,9 +234,7 @@ class KBManager:
             operator=operator,
             change_description=change_description,
         )
-        # 先清除旧索引
         await self._ingestion.delete_doc(file_id, kb_file.kb_id)
-        # 重新索引
         import asyncio
         asyncio.create_task(self._ingestion.ingest(
             file_path=new_file_path,
@@ -315,89 +316,117 @@ class KBManager:
     # ── 内部组件构建 ──────────────────────────────────────────────────
 
     @staticmethod
+    def _resolve_llm_fn(cfg: KBConfig) -> Callable | None:
+        """
+        从 llm.yaml 解析 summarize_engine（用于文档摘要和图谱构建）。
+        返回 async (system, user) -> str 签名的函数，失败时返回 None。
+        """
+        try:
+            from utils.llm_config import load_from_yaml
+            engines, router, _, _ = load_from_yaml()
+            engine_map = {e.alias: e for e in engines}
+
+            alias = cfg.llm.summarize_engine.strip() or router.summarize or router.default
+            llm_cfg = engine_map.get(alias) if alias else None
+            if llm_cfg is None and engines:
+                llm_cfg = engines[0]   # 回退到第一个引擎
+
+            if llm_cfg is not None:
+                engine = llm_cfg.build_engine()
+
+                async def _llm_fn(system: str, user: str) -> str:
+                    return await engine.chat(system=system, user=user)
+
+                log.info("kb_manager.llm_fn_resolved",
+                         alias=llm_cfg.alias, task="summarize/graph/rerank")
+                return _llm_fn
+        except Exception as exc:
+            log.warning("kb_manager.llm_fn_resolve_failed", error=str(exc))
+        return None
+
+    @staticmethod
     async def _create_vector_store(cfg: KBConfig):
-        backend = cfg.vector_store.backend.lower()
+        """
+        向量库构建：
+          1. use_global=True → 使用 llm.yaml vector_store 配置（可用 cfg.vector_store.collection 覆盖 collection 名）
+          2. use_global=False 或 llm.yaml 无 vector_store → 使用 kb_config.yaml vector_store 配置
+          3. 全部失败 → 内存兜底
+        """
+        vs_cfg = cfg.vector_store
+        collection_override = vs_cfg.collection.strip()
+
+        # ── 优先尝试 llm.yaml vector_store ────────────────────────
+        if vs_cfg.use_global:
+            try:
+                from utils.llm_config import load_from_yaml
+                _, _, llm_vs_cfg, _ = load_from_yaml()
+                if llm_vs_cfg is not None:
+                    # 允许 kb_config 覆盖 collection 名
+                    if collection_override:
+                        if llm_vs_cfg.backend == "milvus":
+                            llm_vs_cfg.milvus_collection = collection_override
+                        elif llm_vs_cfg.backend == "qdrant":
+                            llm_vs_cfg.qdrant_collection = collection_override
+                    store = llm_vs_cfg.build()
+                    if store is not None:
+                        await store.initialize()
+                        log.info("kb_manager.vector_store_from_llm_yaml",
+                                 backend=llm_vs_cfg.backend,
+                                 collection=collection_override or "(llm.yaml default)")
+                        return store
+            except Exception as exc:
+                log.warning("kb_manager.llm_yaml_vector_store_failed", error=str(exc))
+
+        # ── 回退到 kb_config.yaml vector_store ────────────────────
+        backend = vs_cfg.backend.lower()
         if backend == "qdrant":
             try:
                 from rag.qdrant_store import QdrantVectorStore
-                c = cfg.vector_store.qdrant
+                c = vs_cfg.qdrant
                 store = QdrantVectorStore(
                     path=c.path if c.mode == "embedded" else None,
                     url=c.url if c.mode == "server" else None,
-                    collection=c.collection,
-                    vector_size=cfg.embedder.qwen.dimensions
-                    if cfg.embedder.backend == "qwen"
-                    else cfg.embedder.openai.dimensions,
+                    collection=collection_override or "kb_chunks",
+                    vector_size=cfg.llm.embed_dimensions,
                 )
                 await store.initialize()
+                log.info("kb_manager.vector_store_qdrant", mode=c.mode)
                 return store
             except Exception as exc:
                 log.warning("kb_manager.qdrant_init_failed", error=str(exc))
+
         if backend == "milvus":
             try:
                 from rag.milvus_store import MilvusVectorStore
-                c = cfg.vector_store.milvus
+                c = vs_cfg.milvus
+                uri = c.uri if c.mode == "lite" else f"http://{c.host}:{c.port}"
                 store = MilvusVectorStore(
-                    uri=c.uri if c.mode == "lite" else f"http://{c.host}:{c.port}",
+                    uri=uri,
+                    collection=collection_override or "kb_chunks",
+                    vector_size=cfg.llm.embed_dimensions,
                 )
                 await store.initialize()
+                log.info("kb_manager.vector_store_milvus", uri=uri)
                 return store
             except Exception as exc:
                 log.warning("kb_manager.milvus_init_failed", error=str(exc))
-        # 兜底：内存向量存储（已有实现）
-        from rag.knowledge_base import HybridRetriever
+
+        if backend == "chroma":
+            try:
+                from rag.chroma_store import ChromaVectorStore  # type: ignore[import]
+                c = vs_cfg.chroma
+                store = ChromaVectorStore(
+                    path=c.path,
+                    collection=collection_override or "kb_chunks",
+                )
+                await store.initialize()
+                log.info("kb_manager.vector_store_chroma", path=c.path)
+                return store
+            except Exception as exc:
+                log.warning("kb_manager.chroma_init_failed", error=str(exc))
+
+        # ── 最终兜底：内存向量存储 ────────────────────────────────
         log.warning("kb_manager.using_memory_vector_store")
-
-        class _MemVectorStore:
-            """薄包装，使 HybridRetriever 符合 upsert_chunks/hybrid_search 接口。"""
-            def __init__(self):
-                self._chunks: list = []
-                self._embs: list = []
-                from rag.knowledge_base import BM25Index
-                self._bm25 = BM25Index()
-
-            async def upsert_chunks(self, payloads: list[dict]):
-                from rag.knowledge_base import Chunk
-                for p in payloads:
-                    c = Chunk(id=p["chunk_id"], doc_id=p["doc_id"],
-                              text=p["text"], chunk_index=p.get("chunk_index", 0),
-                              metadata=p.get("metadata", {}),
-                              embedding=p.get("embedding", []))
-                    self._chunks.append(c)
-                    self._embs.append(p.get("embedding", []))
-                self._bm25.build(self._chunks)
-
-            async def hybrid_search(self, query_vec, query_text, kb_id, top_k, doc_ids=None):
-                import numpy as np
-                if not self._embs or not query_vec:
-                    return []
-                emb_arr = np.array(self._embs, dtype=float)
-                q_arr = np.array(query_vec, dtype=float)
-                norms = np.linalg.norm(emb_arr, axis=1) * np.linalg.norm(q_arr)
-                norms = np.where(norms == 0, 1e-9, norms)
-                sims = emb_arr.dot(q_arr) / norms
-                idxs = np.argsort(sims)[::-1][:top_k]
-                results = []
-                for i in idxs:
-                    c = self._chunks[i]
-                    if doc_ids and c.doc_id not in doc_ids:
-                        continue
-                    if c.metadata.get("kb_id", kb_id) != kb_id:
-                        continue
-                    results.append((float(sims[i]), {
-                        "chunk_id": c.id, "doc_id": c.doc_id,
-                        "kb_id": kb_id, "text": c.text,
-                        "metadata": c.metadata,
-                    }))
-                return results
-
-            async def delete_by_doc_id(self, doc_id: str):
-                self._chunks = [c for c in self._chunks if c.doc_id != doc_id]
-                self._embs = [e for c, e in zip(self._chunks, self._embs) if c.doc_id != doc_id]
-
-            async def get_stats(self, kb_id):
-                return {"chunk_count": len(self._chunks), "total_chars": 0}
-
         return _MemVectorStore()
 
     @staticmethod
@@ -448,7 +477,6 @@ class KBManager:
 
             class _LLMWrapper:
                 async def rerank(self, query, chunks, top_k):
-                    from rag.pipeline.query import RetrievedChunk
                     from rag.knowledge_base import Chunk
                     mem_chunks = [
                         Chunk(id=c.chunk_id, doc_id=c.doc_id, text=c.text,
@@ -477,3 +505,63 @@ class KBManager:
             except Exception as exc:
                 log.warning("kb_manager.cohere_reranker_failed", error=str(exc))
         return None
+
+
+# ── 内存向量存储兜底（不依赖任何外部服务）────────────────────────────────────
+
+class _MemVectorStore:
+    """内存向量存储，无需外部服务，适合单元测试和小数据集。"""
+
+    def __init__(self):
+        self._chunks: list = []
+        self._embs: list = []
+        from rag.knowledge_base import BM25Index
+        self._bm25 = BM25Index()
+
+    async def initialize(self):
+        pass
+
+    async def upsert_chunks(self, payloads: list[dict]):
+        from rag.knowledge_base import Chunk
+        for p in payloads:
+            c = Chunk(
+                id=p["chunk_id"], doc_id=p["doc_id"],
+                text=p["text"], chunk_index=p.get("chunk_index", 0),
+                metadata=p.get("metadata", {}),
+                embedding=p.get("embedding", []),
+            )
+            self._chunks.append(c)
+            self._embs.append(p.get("embedding", []))
+        self._bm25.build(self._chunks)
+
+    async def hybrid_search(self, query_vec, query_text, kb_id, top_k, doc_ids=None):
+        import numpy as np
+        if not self._embs or not query_vec:
+            return []
+        emb_arr = np.array(self._embs, dtype=float)
+        q_arr = np.array(query_vec, dtype=float)
+        norms = np.linalg.norm(emb_arr, axis=1) * np.linalg.norm(q_arr)
+        norms = np.where(norms == 0, 1e-9, norms)
+        sims = emb_arr.dot(q_arr) / norms
+        idxs = np.argsort(sims)[::-1][:top_k]
+        results = []
+        for i in idxs:
+            c = self._chunks[i]
+            if doc_ids and c.doc_id not in doc_ids:
+                continue
+            if c.metadata.get("kb_id", kb_id) != kb_id:
+                continue
+            results.append((float(sims[i]), {
+                "chunk_id": c.id, "doc_id": c.doc_id,
+                "kb_id": kb_id, "text": c.text,
+                "metadata": c.metadata,
+            }))
+        return results
+
+    async def delete_by_doc_id(self, doc_id: str):
+        keep = [(c, e) for c, e in zip(self._chunks, self._embs) if c.doc_id != doc_id]
+        self._chunks = [x[0] for x in keep]
+        self._embs   = [x[1] for x in keep]
+
+    async def get_stats(self, kb_id):
+        return {"chunk_count": len(self._chunks), "total_chars": 0}

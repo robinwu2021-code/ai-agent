@@ -1,7 +1,38 @@
 # kb_config.yaml — 知识库组件配置
-# 所有 backend 字段均可切换，未填写的字段使用内置默认值
+#
+# 设计原则：
+#   - LLM / Embedding 引擎参数（api_key / base_url / model）统一在 llm.yaml 管理
+#   - 本文件通过 alias 引用 llm.yaml engines 节中的引擎，不重复填写连接参数
+#   - 向量库连接参数也优先使用 llm.yaml vector_store 节，本文件仅做覆盖项
+#
+# 快速切换示例（只改 alias，连接参数不动）：
+#   embed_engine: ollama-embed    → 本地 qwen3-embedding:8b
+#   embed_engine: azure-east      → Azure OpenAI text-embedding-3-small
+#   embed_engine: bge_local       → 本地 BGE-M3（离线，不走 llm.yaml）
+# ─────────────────────────────────────────────────────────────────────
 
 knowledge_base:
+
+  # ── LLM / Embedding 引擎引用 ─────────────────────────────────────
+  # 引擎连接参数（api_key / base_url / model）均在 llm.yaml engines 节定义
+  # 此处仅填写引用的 alias；留空则使用 llm.yaml router 对应任务的默认值
+  llm:
+    embed_engine: ""          # 空 = 使用 llm.yaml router.embed（当前: ollama-embed）
+    summarize_engine: ""      # 空 = 使用 llm.yaml router.summarize（当前: vllm-qwen3）
+    rerank_engine: ""         # 空 = 使用 llm.yaml router.default（当前: vllm-qwen3）
+
+    # Embedding 通用参数（与引擎类型无关）
+    embed_dimensions: 1536    # 须与 embed_engine 的 embedding_model 输出维度一致
+                              # qwen3-embedding:8b → 1536
+                              # text-embedding-v3  → 1024 (dashscope) 或按配置
+                              # text-embedding-3-small → 1536
+    embed_batch_size: 32      # 每次请求批量大小
+
+    # 本地 BGE（仅 embed_engine: bge_local 时生效，不走 llm.yaml）
+    bge_local:
+      model: BAAI/bge-m3
+      device: cpu
+      batch_size: 16
 
   # ── 文档解析 ─────────────────────────────────────────────────────
   parser:
@@ -20,7 +51,7 @@ knowledge_base:
 
   # ── 分块策略 ─────────────────────────────────────────────────────
   chunker:
-    strategy: auto                 # auto | structural | semantic | sentence | fixed
+    strategy: structural                 # auto | structural | semantic | sentence | fixed
     # auto: 有标题→structural，无标题→semantic
     structural:
       min_size: 100
@@ -44,34 +75,18 @@ knowledge_base:
       batch_size: 10
       prompt: "请用1-2句话描述以下片段的主题和关键信息，不要复述原文：\n{chunk_text}"
 
-  # ── Embedding ────────────────────────────────────────────────────
-  embedder:
-    backend: qwen                  # qwen | openai | bge_local
-    qwen:
-      model: text-embedding-v3
-      dimensions: 1024
-      batch_size: 32
-      api_key: ""                  # 留空则读 DASHSCOPE_API_KEY 环境变量
-      base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1"
-    openai:
-      model: text-embedding-3-small
-      dimensions: 1536
-      batch_size: 100
-      api_key: ""
-      base_url: ""
-    bge_local:
-      model: BAAI/bge-m3
-      device: cpu
-      batch_size: 16
-
   # ── 向量存储 ─────────────────────────────────────────────────────
+  # use_global=true 时优先使用 llm.yaml vector_store 节的连接参数
+  # collection 字段可覆盖 llm.yaml 中的 collection 名称
   vector_store:
+    use_global: true               # true = 优先使用 llm.yaml vector_store 配置
+    collection: kb_chunks          # 覆盖 llm.yaml 的 collection（留空则用 llm.yaml 原值）
+    # ── 以下配置仅在 use_global=false 或 llm.yaml 无 vector_store 时生效 ──
     backend: qdrant                # qdrant | milvus | chroma
     qdrant:
       mode: embedded               # embedded | server
       path: ./data/qdrant
       url: http://localhost:6333
-      collection: kb_chunks
     milvus:
       mode: lite                   # lite(本地文件) | standalone(服务器)
       uri: ./data/milvus.db

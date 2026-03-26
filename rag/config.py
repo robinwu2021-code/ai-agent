@@ -1,9 +1,16 @@
 """
 rag/config.py — 知识库可插拔配置系统
 
-支持从 YAML 文件或 dict 加载，所有组件均可通过 backend 字段切换实现。
-默认配置文件：项目根目录 kb_config.yaml
-可通过环境变量 KB_CONFIG_FILE 覆盖路径。
+设计原则：
+  - LLM / Embedding 引擎连接参数（api_key / base_url / model）统一在 llm.yaml 管理
+  - kb_config.yaml 通过 alias 引用 llm.yaml engines，不重复填写连接参数
+  - 向量库连接参数也优先使用 llm.yaml vector_store 节
+  - 本模块只定义 KB 业务逻辑配置（解析策略 / 分块策略 / 检索参数等）
+
+加载顺序：
+  1. 显式传入的 path 参数
+  2. 环境变量 KB_CONFIG_FILE
+  3. 项目根目录 kb_config.yaml
 """
 from __future__ import annotations
 
@@ -87,46 +94,58 @@ class ChunkerConfig:
     )
 
 
-# ── Embedder 配置 ─────────────────────────────────────────────────────────────
+# ── LLM / Embedding 引擎引用配置 ─────────────────────────────────────────────
+#
+# 设计：所有连接参数（api_key / base_url / model）均在 llm.yaml engines 节定义。
+# 此处只存放：
+#   1. 引用的 alias 字符串（空 = 使用 llm.yaml router 对应任务的默认值）
+#   2. 与引擎无关的通用 Embedding 参数（维度、批量大小）
+#   3. 本地 BGE 专项配置（不走 llm.yaml，完全离线推理）
 
 @dataclass
-class EmbedderQwenConfig:
-    model: str = "text-embedding-v3"
-    dimensions: int = 1024
-    batch_size: int = 32
-    api_key: str = ""
-    base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
-
-@dataclass
-class EmbedderOpenAIConfig:
-    model: str = "text-embedding-3-small"
-    dimensions: int = 1536
-    batch_size: int = 100
-    api_key: str = ""
-    base_url: str = ""
-
-@dataclass
-class EmbedderBGELocalConfig:
+class KBLLMBGEConfig:
+    """本地 BGE Embedding（不走 llm.yaml，离线推理）。"""
     model: str = "BAAI/bge-m3"
     device: str = "cpu"
     batch_size: int = 16
 
 @dataclass
-class EmbedderConfig:
-    backend: str = "qwen"               # qwen | openai | bge_local
-    qwen: EmbedderQwenConfig = field(default_factory=EmbedderQwenConfig)
-    openai: EmbedderOpenAIConfig = field(default_factory=EmbedderOpenAIConfig)
-    bge_local: EmbedderBGELocalConfig = field(default_factory=EmbedderBGELocalConfig)
+class KBLLMConfig:
+    """
+    KB 组件使用的 LLM / Embedding 引擎配置。
+
+    通过 alias 字符串引用 llm.yaml engines 节中已定义的引擎实例，
+    无需重复填写 api_key / base_url / model 等连接参数。
+
+    切换示例（仅改 alias，连接参数不动）：
+      embed_engine: ollama-embed    → 本地 qwen3-embedding:8b
+      embed_engine: azure-east      → Azure OpenAI text-embedding-3-small
+      embed_engine: bge_local       → 本地 BGE-M3（离线，不走 llm.yaml）
+      summarize_engine: claude-fast → 云端 Claude Haiku 生成摘要
+    """
+    # ── 引擎 alias（引用 llm.yaml engines 节）────────────────────
+    embed_engine: str = ""       # 空 = 使用 llm.yaml router.embed
+    summarize_engine: str = ""   # 空 = 使用 llm.yaml router.summarize
+    rerank_engine: str = ""      # 空 = 使用 llm.yaml router.default
+
+    # ── Embedding 通用参数（与引擎类型无关）──────────────────────
+    embed_dimensions: int = 1536 # 须与 embedding_model 输出维度一致
+    embed_batch_size: int = 32   # 批量请求大小
+
+    # ── 本地 BGE 专项配置（embed_engine="bge_local" 时生效）──────
+    bge_local: KBLLMBGEConfig = field(default_factory=KBLLMBGEConfig)
 
 
 # ── 向量存储配置 ──────────────────────────────────────────────────────────────
+#
+# use_global=True 时优先使用 llm.yaml vector_store 节的连接参数，
+# 本文件中的 backend / qdrant / milvus / chroma 仅在回退时生效。
 
 @dataclass
 class VectorStoreQdrantConfig:
     mode: str = "embedded"              # embedded | server
     path: str = "./data/qdrant"
     url: str = "http://localhost:6333"
-    collection: str = "kb_chunks"
 
 @dataclass
 class VectorStoreMilvusConfig:
@@ -142,7 +161,9 @@ class VectorStoreChromaConfig:
 
 @dataclass
 class VectorStoreConfig:
-    backend: str = "qdrant"             # qdrant | milvus | chroma
+    use_global: bool = True             # True = 优先使用 llm.yaml vector_store 配置
+    collection: str = "kb_chunks"       # 可覆盖 llm.yaml 中的 collection 名称
+    backend: str = "qdrant"             # use_global=False 时生效: qdrant | milvus | chroma
     qdrant: VectorStoreQdrantConfig = field(default_factory=VectorStoreQdrantConfig)
     milvus: VectorStoreMilvusConfig = field(default_factory=VectorStoreMilvusConfig)
     chroma: VectorStoreChromaConfig = field(default_factory=VectorStoreChromaConfig)
@@ -271,17 +292,17 @@ class PermissionsConfig:
 @dataclass
 class FileStorageConfig:
     base_path: str = "./data/files"
-    keep_versions: int = 10             # 保留最近 N 个版本的原始文件；0=不保留
+    keep_versions: int = 10
 
 @dataclass
 class FileSummaryConfig:
     enabled: bool = True
-    generate_diff: bool = True          # content_updated 时生成差异摘要
+    generate_diff: bool = True
     max_input_chars: int = 3000
 
 @dataclass
 class FileAuditConfig:
-    retention_days: int = 365           # 0 = 永久保留
+    retention_days: int = 365
 
 @dataclass
 class FileManagementConfig:
@@ -295,9 +316,9 @@ class FileManagementConfig:
 
 @dataclass
 class KBConfig:
+    llm: KBLLMConfig = field(default_factory=KBLLMConfig)
     parser: ParserConfig = field(default_factory=ParserConfig)
     chunker: ChunkerConfig = field(default_factory=ChunkerConfig)
-    embedder: EmbedderConfig = field(default_factory=EmbedderConfig)
     vector_store: VectorStoreConfig = field(default_factory=VectorStoreConfig)
     keyword_store: KeywordStoreConfig = field(default_factory=KeywordStoreConfig)
     graph: GraphConfig = field(default_factory=GraphConfig)
