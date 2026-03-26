@@ -2069,6 +2069,96 @@ async def health():
     }
 
 
+# ── LLM 直连测试端点 ───────────────────────────────────────────────
+
+class _LLMTestRequest(BaseModel):
+    message:     str   = Field("你好，请用一句话介绍你自己。", description="发送给大模型的消息")
+    system:      str   = Field("You are a helpful assistant.", description="System prompt")
+    engine_alias: str  = Field("", description="指定引擎 alias（留空则使用 llm.yaml default）")
+    timeout:     float = Field(30.0, description="请求超时秒数")
+
+
+@app.post(
+    "/test/llm",
+    summary="直连默认大模型（OpenAI SDK）",
+    tags=["Test"],
+)
+async def test_llm(req: _LLMTestRequest):
+    """
+    **调试用端点** — 完全绕过 Router/Agent，直接用 openai SDK 调用 llm.yaml 中的引擎。
+
+    - 不经过 LLMRouter / Orchestrator / Skill 任何中间层
+    - 通过 engine_alias 指定引擎，留空则取 llm.yaml router.default
+    - 返回原始响应内容、延迟、所用引擎信息，方便排查连通性问题
+    """
+    import time
+    import pathlib
+    import openai as _openai
+
+    from utils.llm_config import load_from_yaml
+
+    yaml_path = pathlib.Path(__file__).parent / "llm.yaml"
+    configs, router_cfg, _, _ = load_from_yaml(yaml_path)
+
+    # 确定目标 alias
+    target_alias = req.engine_alias.strip() or router_cfg.default or ""
+    cfg_map = {c.alias: c for c in configs}
+
+    if target_alias and target_alias in cfg_map:
+        engine_cfg = cfg_map[target_alias]
+    elif configs:
+        engine_cfg = configs[0]   # 取第一个
+        target_alias = engine_cfg.alias
+    else:
+        raise HTTPException(status_code=503, detail="llm.yaml 中没有可用的引擎配置")
+
+    # 构造 openai 兼容客户端（支持 openai / openai_compatible SDK）
+    api_key   = engine_cfg.api_key   or "placeholder"
+    base_url  = engine_cfg.base_url  or None
+    model     = engine_cfg.model
+
+    client = _openai.AsyncOpenAI(
+        api_key=api_key,
+        base_url=base_url,
+        timeout=req.timeout,
+    )
+
+    t0 = time.perf_counter()
+    try:
+        resp = await client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": req.system},
+                {"role": "user",   "content": req.message},
+            ],
+            max_tokens=512,
+        )
+        elapsed = round(time.perf_counter() - t0, 3)
+        content = resp.choices[0].message.content if resp.choices else ""
+        usage   = {
+            "prompt_tokens":     getattr(resp.usage, "prompt_tokens", None),
+            "completion_tokens": getattr(resp.usage, "completion_tokens", None),
+            "total_tokens":      getattr(resp.usage, "total_tokens", None),
+        } if resp.usage else {}
+        return {
+            "status":       "ok",
+            "engine_alias": target_alias,
+            "model":        model,
+            "base_url":     base_url,
+            "elapsed_sec":  elapsed,
+            "content":      content,
+            "usage":        usage,
+        }
+    except _openai.APIConnectionError as e:
+        raise HTTPException(status_code=502, detail=f"连接失败 [{target_alias}] {base_url}: {e}")
+    except _openai.APITimeoutError:
+        raise HTTPException(status_code=504, detail=f"请求超时 [{target_alias}] timeout={req.timeout}s")
+    except _openai.AuthenticationError as e:
+        raise HTTPException(status_code=401, detail=f"API Key 错误 [{target_alias}]: {e}")
+    except _openai.APIStatusError as e:
+        raise HTTPException(status_code=e.status_code, detail=f"API 错误 [{target_alias}]: {e.message}")
+
+
 # ── 启动入口 ───────────────────────────────────────────────────────
 
 def main():
