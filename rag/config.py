@@ -114,25 +114,29 @@ class KBLLMConfig:
     """
     KB 组件使用的 LLM / Embedding 引擎配置。
 
-    通过 alias 字符串引用 llm.yaml engines 节中已定义的引擎实例，
-    无需重复填写 api_key / base_url / model 等连接参数。
+    alias 直接对应 llm.yaml engines[].alias 字段，所有连接参数
+    （api_key / base_url / model / timeout）均在 llm.yaml 统一管理，
+    此处不重复定义。
 
-    切换示例（仅改 alias，连接参数不动）：
-      embed_engine: ollama-embed    → 本地 qwen3-embedding:8b
-      embed_engine: azure-east      → Azure OpenAI text-embedding-3-small
-      embed_engine: bge_local       → 本地 BGE-M3（离线，不走 llm.yaml）
-      summarize_engine: claude-fast → 云端 Claude Haiku 生成摘要
+    切换引擎只需修改 alias（llm.yaml 连接参数不动）：
+      embed_engine: ollama-embed    → llm.yaml engines[ollama-embed]  本地 qwen3-embedding:8b
+      embed_engine: azure-east      → llm.yaml engines[azure-east]   Azure text-embedding-3-small
+      embed_engine: bge_local       → 本地 BGE-M3（离线推理，不走 llm.yaml）
+      summarize_engine: claude-fast → llm.yaml engines[claude-fast]  云端 Claude Haiku
+
+    留空规则（不推荐）：
+      留空时分别回退到 llm.yaml router.embed / router.summarize / router.default。
     """
-    # ── 引擎 alias（引用 llm.yaml engines 节）────────────────────
-    embed_engine: str = ""       # 空 = 使用 llm.yaml router.embed
-    summarize_engine: str = ""   # 空 = 使用 llm.yaml router.summarize
-    rerank_engine: str = ""      # 空 = 使用 llm.yaml router.default
+    # ── 引擎 alias（直接对应 llm.yaml engines[].alias 字段）──────
+    embed_engine:     str = ""   # 推荐显式填写，如 "ollama-embed"
+    summarize_engine: str = ""   # 推荐显式填写，如 "vllm-qwen3"
+    rerank_engine:    str = ""   # 推荐显式填写，如 "vllm-qwen3"
 
-    # ── Embedding 通用参数（与引擎类型无关）──────────────────────
-    embed_dimensions: int = 1536 # 须与 embedding_model 输出维度一致
-    embed_batch_size: int = 32   # 批量请求大小
+    # ── Embedding 通用参数（须与引擎输出维度及 llm.yaml vector_store.*.vector_size 一致）
+    embed_dimensions: int = 1536 # qwen3-embedding:8b → 1536，text-embedding-3-small → 1536
+    embed_batch_size: int = 32   # 每批次请求数量
 
-    # ── 本地 BGE 专项配置（embed_engine="bge_local" 时生效）──────
+    # ── 本地 BGE 专项配置（embed_engine="bge_local" 时生效，不走 llm.yaml）
     bge_local: KBLLMBGEConfig = field(default_factory=KBLLMBGEConfig)
 
 
