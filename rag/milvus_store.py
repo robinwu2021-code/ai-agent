@@ -126,6 +126,32 @@ class MilvusVectorStore(VectorStoreBase):
         )
 
         if self._client.has_collection(self._collection):
+            # ── 检查现有 collection 的向量维度是否与配置一致 ──────────────
+            try:
+                desc = self._client.describe_collection(self._collection)
+                for field in desc.get("fields", []):
+                    if field.get("name") == "dense_vec":
+                        existing_dim = field.get("params", {}).get("dim", 0)
+                        if existing_dim and existing_dim != self._vector_size:
+                            log.error(
+                                "milvus_store.dim_mismatch",
+                                collection=self._collection,
+                                existing_dim=existing_dim,
+                                config_dim=self._vector_size,
+                                fix=(
+                                    f"维度不匹配！现有 collection dim={existing_dim}，"
+                                    f"当前配置 embed_dimensions={self._vector_size}。"
+                                    f"解决方案：\n"
+                                    f"  1. 将 kb_config.yaml embed_dimensions 改为 {existing_dim}\n"
+                                    f"  2. 或删除 collection 后重建："
+                                    f"client.drop_collection('{self._collection}')"
+                                ),
+                            )
+                            # 自动修正 vector_size 以避免写入报错
+                            self._vector_size = existing_dim
+                        break
+            except Exception:
+                pass
             log.debug("milvus_store.collection_exists",
                       collection=self._collection)
             return
