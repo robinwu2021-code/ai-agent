@@ -83,6 +83,18 @@ class ContextualEnhancementConfig:
     prompt: str = "请用1-2句话描述以下片段的主题和关键信息，不要复述原文：\n{chunk_text}"
 
 @dataclass
+class ChunkSummaryConfig:
+    """
+    分块后 LLM 摘要（原语言）。
+
+    enabled=True 时，ingestion pipeline 对每个 chunk 调用 LLM 生成 1-2 句摘要，
+    摘要向量单独存入 dense_vec_summary，检索时兼顾语义多样性。
+    """
+    enabled: bool = False
+    max_chars: int = 800               # 送给 LLM 的 chunk 最大字符数（超出截断）
+    concurrency: int = 8               # LLM 并发数（避免 429）
+
+@dataclass
 class ChunkerConfig:
     strategy: str = "auto"              # auto | structural | semantic | sentence | fixed
     structural: ChunkerStructuralConfig = field(default_factory=ChunkerStructuralConfig)
@@ -92,6 +104,7 @@ class ChunkerConfig:
     contextual_enhancement: ContextualEnhancementConfig = field(
         default_factory=ContextualEnhancementConfig
     )
+    chunk_summary: ChunkSummaryConfig = field(default_factory=ChunkSummaryConfig)
 
 
 # ── LLM / Embedding 引擎引用配置 ─────────────────────────────────────────────

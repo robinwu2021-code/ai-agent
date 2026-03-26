@@ -74,6 +74,15 @@ knowledge_base:
       batch_size: 10
       prompt: "请用1-2句话描述以下片段的主题和关键信息，不要复述原文：\n{chunk_text}"
 
+    # ── 分块摘要（原语言）────────────────────────────────────────
+    # 开启后对每个 chunk 调用 LLM 生成 1-2 句原语言摘要，
+    # 摘要向量单独存入 Milvus dense_vec_summary 字段，检索时覆盖更多语义角度。
+    # ⚠ 首次启用前须删除旧 collection（新 schema 含 dense_vec_summary + summary 字段）
+    chunk_summary:
+      enabled: false               # true = 开启（会增加 LLM 调用次数）
+      max_chars: 800               # 送入 LLM 的 chunk 最大字符数（超出截断）
+      concurrency: 8               # LLM 并发调用数（避免触发 429 限流）
+
   # ── 向量存储 ─────────────────────────────────────────────────────
   # use_global=true 时优先使用 llm.yaml vector_store 节的连接参数
   # collection 字段可覆盖 llm.yaml 中的 collection 名称

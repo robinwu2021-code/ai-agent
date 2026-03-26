@@ -2,13 +2,15 @@
 rag/pipeline/ingestion.py — 文档写入流水线
 
 流程：
-  解析 → 分块 → Embedding → 并发写入（向量库 + 关键词库 + 图谱）
-  → LLM 摘要生成 → 回调 KBFileManager 更新版本记录
+  解析 → 分块 → [可选] 分块摘要（原语言）→ Embedding（内容 + 摘要）
+  → 并发写入（向量库 + 关键词库 + 图谱）
+  → LLM 文档摘要生成 → 回调 KBFileManager 更新版本记录
 
 设计原则：
   - 解析/Embedding 串行（避免 OOM）
+  - 分块摘要并发生成（asyncio.Semaphore 控制并发数）
   - 三个写入存储并发（asyncio.gather）
-  - 摘要生成与写入并发（不阻塞入库）
+  - 文档摘要生成与写入并发（不阻塞入库）
   - 任何步骤失败记录 error 但不崩溃整个流水线
 """
 from __future__ import annotations
@@ -65,6 +67,9 @@ class IngestionPipeline:
         summary_enabled: bool = True,
         summary_max_chars: int = 3000,
         generate_diff_summary: bool = True,
+        chunk_summary_enabled: bool = False,
+        chunk_summary_max_chars: int = 800,
+        chunk_summary_concurrency: int = 8,
     ) -> None:
         self._parser = parser
         self._chunker = chunker
@@ -77,6 +82,9 @@ class IngestionPipeline:
         self._summary_enabled = summary_enabled
         self._summary_max_chars = summary_max_chars
         self._generate_diff = generate_diff_summary
+        self._chunk_summary_enabled = chunk_summary_enabled
+        self._chunk_summary_max_chars = chunk_summary_max_chars
+        self._chunk_summary_concurrency = chunk_summary_concurrency
 
     async def ingest(
         self,
@@ -118,9 +126,30 @@ class IngestionPipeline:
             total = len(chunks)
             log.info("ingestion.chunks_ready", file_id=file_id, count=total)
 
-            # ③ Embedding（串行，避免内存爆炸）
+            # ③ 分块摘要（可选，原语言，LLM 并发生成）
+            if self._chunk_summary_enabled and self._llm_fn:
+                log.info("ingestion.chunk_summary_start",
+                         file_id=file_id, count=total)
+                chunks = await self._gen_chunk_summaries(chunks)
+                log.info("ingestion.chunk_summary_done", file_id=file_id)
+
+            # ④ Embedding（串行，避免内存爆炸）
+            #    内容向量 + 摘要向量（有摘要时）一次性批量 embed
             texts = [c.text for c in chunks]
             embeddings = await self._embedder.embed_batch(texts)
+
+            # 摘要向量（仅有摘要的 chunk 单独 embed）
+            summary_embeddings: list[list[float]] = [[] for _ in chunks]
+            if self._chunk_summary_enabled:
+                summary_texts = [c.summary if c.summary else "" for c in chunks]
+                has_summaries = any(summary_texts)
+                if has_summaries:
+                    # 只 embed 非空摘要，其余复用内容向量（在 payload 构建时处理）
+                    nonempty_idx = [i for i, s in enumerate(summary_texts) if s]
+                    nonempty_texts = [summary_texts[i] for i in nonempty_idx]
+                    nonempty_embs = await self._embedder.embed_batch(nonempty_texts)
+                    for idx, emb in zip(nonempty_idx, nonempty_embs):
+                        summary_embeddings[idx] = emb
 
             # 进度回调
             if on_progress:
@@ -129,19 +158,21 @@ class IngestionPipeline:
                 except Exception:
                     pass
 
-            # ④ 构建写入 payload
+            # ⑤ 构建写入 payload
             now = time.time()
             chunk_payloads = [
                 {
-                    "chunk_id":    c.metadata.get("chunk_id", uuid.uuid4().hex),
-                    "doc_id":      doc_id,
-                    "kb_id":       kb_id,
-                    "file_id":     file_id,
-                    "chunk_index": c.chunk_index,
-                    "text":        c.text,
-                    "embedding":   embeddings[i] if i < len(embeddings) else [],
-                    "heading_path": c.heading_path,
-                    "metadata":    {
+                    "chunk_id":         c.metadata.get("chunk_id", uuid.uuid4().hex),
+                    "doc_id":           doc_id,
+                    "kb_id":            kb_id,
+                    "file_id":          file_id,
+                    "chunk_index":      c.chunk_index,
+                    "text":             c.text,
+                    "summary":          c.summary,
+                    "embedding":        embeddings[i] if i < len(embeddings) else [],
+                    "summary_embedding": summary_embeddings[i] if summary_embeddings[i] else [],
+                    "heading_path":     c.heading_path,
+                    "metadata":         {
                         **c.metadata,
                         "source":   parsed.source,
                         "format":   parsed.format,
@@ -163,7 +194,7 @@ class IngestionPipeline:
                         f"{doc_id}_{p['chunk_index']}".encode()
                     ).hexdigest()
 
-            # ⑤ 并发写入三个存储
+            # ⑥ 并发写入三个存储
             write_tasks = [
                 self._vector_store.upsert_chunks(chunk_payloads),
                 self._keyword_store.index_chunks(chunk_payloads, kb_id),
@@ -185,7 +216,7 @@ class IngestionPipeline:
             result.chunk_count = total
             result.token_count = token_count
 
-            # ⑥ LLM 摘要生成（与主流程并发，不阻塞）
+            # ⑦ LLM 文档摘要生成（与主流程并发，不阻塞）
             summary = ""
             diff_summary = ""
             if self._llm_fn and self._summary_enabled:
@@ -196,7 +227,7 @@ class IngestionPipeline:
                 )
             result.summary = summary
 
-            # ⑦ 回调文件管理器更新版本记录
+            # ⑧ 回调文件管理器更新版本记录
             elapsed_ms = int((time.time() - started) * 1000)
             result.indexing_duration_ms = elapsed_ms
             if self._file_manager:
@@ -238,6 +269,37 @@ class IngestionPipeline:
         log.info("ingestion.doc_deleted", doc_id=doc_id, kb_id=kb_id)
 
     # ── LLM 摘要 ──────────────────────────────────────────────────────
+
+    async def _gen_chunk_summaries(self, chunks: list) -> list:
+        """
+        对每个 chunk 调用 LLM 生成原语言摘要（1-2句）。
+
+        设计要点：
+          - asyncio.Semaphore 限制并发，避免触发 429
+          - 任何 chunk 摘要失败只影响该 chunk（summary 置为空字符串）
+          - LLM 提示语言无关（模型自动识别原语言并输出同语言摘要）
+        """
+        sem = asyncio.Semaphore(self._chunk_summary_concurrency)
+
+        async def _summarize_one(chunk) -> str:
+            async with sem:
+                try:
+                    return await self._llm_fn(
+                        system=(
+                            "请用1-2句话概括以下文本的核心内容，"
+                            "使用与原文相同的语言，不要复述原文，不要加解释。"
+                        ),
+                        user=chunk.text[:self._chunk_summary_max_chars],
+                    )
+                except Exception as exc:
+                    log.warning("ingestion.chunk_summary_failed",
+                                chunk_index=chunk.chunk_index, error=str(exc))
+                    return ""
+
+        summaries = await asyncio.gather(*[_summarize_one(c) for c in chunks])
+        for c, s in zip(chunks, summaries):
+            c.summary = s
+        return chunks
 
     async def _gen_summary(self, content: str) -> str:
         try:

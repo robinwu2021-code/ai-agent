@@ -23,15 +23,17 @@ Milvus 相比 Qdrant 的核心升级：
     pip install "pymilvus[model]>=2.4.0"
 
 Collection Schema：
-  chunk_id    VARCHAR(128)  PRIMARY KEY
-  doc_id      VARCHAR(128)  [scalar index]
-  kb_id       VARCHAR(64)   [scalar index]
-  chunk_index INT32
-  text        VARCHAR(65535) [enable_analyzer=True → BM25 → sparse_vec]
-  dense_vec   FLOAT_VECTOR(dim)     [HNSW index]
-  sparse_vec  SPARSE_FLOAT_VECTOR   [SPARSE_INVERTED_INDEX, auto by BM25]
-  created_at  DOUBLE
-  meta_json   VARCHAR(8192)
+  chunk_id          VARCHAR(128)  PRIMARY KEY
+  doc_id            VARCHAR(128)  [scalar index]
+  kb_id             VARCHAR(64)   [scalar index]
+  chunk_index       INT32
+  text              VARCHAR(65535) [enable_analyzer=True → BM25 → sparse_vec]
+  summary           VARCHAR(4096)  原语言摘要（空字符串表示无摘要）
+  dense_vec         FLOAT_VECTOR(dim)     [HNSW index]  内容向量
+  dense_vec_summary FLOAT_VECTOR(dim)     [HNSW index]  摘要向量（无摘要时等于 dense_vec）
+  sparse_vec        SPARSE_FLOAT_VECTOR   [SPARSE_INVERTED_INDEX, auto by BM25]
+  created_at        DOUBLE
+  meta_json         VARCHAR(8192)
 """
 from __future__ import annotations
 
@@ -47,6 +49,9 @@ from rag.vector_store_base import VectorStoreBase
 log = structlog.get_logger(__name__)
 
 _COLLECTION = "kb_chunks"
+
+# 新 schema 特征字段：用于检测现有 collection 是否需要迁移
+_SCHEMA_MARKER = "dense_vec_summary"
 
 # ---------------------------------------------------------------------------
 # MilvusVectorStore
@@ -77,16 +82,17 @@ class MilvusVectorStore(VectorStoreBase):
         m:                int  = 16,
         ef_construction:  int  = 200,
     ) -> None:
-        self._uri             = uri
-        self._token           = token
-        self._collection      = collection
-        self._vector_size     = vector_size
-        self._index_type      = index_type
-        self._m               = m
-        self._ef_construction = ef_construction
-        self._client: Any     = None
-        self._initialized     = False
-        self._lock            = asyncio.Lock()
+        self._uri              = uri
+        self._token            = token
+        self._collection       = collection
+        self._vector_size      = vector_size
+        self._index_type       = index_type
+        self._m                = m
+        self._ef_construction  = ef_construction
+        self._client: Any      = None
+        self._initialized      = False
+        self._lock             = asyncio.Lock()
+        self._has_summary_field: bool = True  # 新建 collection 默认有摘要字段
 
     # ------------------------------------------------------------------ #
     # initialize                                                           #
@@ -126,12 +132,32 @@ class MilvusVectorStore(VectorStoreBase):
         )
 
         if self._client.has_collection(self._collection):
-            # ── 检查现有 collection 的向量维度是否与配置一致 ──────────────
+            # ── 检查现有 collection 的 schema 和向量维度 ────────────────
             try:
                 desc = self._client.describe_collection(self._collection)
-                for field in desc.get("fields", []):
-                    if field.get("name") == "dense_vec":
-                        existing_dim = field.get("params", {}).get("dim", 0)
+                field_names = {f.get("name") for f in desc.get("fields", [])}
+
+                # 检查是否缺少新 schema 标记字段（旧版本 collection）
+                if _SCHEMA_MARKER not in field_names:
+                    log.warning(
+                        "milvus_store.schema_outdated",
+                        collection=self._collection,
+                        missing_field=_SCHEMA_MARKER,
+                        hint=(
+                            f"现有 collection 缺少 '{_SCHEMA_MARKER}' 字段（旧版 schema）。"
+                            f"摘要向量功能将降级为只存储内容向量。"
+                            f"如需启用摘要向量，请删除并重建 collection："
+                            f" client.drop_collection('{self._collection}')"
+                        ),
+                    )
+                    self._has_summary_field = False
+                else:
+                    self._has_summary_field = True
+
+                # 检查向量维度一致性
+                for f in desc.get("fields", []):
+                    if f.get("name") == "dense_vec":
+                        existing_dim = f.get("params", {}).get("dim", 0)
                         if existing_dim and existing_dim != self._vector_size:
                             log.error(
                                 "milvus_store.dim_mismatch",
@@ -151,9 +177,10 @@ class MilvusVectorStore(VectorStoreBase):
                             self._vector_size = existing_dim
                         break
             except Exception:
-                pass
+                self._has_summary_field = True  # 假设新版，出错时不影响写入
             log.debug("milvus_store.collection_exists",
-                      collection=self._collection)
+                      collection=self._collection,
+                      has_summary_field=self._has_summary_field)
             return
 
         # ── Schema ────────────────────────────────────────────────────
@@ -190,8 +217,14 @@ class MilvusVectorStore(VectorStoreBase):
             )
             log.info("milvus_store.analyzer", type="standard_fallback")
 
-        # Dense vector field
+        # Summary text field (原语言摘要；无摘要时存空字符串)
+        schema.add_field("summary", DataType.VARCHAR, max_length=4096)
+
+        # Dense vector fields
         schema.add_field("dense_vec", DataType.FLOAT_VECTOR,
+                         dim=self._vector_size)
+        # Summary dense vector: 无摘要时等于 dense_vec（内容向量）
+        schema.add_field("dense_vec_summary", DataType.FLOAT_VECTOR,
                          dim=self._vector_size)
 
         # Sparse vector field — populated automatically by BM25 Function
@@ -209,20 +242,21 @@ class MilvusVectorStore(VectorStoreBase):
         # ── Index params ──────────────────────────────────────────────
         index_params = self._client.prepare_index_params()
 
-        # Dense vector: HNSW or DISKANN
-        if self._index_type == "DISKANN":
-            index_params.add_index(
-                field_name="dense_vec",
-                index_type="DISKANN",
-                metric_type="COSINE",
-            )
-        else:
-            index_params.add_index(
-                field_name="dense_vec",
-                index_type="HNSW",
-                metric_type="COSINE",
-                params={"M": self._m, "efConstruction": self._ef_construction},
-            )
+        # Dense vectors: HNSW or DISKANN (content + summary)
+        for vec_field in ("dense_vec", "dense_vec_summary"):
+            if self._index_type == "DISKANN":
+                index_params.add_index(
+                    field_name=vec_field,
+                    index_type="DISKANN",
+                    metric_type="COSINE",
+                )
+            else:
+                index_params.add_index(
+                    field_name=vec_field,
+                    index_type="HNSW",
+                    metric_type="COSINE",
+                    params={"M": self._m, "efConstruction": self._ef_construction},
+                )
 
         # Sparse vector: SPARSE_INVERTED_INDEX + BM25 metric
         index_params.add_index(
@@ -268,17 +302,26 @@ class MilvusVectorStore(VectorStoreBase):
                             chunk_id=c.get("chunk_id"))
                 continue
             meta = c.get("meta") or {}
-            rows.append({
-                "chunk_id":    c["chunk_id"],
-                "doc_id":      c["doc_id"],
-                "kb_id":       c["kb_id"],
-                "chunk_index": int(c.get("chunk_index", 0)),
-                "text":        c.get("text", ""),
-                "dense_vec":   list(embedding),
+
+            # 摘要向量：有摘要时用 summary_embedding，否则复用内容向量
+            summary_emb = c.get("summary_embedding") or embedding
+
+            row: dict = {
+                "chunk_id":          c["chunk_id"],
+                "doc_id":            c["doc_id"],
+                "kb_id":             c["kb_id"],
+                "chunk_index":       int(c.get("chunk_index", 0)),
+                "text":              c.get("text", ""),
+                "summary":           c.get("summary", ""),
+                "dense_vec":         list(embedding),
                 # sparse_vec is NOT provided — Milvus generates it via BM25 Function
-                "created_at":  float(c.get("created_at", time.time())),
-                "meta_json":   json.dumps(meta, ensure_ascii=False)[:8192],
-            })
+                "created_at":        float(c.get("created_at", time.time())),
+                "meta_json":         json.dumps(meta, ensure_ascii=False)[:8192],
+            }
+            # 写入摘要向量（仅新版 schema 有该字段）
+            if self._has_summary_field:
+                row["dense_vec_summary"] = list(summary_emb)
+            rows.append(row)
 
         if not rows:
             return
@@ -322,7 +365,7 @@ class MilvusVectorStore(VectorStoreBase):
             expr    = f'({expr}) and doc_id in {ids_lit}'
         candidates = top_k * 3
         out_fields = ["chunk_id", "doc_id", "kb_id",
-                      "chunk_index", "text", "meta_json", "created_at"]
+                      "chunk_index", "text", "summary", "meta_json", "created_at"]
 
         # Dense search request
         dense_req = AnnSearchRequest(
@@ -373,7 +416,7 @@ class MilvusVectorStore(VectorStoreBase):
         top_k:     int = 10,
     ) -> list[tuple[float, dict]]:
         out_fields = ["chunk_id", "doc_id", "kb_id",
-                      "chunk_index", "text", "meta_json", "created_at"]
+                      "chunk_index", "text", "summary", "meta_json", "created_at"]
         results = await asyncio.to_thread(
             self._client.search,
             collection_name=self._collection,
@@ -439,7 +482,7 @@ class MilvusVectorStore(VectorStoreBase):
             collection_name=self._collection,
             filter=f'doc_id == "{doc_id}"',
             output_fields=["chunk_id", "doc_id", "kb_id",
-                           "chunk_index", "text", "meta_json", "created_at"],
+                           "chunk_index", "text", "summary", "meta_json", "created_at"],
             limit=10000,
         )
         payloads = [self._row_to_payload(r) for r in rows]
@@ -453,7 +496,7 @@ class MilvusVectorStore(VectorStoreBase):
             collection_name=self._collection,
             filter=f'kb_id == "{kb_id}"',
             output_fields=["chunk_id", "doc_id", "kb_id",
-                           "chunk_index", "text", "meta_json", "created_at"],
+                           "chunk_index", "text", "summary", "meta_json", "created_at"],
             limit=limit,
         )
         return [self._row_to_payload(r) for r in rows]
@@ -554,6 +597,7 @@ class MilvusVectorStore(VectorStoreBase):
             "kb_id":       _get("kb_id", ""),
             "chunk_index": int(_get("chunk_index", 0)),
             "text":        _get("text", ""),
+            "summary":     _get("summary", ""),
             "meta":        meta,
             "created_at":  float(_get("created_at", 0.0)),
         }

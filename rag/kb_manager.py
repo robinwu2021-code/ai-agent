@@ -135,6 +135,7 @@ class KBManager:
 
         # ── 流水线组装 ─────────────────────────────────────────────
         s = cfg.file_management.summary
+        cs = cfg.chunker.chunk_summary
         ingestion = IngestionPipeline(
             parser=parser,
             chunker=chunker,
@@ -147,6 +148,9 @@ class KBManager:
             summary_enabled=s.enabled,
             summary_max_chars=s.max_input_chars,
             generate_diff_summary=s.generate_diff,
+            chunk_summary_enabled=cs.enabled,
+            chunk_summary_max_chars=cs.max_chars,
+            chunk_summary_concurrency=cs.concurrency,
         )
 
         r = cfg.retrieval

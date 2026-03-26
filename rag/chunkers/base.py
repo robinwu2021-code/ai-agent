@@ -16,6 +16,7 @@ class Chunk:
     source: str
     heading_path: str = ""              # 所属标题面包屑，如 "第一章 > 背景"
     metadata: dict = field(default_factory=dict)
+    summary: str = ""                   # 原语言摘要（由 IngestionPipeline 生成，可选）
 
 
 @runtime_checkable
