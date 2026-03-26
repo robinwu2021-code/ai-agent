@@ -10,6 +10,19 @@
 
 engines:
 
+  # ── MiniMax M2.5（默认主力引擎，OpenAI 兼容接口）────────────────
+  - alias: minimax
+    sdk: openai_compatible
+    api_key: ${MINIMAX_API_KEY}
+    base_url: https://api.scnet.cn/api/llm/v1
+    model: MiniMax-M2.5
+    max_tokens: 8192
+    timeout_sec: 120.0
+    cost_tier: 2
+    supports_tools: true
+    supports_embed: false
+    tags: [primary, cloud, minimax]
+
   # ── Anthropic Claude（主账号，旗舰模型）─────────────────────────
   - alias: claude-smart
     sdk: anthropic
@@ -119,21 +132,21 @@ engines:
 
 router:
   # 所有未覆盖任务类型的回落引擎
-  default: vllm-qwen3
+  default: minimax
 
   # ── 按任务类型路由（留空则回落 default）──────────────────────
-  chat: vllm-qwen3            # 主推理对话（ReAct 循环）
-  plan: vllm-qwen3            # Plan-Execute 规划阶段
-  summarize: vllm-qwen3       # 文本摘要/上下文裁剪
-  consolidate: vllm-qwen3     # 记忆固化提炼
-  embed: ollama-embed         # 向量化 → 本地 qwen3-embedding:8b（离线可用，0成本）
-  # embed: azure-east         # 若需 OpenAI embedding 取消注释并注释上行
-  # eval: vllm-qwen3          # LLM-as-judge 打分
-  # route: vllm-qwen3         # Multi-Agent 路由决策
+  chat:        minimax         # 主推理对话（ReAct 循环）
+  plan:        minimax         # Plan-Execute 规划阶段
+  summarize:   minimax         # 文本摘要/上下文裁剪
+  consolidate: minimax         # 记忆固化提炼
+  embed:       ollama-embed    # 向量化 → 本地 qwen3-embedding:8b（离线可用，0成本）
+  # eval:      minimax         # LLM-as-judge 打分
+  # route:     minimax         # Multi-Agent 路由决策
 
   # ── Fallback 链（主引擎失败后按序尝试）──────────────────────
   fallback:
-    - vllm-qwen3
+    - vllm-qwen3               # 本地 vLLM 作为兜底（无网络时仍可用）
+    - ollama-qwen3             # 最终兜底（本地 Ollama）
     # - deepseek-chat
     # - groq-fast
 
@@ -203,10 +216,11 @@ memory:
     backend: mem0                   # mem0 | milvus | qdrant | zep | in_memory
 
     # ── LLM 引擎：引用 engines 节 alias，无需重复配置 ──────────
-    llm_engine:   vllm-qwen3        # 用于 mem0 内部记忆提取/去重判断
+    llm_engine:   minimax           # 用于 mem0 内部记忆提取/去重判断
     embed_engine: ollama-embed      # 用于向量化存储与语义检索
 
     # ── 切换示例（取消注释即生效）─────────────────────────────
+    # llm_engine: vllm-qwen3        # 改为本地 vLLM
     # llm_engine: ollama-qwen3      # 改为本地 Ollama
     # llm_engine: claude-fast       # 改为云端 Claude Haiku（质量更高）
     # llm_engine: claude-smart      # 改为旗舰模型（成本高，质量最好）
@@ -227,8 +241,8 @@ memory:
 
   # ── 工作记忆（Context 组装）────────────────────────────────
   working:
-    # 历史压缩使用本地 vLLM 引擎
-    summarize_engine: vllm-qwen3    # 空字符串 → 使用 router.summarize 默认路由
+    summarize_engine: minimax       # 空字符串 → 使用 router.summarize 默认路由
+    # summarize_engine: vllm-qwen3  # 切换到本地 vLLM
     # summarize_engine: ollama-qwen3   # 切换回 Ollama
     # summarize_engine: claude-fast    # 切换到云端 Claude
 
@@ -238,8 +252,8 @@ memory:
 
   # ── 记忆固化（Consolidation）────────────────────────────────
   consolidation:
-    # 固化提取使用本地 vLLM 引擎
-    engine: vllm-qwen3              # 空字符串 → 使用 router.consolidate 默认路由
+    engine: minimax                 # 空字符串 → 使用 router.consolidate 默认路由
+    # engine: vllm-qwen3            # 切换到本地 vLLM
     # engine: ollama-qwen3          # 切换到本地 Ollama
     # engine: claude-fast           # 切换到云端 Claude
 

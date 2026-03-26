@@ -18,9 +18,9 @@ knowledge_base:
   # 连接参数（api_key / base_url / model / timeout）全部在 llm.yaml 中管理
   llm:
     # ▼ 直接引用 llm.yaml engines 中已定义的 alias ▼
-    embed_engine:     ollama-embed   # llm.yaml engines[ollama-embed]  → qwen3-embedding:8b @ 192.168.0.222:11434
-    summarize_engine: vllm-qwen3    # llm.yaml engines[vllm-qwen3]    → Qwen3.5-35B @ 192.168.0.222:8003
-    rerank_engine:    vllm-qwen3    # llm.yaml engines[vllm-qwen3]    → 同上
+    embed_engine:     ollama-embed  # llm.yaml engines[ollama-embed]  → qwen3-embedding:8b @ 192.168.0.222:11434
+    summarize_engine: minimax       # llm.yaml engines[minimax]       → MiniMax-M2.5 @ api.scnet.cn
+    rerank_engine:    minimax       # llm.yaml engines[minimax]       → 同上
 
     # Embedding 维度 — 须与 embed_engine 的 embedding_model 输出维度一致
     # 同时须与 llm.yaml vector_store.milvus.vector_size 保持一致（当前均为 1536）
