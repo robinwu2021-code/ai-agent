@@ -238,7 +238,12 @@ def _build_container(engine_alias: str | None = None):
     for cfg in configs:
         try:
             engine = cfg.build_engine()
-            registry.register(cfg.alias, engine, cost_tier=cfg.cost_tier)
+            registry.register(
+                cfg.alias,
+                engine,
+                cost_tier=cfg.cost_tier,
+                supports_embed=cfg.supports_embed,
+            )
             loaded_aliases.append(cfg.alias)
             log.info("server.engine_loaded", alias=cfg.alias, model=cfg.model)
         except Exception as exc:
@@ -261,11 +266,17 @@ def _build_container(engine_alias: str | None = None):
     fallback = [a for a in (router_cfg.fallback or []) if a in loaded_aliases]
 
     task_router = TaskRouter(
-        default     = default_alias,
-        chat        = _resolve(router_cfg.chat),
-        summarize   = _resolve(router_cfg.summarize),
-        consolidate = _resolve(router_cfg.consolidate),
-        fallback    = fallback,
+        default        = default_alias,
+        chat           = _resolve(router_cfg.chat),
+        plan           = _resolve(router_cfg.plan),
+        summarize      = _resolve(router_cfg.summarize),
+        consolidate    = _resolve(router_cfg.consolidate),
+        embed          = _resolve(router_cfg.embed),
+        rerank         = _resolve(router_cfg.rerank),
+        eval           = _resolve(router_cfg.eval),
+        route          = _resolve(router_cfg.route),
+        node_overrides = router_cfg.node_overrides,
+        fallback       = fallback,
     )
     llm_router = LLMRouter(registry=registry, task_router=task_router)
 
@@ -2023,13 +2034,24 @@ async def _startup():
     """
     FastAPI startup hook — finish PKB index recovery once the event loop is live.
     _container is set in main() before uvicorn starts, so it is available here.
+
+    所有外部连接（Milvus / Qdrant）均设 15 秒超时，避免服务因后端不可达而卡死。
+    连接失败时 KB 功能降级为不可用，其余 API 正常启动。
     """
+    import asyncio as _asyncio
+
     if _container is not None:
         pkb = getattr(_container, "knowledge_base", None)
         if pkb and hasattr(pkb, "initialize"):
             try:
-                await pkb.initialize()
+                await _asyncio.wait_for(pkb.initialize(), timeout=15.0)
                 log.info("server.pkb_initialized")
+            except _asyncio.TimeoutError:
+                log.warning(
+                    "server.pkb_init_timeout",
+                    timeout_sec=15,
+                    hint="Milvus/Qdrant 连接超时，KB 向量检索功能暂不可用，其余 API 正常服务",
+                )
             except Exception as exc:
                 log.warning("server.pkb_startup_init_failed", error=str(exc))
 

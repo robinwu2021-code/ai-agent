@@ -124,6 +124,10 @@ class MilvusVectorStore(VectorStoreBase):
         kw: dict = {"uri": self._uri}
         if self._token:
             kw["token"] = self._token
+        # timeout 仅对 Standalone 模式的 gRPC 连接生效；
+        # Milvus Lite（.db 文件）忽略此参数。
+        if not self._uri.endswith(".db"):
+            kw["timeout"] = 10.0  # 秒：连接超时，防止服务不可达时无限挂起
         self._client = MilvusClient(**kw)
         self._ensure_collection()
 
