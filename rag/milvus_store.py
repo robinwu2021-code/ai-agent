@@ -81,6 +81,7 @@ class MilvusVectorStore(VectorStoreBase):
         index_type:       str  = "HNSW",
         m:                int  = 16,
         ef_construction:  int  = 200,
+        summary_enabled:  bool = True,
     ) -> None:
         self._uri              = uri
         self._token            = token
@@ -89,6 +90,7 @@ class MilvusVectorStore(VectorStoreBase):
         self._index_type       = index_type
         self._m                = m
         self._ef_construction  = ef_construction
+        self._summary_enabled: bool = summary_enabled
         self._client: Any      = None
         self._initialized      = False
         self._lock             = asyncio.Lock()
@@ -218,14 +220,16 @@ class MilvusVectorStore(VectorStoreBase):
             log.info("milvus_store.analyzer", type="standard_fallback")
 
         # Summary text field (原语言摘要；无摘要时存空字符串)
-        schema.add_field("summary", DataType.VARCHAR, max_length=4096)
+        if self._summary_enabled:
+            schema.add_field("summary", DataType.VARCHAR, max_length=4096)
 
         # Dense vector fields
         schema.add_field("dense_vec", DataType.FLOAT_VECTOR,
                          dim=self._vector_size)
         # Summary dense vector: 无摘要时等于 dense_vec（内容向量）
-        schema.add_field("dense_vec_summary", DataType.FLOAT_VECTOR,
-                         dim=self._vector_size)
+        if self._summary_enabled:
+            schema.add_field("dense_vec_summary", DataType.FLOAT_VECTOR,
+                             dim=self._vector_size)
 
         # Sparse vector field — populated automatically by BM25 Function
         schema.add_field("sparse_vec", DataType.SPARSE_FLOAT_VECTOR)
@@ -242,8 +246,11 @@ class MilvusVectorStore(VectorStoreBase):
         # ── Index params ──────────────────────────────────────────────
         index_params = self._client.prepare_index_params()
 
-        # Dense vectors: HNSW or DISKANN (content + summary)
-        for vec_field in ("dense_vec", "dense_vec_summary"):
+        # Dense vectors: HNSW or DISKANN (content + optional summary)
+        dense_vec_fields = ["dense_vec"]
+        if self._summary_enabled:
+            dense_vec_fields.append("dense_vec_summary")
+        for vec_field in dense_vec_fields:
             if self._index_type == "DISKANN":
                 index_params.add_index(
                     field_name=vec_field,
@@ -301,25 +308,26 @@ class MilvusVectorStore(VectorStoreBase):
                 log.warning("milvus_store.upsert_skip_no_embedding",
                             chunk_id=c.get("chunk_id"))
                 continue
-            meta = c.get("meta") or {}
+            meta = c.get("metadata") or c.get("meta") or {}
 
             # 摘要向量：有摘要时用 summary_embedding，否则复用内容向量
             summary_emb = c.get("summary_embedding") or embedding
 
             row: dict = {
-                "chunk_id":          c["chunk_id"],
-                "doc_id":            c["doc_id"],
-                "kb_id":             c["kb_id"],
-                "chunk_index":       int(c.get("chunk_index", 0)),
-                "text":              c.get("text", ""),
-                "summary":           c.get("summary", ""),
-                "dense_vec":         list(embedding),
+                "chunk_id":    c["chunk_id"],
+                "doc_id":      c["doc_id"],
+                "kb_id":       c["kb_id"],
+                "chunk_index": int(c.get("chunk_index", 0)),
+                "text":        c.get("text", ""),
+                "dense_vec":   list(embedding),
                 # sparse_vec is NOT provided — Milvus generates it via BM25 Function
-                "created_at":        float(c.get("created_at", time.time())),
-                "meta_json":         json.dumps(meta, ensure_ascii=False)[:8192],
+                "created_at":  float(c.get("created_at", time.time())),
+                "meta_json":   json.dumps(meta, ensure_ascii=False)[:8192],
             }
-            # 写入摘要向量（仅新版 schema 有该字段）
-            if self._has_summary_field:
+            # summary / dense_vec_summary 只在 schema 含对应字段时写入，
+            # 避免 enable_dynamic_field=False 时 Milvus 拒绝多余字段
+            if self._has_summary_field and self._summary_enabled:
+                row["summary"]           = c.get("summary", "")
                 row["dense_vec_summary"] = list(summary_emb)
             rows.append(row)
 
@@ -342,12 +350,13 @@ class MilvusVectorStore(VectorStoreBase):
 
     async def hybrid_search(
         self,
-        query_vec:  list[float],
-        query_text: str,
-        kb_id:      str,
-        top_k:      int = 5,
-        rrf_k:      int = 60,
-        doc_ids:    list[str] | None = None,
+        query_vec:   list[float],
+        query_text:  str,
+        kb_id:       str,
+        top_k:       int = 5,
+        rrf_k:       int = 60,
+        doc_ids:     list[str] | None = None,
+        use_summary: bool = False,
     ) -> list[tuple[float, dict]]:
         """
         原生混合检索：
@@ -389,10 +398,25 @@ class MilvusVectorStore(VectorStoreBase):
             expr=expr,
         )
 
+        if use_summary and self._has_summary_field:
+            summary_req = AnnSearchRequest(
+                data=[list(query_vec)],
+                anns_field="dense_vec_summary",
+                param={
+                    "metric_type": "COSINE",
+                    "params": {"ef": max(candidates, 64)},
+                },
+                limit=candidates,
+                expr=expr,
+            )
+            reqs = [dense_req, sparse_req, summary_req]
+        else:
+            reqs = [dense_req, sparse_req]
+
         results = await asyncio.to_thread(
             self._client.hybrid_search,
             collection_name=self._collection,
-            reqs=[dense_req, sparse_req],
+            reqs=reqs,
             ranker=RRFRanker(k=rrf_k),
             limit=top_k,
             output_fields=out_fields,

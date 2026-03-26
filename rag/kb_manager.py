@@ -172,6 +172,7 @@ class KBManager:
             },
             enable_graph=r.enable_graph_retrieval,
             final_top_k=cfg.reranker.top_n,
+            use_summary_search=cs.enabled,   # 摘要检索与分块摘要开关保持一致
         )
 
         log.info(
@@ -373,6 +374,9 @@ class KBManager:
                             llm_vs_cfg.qdrant_collection = collection_override
                     store = llm_vs_cfg.build()
                     if store is not None:
+                        # Propagate chunk_summary config to vector store
+                        if hasattr(store, '_summary_enabled'):
+                            store._summary_enabled = cfg.chunker.chunk_summary.enabled
                         await store.initialize()
                         log.info("kb_manager.vector_store_from_llm_yaml",
                                  backend=llm_vs_cfg.backend,
@@ -408,6 +412,7 @@ class KBManager:
                     uri=uri,
                     collection=collection_override or "kb_chunks",
                     vector_size=cfg.llm.embed_dimensions,
+                    summary_enabled=cfg.chunker.chunk_summary.enabled,
                 )
                 await store.initialize()
                 log.info("kb_manager.vector_store_milvus", uri=uri)

@@ -64,6 +64,7 @@ class QueryPipeline:
         weights: dict | None = None,   # {"vector": 0.5, "keyword": 0.3, "graph": 0.2}
         enable_graph: bool = True,
         final_top_k: int = 5,
+        use_summary_search: bool = False,
     ) -> None:
         self._embedder = embedder
         self._vector_store = vector_store
@@ -78,6 +79,7 @@ class QueryPipeline:
         self._weights = weights or {"vector": 0.5, "keyword": 0.3, "graph": 0.2}
         self._enable_graph = enable_graph and graph_retriever is not None
         self._final_k = final_top_k
+        self._use_summary = use_summary_search
 
     async def query(
         self,
@@ -157,6 +159,7 @@ class QueryPipeline:
                 kb_id=kb_id,
                 top_k=self._vec_k,
                 doc_ids=doc_ids,
+                use_summary=self._use_summary,
             )
             return [
                 RetrievedChunk(

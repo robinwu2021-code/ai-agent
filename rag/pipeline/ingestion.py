@@ -25,6 +25,12 @@ import structlog
 
 log = structlog.get_logger(__name__)
 
+_CHUNK_SUMMARY_SYSTEM = (
+    "Summarize the following text in 1-2 sentences. "
+    "Use the same language as the source text. "
+    "Be concise, factual, and do not copy sentences verbatim."
+)
+
 
 @dataclass
 class IngestionResult:
@@ -37,6 +43,7 @@ class IngestionResult:
     indexing_duration_ms: int = 0
     summary: str = ""
     error: str = ""
+    summary_skipped: int = 0
 
 
 class IngestionPipeline:
@@ -131,7 +138,10 @@ class IngestionPipeline:
                 log.info("ingestion.chunk_summary_start",
                          file_id=file_id, count=total)
                 chunks = await self._gen_chunk_summaries(chunks)
-                log.info("ingestion.chunk_summary_done", file_id=file_id)
+                summary_skipped = sum(1 for c in chunks if not c.summary)
+                result.summary_skipped = summary_skipped
+                log.info("ingestion.chunk_summary_done",
+                         file_id=file_id, summary_skipped=summary_skipped)
 
             # ④ Embedding（串行，避免内存爆炸）
             #    内容向量 + 摘要向量（有摘要时）一次性批量 embed
@@ -150,13 +160,6 @@ class IngestionPipeline:
                     nonempty_embs = await self._embedder.embed_batch(nonempty_texts)
                     for idx, emb in zip(nonempty_idx, nonempty_embs):
                         summary_embeddings[idx] = emb
-
-            # 进度回调
-            if on_progress:
-                try:
-                    on_progress(total, total)
-                except Exception:
-                    pass
 
             # ⑤ 构建写入 payload
             now = time.time()
@@ -211,6 +214,13 @@ class IngestionPipeline:
                     log.warning("ingestion.write_failed",
                                 store=names[i] if i < len(names) else f"store_{i}",
                                 error=str(r))
+
+            # 进度回调（在写入完成后触发）
+            if on_progress:
+                try:
+                    on_progress(total, total)
+                except Exception:
+                    pass
 
             token_count = sum(len(c.text) for c in chunks)
             result.chunk_count = total
@@ -276,6 +286,7 @@ class IngestionPipeline:
 
         设计要点：
           - asyncio.Semaphore 限制并发，避免触发 429
+          - 最多重试 3 次（指数退避：0.5s, 1s, 2s）
           - 任何 chunk 摘要失败只影响该 chunk（summary 置为空字符串）
           - LLM 提示语言无关（模型自动识别原语言并输出同语言摘要）
         """
@@ -283,18 +294,20 @@ class IngestionPipeline:
 
         async def _summarize_one(chunk) -> str:
             async with sem:
-                try:
-                    return await self._llm_fn(
-                        system=(
-                            "请用1-2句话概括以下文本的核心内容，"
-                            "使用与原文相同的语言，不要复述原文，不要加解释。"
-                        ),
-                        user=chunk.text[:self._chunk_summary_max_chars],
-                    )
-                except Exception as exc:
-                    log.warning("ingestion.chunk_summary_failed",
-                                chunk_index=chunk.chunk_index, error=str(exc))
-                    return ""
+                for attempt in range(3):
+                    try:
+                        return await self._llm_fn(
+                            system=_CHUNK_SUMMARY_SYSTEM,
+                            user=chunk.text[:self._chunk_summary_max_chars],
+                        )
+                    except Exception as exc:
+                        if attempt < 2:
+                            await asyncio.sleep(0.5 * (2 ** attempt))
+                        else:
+                            log.warning("ingestion.chunk_summary_failed",
+                                        chunk_index=chunk.chunk_index, error=str(exc))
+                            return ""
+                return ""
 
         summaries = await asyncio.gather(*[_summarize_one(c) for c in chunks])
         for c, s in zip(chunks, summaries):
