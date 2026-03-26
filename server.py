@@ -2071,19 +2071,17 @@ async def health():
 
 # ── LLM 直连测试端点 ───────────────────────────────────────────────
 
-class _LLMTestRequest(BaseModel):
-    message:     str   = Field("你好，请用一句话介绍你自己。", description="发送给大模型的消息")
-    system:      str   = Field("You are a helpful assistant.", description="System prompt")
-    engine_alias: str  = Field("", description="指定引擎 alias（留空则使用 llm.yaml default）")
-    timeout:     float = Field(30.0, description="请求超时秒数")
-
-
-@app.post(
+@app.get(
     "/test/llm",
     summary="直连默认大模型（OpenAI SDK）",
     tags=["Test"],
 )
-async def test_llm(req: _LLMTestRequest):
+async def test_llm(
+    message:      str   = "你好，请用一句话介绍你自己。",
+    system:       str   = "You are a helpful assistant.",
+    engine_alias: str   = "",
+    timeout:      float = 30.0,
+):
     """
     **调试用端点** — 完全绕过 Router/Agent，直接用 openai SDK 调用 llm.yaml 中的引擎。
 
@@ -2091,6 +2089,10 @@ async def test_llm(req: _LLMTestRequest):
     - 通过 engine_alias 指定引擎，留空则取 llm.yaml router.default
     - 返回原始响应内容、延迟、所用引擎信息，方便排查连通性问题
     """
+    req_message      = message
+    req_system       = system
+    req_engine_alias = engine_alias
+    req_timeout      = timeout
     import time
     import pathlib
     import openai as _openai
@@ -2101,7 +2103,7 @@ async def test_llm(req: _LLMTestRequest):
     configs, router_cfg, _, _ = load_from_yaml(yaml_path)
 
     # 确定目标 alias
-    target_alias = req.engine_alias.strip() or router_cfg.default or ""
+    target_alias = req_engine_alias.strip() or router_cfg.default or ""
     cfg_map = {c.alias: c for c in configs}
 
     if target_alias and target_alias in cfg_map:
@@ -2120,7 +2122,7 @@ async def test_llm(req: _LLMTestRequest):
     client = _openai.AsyncOpenAI(
         api_key=api_key,
         base_url=base_url,
-        timeout=req.timeout,
+        timeout=req_timeout,
     )
 
     t0 = time.perf_counter()
@@ -2128,8 +2130,8 @@ async def test_llm(req: _LLMTestRequest):
         resp = await client.chat.completions.create(
             model=model,
             messages=[
-                {"role": "system", "content": req.system},
-                {"role": "user",   "content": req.message},
+                {"role": "system", "content": req_system},
+                {"role": "user",   "content": req_message},
             ],
             max_tokens=512,
         )
