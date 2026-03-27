@@ -88,6 +88,12 @@ class QueryPipeline:
         top_k: int | None = None,
         doc_ids: list[str] | None = None,
         directory_ids: list[str] | None = None,
+        # ── 场景 A：相似推荐去重 ──────────────────────────────────────────
+        use_mmr: bool = False,
+        mmr_lambda: float = 0.5,
+        # ── 场景 E：精确编号强制通道 ─────────────────────────────────────
+        exact_terms: list[str] | None = None,
+        exact_boost: float = 0.3,
     ) -> QueryResult:
         """
         执行混合检索并返回 QueryResult。
@@ -98,6 +104,10 @@ class QueryPipeline:
             top_k:         最终返回条数（默认使用初始化时的 final_top_k）
             doc_ids:       限定检索范围的文档 ID 列表
             directory_ids: 限定检索范围的目录 ID 列表（与 doc_ids 可同时使用）
+            use_mmr:       [场景A] 启用 MMR 去重，提升相似推荐多样性
+            mmr_lambda:    [场景A] MMR λ 参数，0.5=相关性/多样性平衡
+            exact_terms:   [场景E] 精确匹配词列表，命中时额外加分（编号/标准号等）
+            exact_boost:   [场景E] 精确命中额外加分值（0.0~1.0）
         """
         k = top_k or self._final_k
 
@@ -132,7 +142,12 @@ class QueryPipeline:
         else:
             fused = self._weighted_fusion(vec_hits, kw_hits, graph_hits, k=k * 3)
 
-        # ④ 可选重排序
+        # ④ [场景E] 精确编号加分 → 在 rerank 前提权，避免被语义相似度压制
+        if exact_terms:
+            from rag.pipeline.advanced_query import boost_exact_match
+            fused = boost_exact_match(fused, exact_terms, boost=exact_boost)
+
+        # ⑤ 可选重排序
         if self._reranker and fused:
             try:
                 fused = await self._reranker.rerank(query_text, fused, top_k=k)
@@ -141,6 +156,11 @@ class QueryPipeline:
                 fused = fused[:k]
         else:
             fused = fused[:k]
+
+        # ⑥ [场景A] MMR 多样性去重（在 rerank 之后应用，保证基础质量）
+        if use_mmr and fused:
+            from rag.pipeline.advanced_query import apply_mmr
+            fused = apply_mmr(fused, query_vec, top_k=k, lambda_=mmr_lambda)
 
         context = self._format_context(fused)
         return QueryResult(query=query_text, kb_id=kb_id, chunks=fused, context=context)
