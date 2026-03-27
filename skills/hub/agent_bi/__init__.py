@@ -648,6 +648,21 @@ class AgentBiSkill:
                  range_start=range_start, range_end=range_end,
                  row_count=len(raw_metrics), comparison=comparison)
 
+        # ── 空数据：明确告知 LLM，禁止重试 ───────────────────────────────────
+        if not raw_metrics:
+            log.info("agent_bi.no_data", mode=mode, bra_id=bra_id,
+                     range_start=range_start, range_end=range_end)
+            return {
+                "success":   True,
+                "no_data":   True,
+                "mode":      mode,
+                "bra_id":    bra_id,
+                "range_start": range_start,
+                "range_end":   range_end,
+                "metrics":   [],
+                "message":   "该时间段内暂无数据，请直接告知用户没有相关数据，勿重试。",
+            }
+
         response: dict[str, Any] = {
             "success":          True,
             "mode":             mode,
