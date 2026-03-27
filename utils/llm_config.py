@@ -644,6 +644,12 @@ class RouterConfig:
     # ── Fallback 链（主引擎失败后按序尝试）──────────────────────
     fallback: list[str] = field(default_factory=list)
 
+    # ── 全局 Fallback 开关（默认关闭）────────────────────────────
+    # False：主引擎失败直接抛错，不尝试后备引擎（生产推荐：快速暴露问题）
+    # True ：按 fallback 链依次重试（高可用场景）
+    # 环境变量 ROUTER_ENABLE_FALLBACK=true/false 可覆盖此值
+    enable_fallback: bool = False
+
     @classmethod
     def from_dict(cls, data: dict, default_alias: str) -> "RouterConfig":
         """从字典构建路由规则（通常来自 llm.yaml 的 router 节）。"""
@@ -656,18 +662,29 @@ class RouterConfig:
             else list(fallback_raw)
         )
 
+        # enable_fallback：yaml bool > env var > 默认 False
+        _ef_yaml = d.get("enable_fallback")
+        _ef_env  = os.environ.get("ROUTER_ENABLE_FALLBACK")
+        if _ef_env is not None:
+            enable_fallback = _ef_env.strip().lower() in ("1", "true", "yes")
+        elif _ef_yaml is not None:
+            enable_fallback = bool(_ef_yaml)
+        else:
+            enable_fallback = False
+
         return cls(
-            default        = d.get("default", default_alias),
-            chat           = d.get("chat"),
-            plan           = d.get("plan"),
-            summarize      = d.get("summarize"),
-            consolidate    = d.get("consolidate"),
-            embed          = d.get("embed"),
-            rerank         = d.get("rerank"),
-            eval           = d.get("eval"),
-            route          = d.get("route"),
-            node_overrides = dict(d.get("node_overrides") or {}),
-            fallback       = fallback,
+            default         = d.get("default", default_alias),
+            chat            = d.get("chat"),
+            plan            = d.get("plan"),
+            summarize       = d.get("summarize"),
+            consolidate     = d.get("consolidate"),
+            embed           = d.get("embed"),
+            rerank          = d.get("rerank"),
+            eval            = d.get("eval"),
+            route           = d.get("route"),
+            node_overrides  = dict(d.get("node_overrides") or {}),
+            fallback        = fallback,
+            enable_fallback = enable_fallback,
         )
 
     @classmethod
@@ -679,17 +696,21 @@ class RouterConfig:
         fallback_raw = _get("FALLBACK") or ""
         fallback = [a.strip() for a in fallback_raw.split(",") if a.strip()]
 
+        _ef = _get("ENABLE_FALLBACK")
+        enable_fallback = _ef.strip().lower() in ("1", "true", "yes") if _ef else False
+
         return cls(
-            default     = _get("DEFAULT") or default_alias,
-            chat        = _get("CHAT"),
-            plan        = _get("PLAN"),
-            summarize   = _get("SUMMARIZE"),
-            consolidate = _get("CONSOLIDATE"),
-            embed       = _get("EMBED"),
-            rerank      = _get("RERANK"),
-            eval        = _get("EVAL"),
-            route       = _get("ROUTE"),
-            fallback    = fallback,
+            default         = _get("DEFAULT") or default_alias,
+            chat            = _get("CHAT"),
+            plan            = _get("PLAN"),
+            summarize       = _get("SUMMARIZE"),
+            consolidate     = _get("CONSOLIDATE"),
+            embed           = _get("EMBED"),
+            rerank          = _get("RERANK"),
+            eval            = _get("EVAL"),
+            route           = _get("ROUTE"),
+            fallback        = fallback,
+            enable_fallback = enable_fallback,
         )
 
 

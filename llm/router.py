@@ -301,9 +301,11 @@ class LLMRouter:
         task_router:    TaskRouter,
         circuit_breaker_threshold: int   = 3,
         circuit_breaker_cooldown:  float = 60.0,
+        enable_fallback: bool = False,
     ) -> None:
-        self._registry    = registry
-        self._task_router = task_router
+        self._registry       = registry
+        self._task_router    = task_router
+        self._enable_fallback = enable_fallback
         self._circuits:   dict[str, _CircuitState] = defaultdict(
             lambda: _CircuitState(
                 threshold=circuit_breaker_threshold,
@@ -440,8 +442,20 @@ class LLMRouter:
     async def _call_chain(
         self, chain: list[str], task: str, fn
     ) -> Any:
+        """
+        沿 chain 依次尝试引擎，直到成功或全部失败。
+
+        enable_fallback=False（默认）时，chain 被截断为仅第一个引擎：
+          - 主引擎失败立即上抛，不尝试后备引擎
+          - 优点：快速暴露配置/网络问题，不产生误导性的"降级成功"日志
+
+        enable_fallback=True 时保持原有行为：
+          - 按 chain 顺序逐个重试，直到成功或耗尽
+        """
+        effective_chain = chain if self._enable_fallback else chain[:1]
+
         last_exc: Exception | None = None
-        for i, alias in enumerate(chain):
+        for i, alias in enumerate(effective_chain):
             spec = self._registry.get(alias)
             if spec is None:
                 log.warning("router.alias_not_found", alias=alias, task=task)
@@ -463,13 +477,16 @@ class LLMRouter:
                 elapsed = (time.monotonic() - t0) * 1000
                 self._record_failure(alias, elapsed)
                 last_exc = exc
+                remaining = len(effective_chain) - i - 1
                 log.warning("router.engine_failed",
                             alias=alias, task=task, error=str(exc),
-                            fallback_remaining=len(chain) - i - 1)
+                            fallback_enabled=self._enable_fallback,
+                            fallback_remaining=remaining)
 
         raise RuntimeError(
-            f"All engines failed for task '{task}'. "
-            f"Chain: {chain}. Last error: {last_exc}"
+            f"Engine failed for task '{task}' "
+            f"(fallback {'enabled' if self._enable_fallback else 'disabled'}). "
+            f"Chain tried: {effective_chain}. Last error: {last_exc}"
         ) from last_exc
 
     async def _pick_healthy(self, chain: list[str]) -> ModelSpec:

@@ -278,7 +278,14 @@ def _build_container(engine_alias: str | None = None):
         node_overrides = router_cfg.node_overrides,
         fallback       = fallback,
     )
-    llm_router = LLMRouter(registry=registry, task_router=task_router)
+    llm_router = LLMRouter(
+        registry        = registry,
+        task_router     = task_router,
+        enable_fallback = router_cfg.enable_fallback,
+    )
+    log.info("server.fallback_switch",
+             enable_fallback = router_cfg.enable_fallback,
+             fallback_chain  = router_cfg.fallback)
 
     # Skill 注册表：内置 Skill
     from skills.loader import SkillLoader
@@ -2119,6 +2126,7 @@ async def test_llm(
     base_url  = engine_cfg.base_url  or None
     model     = engine_cfg.model
 
+    print(f"-----{api_key}----{base_url}")
     client = _openai.AsyncOpenAI(
         api_key=api_key,
         base_url=base_url,
