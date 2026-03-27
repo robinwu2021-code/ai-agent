@@ -242,7 +242,7 @@ class AgentBiSkill:
             "Query store BI report: sales/revenue, orders, customers, payments, members, refunds; "
             "dish ranking; low-stock items; stored-value stats; new member stats; yoy/pop comparison. "
             "bra_id: from [BI store context]; range_start/range_end: from [BI date context]; "
-            "For trend queries use time_granularity=DAY/MONTH/YEAR with aggregation=SUM."
+            "Omit aggregation for list/trend data; pass aggregation=SUM for totals."
         ),
         input_schema={
             "type": "object",
@@ -269,8 +269,13 @@ class AgentBiSkill:
                 "aggregation": {
                     "type": "string",
                     "enum": sorted(_VALID_AGGREGATIONS),
-                    "default": "SUM",
-                    "description": "聚合函数（默认 SUM）。粒度模式必传，菜品/库存模式无效。",
+                    "description": (
+                        "聚合函数（可选）。\n"
+                        "  不传 -> API 返回时间区间内每天一行的 list（趋势/明细场景）。\n"
+                        "  传入 SUM/AVG/MAX/MIN/COUNT -> 聚合为单行汇总（总计/平均场景）。\n"
+                        "判断规则：用户要趋势、每天、每周、每月等明细 -> 不传；"
+                        "用户要总计、合计、今天营业额是多少 -> 传 aggregation=SUM。"
+                    ),
                 },
                 "dimensions": {
                     "type": "string",
@@ -357,7 +362,7 @@ class AgentBiSkill:
             return await self._query(
                 metrics=arguments.get("metrics") or [],
                 bra_id=arguments.get("bra_id"),
-                aggregation=arguments.get("aggregation", "SUM"),
+                aggregation=arguments.get("aggregation"),          # None = 不传给 API → 返回 list
                 dimensions=arguments.get("dimensions"),
                 time_granularity=arguments.get("time_granularity"),
                 stock_threshold=arguments.get("stock_threshold"),
@@ -500,7 +505,7 @@ class AgentBiSkill:
         self,
         metrics: list[str],
         bra_id: str | None = None,
-        aggregation: str = "SUM",
+        aggregation: str | None = None,         # None = 不传给 API → 返回 list
         dimensions: str | None = None,
         time_granularity: str | None = None,
         stock_threshold: int | None = None,
@@ -513,47 +518,47 @@ class AgentBiSkill:
         if not bra_id:
             bra_id = _default_bra_id()
 
-        # ── 检测查询模式 ──────────────────────────────────────────────────────
+        # ── 检测兼容模式 ──────────────────────────────────────────────────────
+        # 仅用于区分特殊数据源（菜品/库存/储值/会员），默认走 report_daily_statistics
         mode = _detect_mode(dimensions, metrics, time_granularity)
 
-        # ── 参数校验（仅默认/粒度模式需校验 metrics 白名单）───────────────────
+        # ── 参数校验 ──────────────────────────────────────────────────────────
+        # 标准指标模式：metrics 必须合法
         if mode in ("default", "granular"):
             if not metrics:
-                return {"error": "metrics 不能为空，默认模式下请至少指定一个指标",
+                return {"error": "metrics 不能为空，请至少指定一个指标",
                         "valid_metrics": sorted(_VALID_METRICS)}
             invalid = [m for m in metrics if m not in _VALID_METRICS]
             if invalid:
-                return {"error": f"无效指标: {invalid}，默认模式仅支持标准字段",
-                        "valid_metrics": sorted(_VALID_METRICS)}
+                return {"error": f"无效指标: {invalid}", "valid_metrics": sorted(_VALID_METRICS)}
 
-        if mode == "granular" and aggregation not in _VALID_AGGREGATIONS:
-            return {"error": f"粒度模式必须传合法的 aggregation，当前值: {aggregation!r}",
-                    "valid_aggregations": sorted(_VALID_AGGREGATIONS)}
-
+        # aggregation 非法时静默清空（等同于不传）
         if aggregation and aggregation not in _VALID_AGGREGATIONS:
-            # 非法聚合函数：按文档行为，不聚合，但打 warning 便于排查
-            log.warning("agent_bi.invalid_aggregation_fallback", aggregation=aggregation)
-            aggregation = "SUM"
+            log.warning("agent_bi.invalid_aggregation_ignored", aggregation=aggregation)
+            aggregation = None
 
         if comparison and comparison not in ("yoy", "pop"):
             return {"error": f"无效对比类型: {comparison!r}，支持: yoy（同比）、pop（环比）",
                     "type": "InvalidComparison"}
 
-        # dish_top / low_stock 无意义做同比/环比，静默忽略
+        # 菜品/库存模式不支持同比/环比
         if mode in ("dish_top", "low_stock"):
             comparison = None
 
-        # ── 时间范围自动修复（单日零窗口）───────────────────────────────────
+        # ── 时间范围自动修复（单日零窗口）──────────────────────────────────
         _ONE_DAY_MS = 86_400_000
         if range_start is not None and (range_end is None or range_end <= range_start):
             range_end = range_start + _ONE_DAY_MS
             log.info("agent_bi.range_end_auto_fixed",
                      range_start=range_start, range_end=range_end)
 
-        # ── 构建 API 请求体 ──────────────────────────────────────────────────
+        # ── 构建 API 请求体 ─────────────────────────────────────────────────
+        # 规则：只把有值的字段写入 payload，让 API 决定行为
+        #   - aggregation 未传 → API 返回时间区间内每天/每周/每月的 list
+        #   - aggregation 传入 → API 返回聚合后的单行汇总
+        #   - timeGranularity 传入 → 控制分组粒度（DAY/MONTH/YEAR）
         payload: dict[str, Any] = {}
 
-        # 公共字段
         if bra_id:
             payload["braId"] = bra_id
         if range_start is not None:
@@ -562,47 +567,46 @@ class AgentBiSkill:
             payload["rangeEnd"] = range_end
 
         if mode == "dish_top":
-            # 菜品排行：dimensions 触发，aggregation 不参与
             payload["dimensions"] = dimensions or "product_top"
 
         elif mode == "low_stock":
-            # 库存不足：dimensions 触发，stockThreshold 可选
             payload["dimensions"] = dimensions or "low_stock"
             if stock_threshold is not None:
                 payload["stockThreshold"] = stock_threshold
 
         elif mode == "stored_value":
-            # 储值统计：metrics 触发；dimensions 可选（含 trend 时按天展开）
             payload["metrics"] = metrics or list(_STORED_VAL_METRICS)
             if dimensions:
                 payload["dimensions"] = dimensions
+            if aggregation:
+                payload["aggregation"] = aggregation
+            if time_granularity:
+                payload["timeGranularity"] = time_granularity
 
         elif mode == "member_info":
-            # 会员信息：dimensions 触发；metrics 可选
             if dimensions:
                 payload["dimensions"] = dimensions
             if metrics:
                 payload["metrics"] = metrics
+            if aggregation:
+                payload["aggregation"] = aggregation
+            if time_granularity:
+                payload["timeGranularity"] = time_granularity
 
-        elif mode == "granular":
-            # 粒度分组：timeGranularity 优先
+        else:  # default（含原 granular，统一处理）
             payload["metrics"] = metrics
-            payload["aggregation"] = aggregation
-            payload["timeGranularity"] = time_granularity
-            # dimensions 中的 day/month/year 关键词也保留（兜底）
-            if dimensions:
-                payload["dimensions"] = dimensions
-
-        else:  # default
-            payload["metrics"] = metrics
-            payload["aggregation"] = aggregation
+            if aggregation:                        # 不传 → API 返回 list
+                payload["aggregation"] = aggregation
+            if time_granularity:                   # 控制分组粒度
+                payload["timeGranularity"] = time_granularity
             if dimensions:
                 payload["dimensions"] = dimensions
 
         headers = self._build_headers()
 
-        log.info("agent_bi.mode_detected", mode=mode, dimensions=dimensions,
-                 time_granularity=time_granularity, metrics=metrics)
+        log.info("agent_bi.query", mode=mode, metrics=metrics,
+                 aggregation=aggregation, time_granularity=time_granularity,
+                 dimensions=dimensions, range_start=range_start, range_end=range_end)
 
         # ── 发起请求（含同比/环比并发）──────────────────────────────────────
         prev_start: int | None = None
