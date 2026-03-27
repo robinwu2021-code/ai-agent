@@ -1,0 +1,38 @@
+evolution:
+  enabled: true
+  db_path: "./data/evolution.db"
+
+  signal:
+    rag_enabled: true
+    bi_enabled: true
+    implicit_accept_window: 30       # 秒：30 秒内无追问视为"接受"
+
+  scheduler:
+    daily_job_hour: 2                # 凌晨 2 点运行日任务
+    daily_job_minute: 0
+    timezone: "Asia/Shanghai"
+
+  analyzer:
+    chunk_scorer_enabled: true
+    low_quality_threshold: 0.3       # 低于此分的 chunk 标记为低质量
+    bi_profiler_enabled: true
+    qa_extractor_enabled: true
+    qa_min_feedback_score: 4.0       # 反馈分 ≥ 4 才提取 Q&A 对
+
+  actor:
+    kb_injector_enabled: true
+    auto_inject: true                # true=自动注入, false=进入人工审核队列
+    param_tuner_enabled: true
+    template_builder_enabled: true
+    prompt_updater_enabled: true
+    prompt_auto_apply: true          # true=自动生效, false=人工审核后生效
+    stale_chunk_days: 90             # 超过 90 天未命中视为过期
+    stale_hit_threshold: 3           # 命中次数 < 3 也视为过期
+
+  # 扩展点：未来新功能模块可在此追加，无需修改代码
+  # extra_signal_collectors:
+  #   - module: "myapp.signals.order"
+  #     class: "OrderSignalCollector"
+  #     config: {}
+  # extra_analyzers: []
+  # extra_actors: []

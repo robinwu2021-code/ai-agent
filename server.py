@@ -2056,6 +2056,9 @@ async def kg_reindex_document(doc_id: str, kb_id: str = "global"):
     return {"ok": True, "message": "旧数据已清除，请重新调用 /kg/build/text 或 /kg/build/file 触发构建"}
 
 
+_evolution_module = None   # 全局进化模块实例
+
+
 @app.on_event("startup")
 async def _startup():
     """
@@ -2065,6 +2068,7 @@ async def _startup():
     所有外部连接（Milvus / Qdrant）均设 15 秒超时，避免服务因后端不可达而卡死。
     连接失败时 KB 功能降级为不可用，其余 API 正常启动。
     """
+    global _evolution_module
     import asyncio as _asyncio
 
     if _container is not None:
@@ -2082,6 +2086,28 @@ async def _startup():
             except Exception as exc:
                 log.warning("server.pkb_startup_init_failed", error=str(exc))
 
+    # ── 启动进化模块（独立模块，失败不影响主服务）────────────────────────────
+    try:
+        from evolution import EvolutionModule
+        _evolution_module = EvolutionModule.from_yaml("evolution_config.yaml")
+        await _evolution_module.setup(
+            skill_registry = getattr(_container, "skill_registry", None) if _container else None,
+            kb             = getattr(_container, "knowledge_base", None) if _container else None,
+        )
+    except Exception as _evo_exc:
+        log.warning("server.evolution_startup_failed", error=str(_evo_exc))
+
+
+@app.on_event("shutdown")
+async def _shutdown():
+    """优雅关闭进化模块。"""
+    global _evolution_module
+    if _evolution_module is not None:
+        try:
+            await _evolution_module.teardown()
+        except Exception as exc:
+            log.warning("server.evolution_shutdown_failed", error=str(exc))
+
 
 @app.get("/health", summary="健康检查")
 async def health():
@@ -2089,10 +2115,17 @@ async def health():
     if _container is None:
         return {"status": "initializing"}
     skills = _container.skill_registry.list_descriptors() if _container.skill_registry else []
+    evo_stats = None
+    if _evolution_module is not None:
+        try:
+            evo_stats = _evolution_module._bus.stats
+        except Exception:
+            pass
     return {
         "status": "ok",
         "skills": len(skills),
         "skill_names": [d.name for d in skills],
+        "evolution": evo_stats,
     }
 
 
