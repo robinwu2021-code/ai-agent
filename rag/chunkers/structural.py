@@ -98,16 +98,50 @@ class StructuralChunker:
         return sections
 
     def _split_long(self, text: str) -> list[str]:
-        paragraphs = re.split(r'\n{2,}', text)
-        chunks: list[str] = []
+        """将超长 section 切分为不超过 max_size 的子块。
+
+        降级策略：双换行段落 → 单换行行 → 句子边界 → 强制字符截断。
+        确保英文 PDF（Docling 输出多为单换行）也能被充分切分。
+        """
+        result: list[str] = []
+        self._split_by_sep(text, result)
+        return result or [text]
+
+    def _split_by_sep(self, text: str, out: list[str], _depth: int = 0) -> None:
+        """递归按分隔符切分，直到每块 <= max_size。"""
+        separators = [r'\n{2,}', r'\n', r'(?<=[.!?])\s+', '']
+        if _depth >= len(separators):
+            # 强制按字符截断
+            for i in range(0, len(text), self._max_size):
+                chunk = text[i:i + self._max_size].strip()
+                if chunk:
+                    out.append(chunk)
+            return
+
+        sep = separators[_depth]
+        parts = re.split(sep, text) if sep else list(text)
+        if sep == '':
+            # 已是字符级，直接截断
+            self._split_by_sep(text, out, _depth=len(separators))
+            return
+
         current = ""
-        for para in paragraphs:
-            if len(current) + len(para) + 2 <= self._max_size:
-                current = (current + "\n\n" + para).strip()
+        for part in parts:
+            part = part.strip()
+            if not part:
+                continue
+            join = "\n\n" if _depth == 0 else " "
+            candidate = (current + join + part).strip() if current else part
+            if len(candidate) <= self._max_size:
+                current = candidate
             else:
                 if current:
-                    chunks.append(current)
-                current = para
+                    out.append(current)
+                # 单个 part 本身就超长，递归用更细粒度切
+                if len(part) > self._max_size:
+                    self._split_by_sep(part, out, _depth=_depth + 1)
+                    current = ""
+                else:
+                    current = part
         if current:
-            chunks.append(current)
-        return chunks
+            out.append(current)

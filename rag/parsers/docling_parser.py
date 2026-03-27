@@ -94,27 +94,44 @@ class DoclingParser:
     def _run_docling(self, converter, path: Path) -> ParsedDocument:
         result = converter.convert(str(path))
         doc = result.document
-        content = doc.export_to_markdown()
 
         headings: list[dict] = []
+        tables: list[dict] = []
         has_headings = False
+
+        # ── 从结构化 items 重建内容，确保每个段落/标题之间有 \n\n 分隔 ──
+        # export_to_markdown() 对部分英文 PDF 会丢失段落边界，
+        # 直接遍历 doc.texts 可完整保留每个文本块结构。
+        parts: list[str] = []
         try:
             for item in doc.texts:
                 lbl = str(getattr(item, "label", "")).lower()
+                text = getattr(item, "text", "").strip()
+                if not text:
+                    continue
+
                 if any(x in lbl for x in ("heading", "title", "h1", "h2", "h3")):
                     level = 1
-                    if "h2" in lbl or "heading2" in lbl or "section" in lbl:
+                    if "h2" in lbl or "heading2" in lbl or "section_header" in lbl:
                         level = 2
                     elif "h3" in lbl or "heading3" in lbl:
                         level = 3
-                    text = getattr(item, "text", "").strip()
-                    if text:
-                        headings.append({"level": level, "text": text})
-                        has_headings = True
-        except Exception:
-            pass
+                    headings.append({"level": level, "text": text})
+                    has_headings = True
+                    parts.append(f"{'#' * level} {text}")
+                else:
+                    parts.append(text)
+        except Exception as exc:
+            log.warning("docling.text_items_failed", error=str(exc))
 
-        tables: list[dict] = []
+        # 每个 item 之间用双换行，保证 chunker 能识别段落边界
+        content = "\n\n".join(parts) if parts else doc.export_to_markdown()
+
+        # 若从 items 构建失败则回退到 markdown，同时检测标题
+        if not parts:
+            has_headings = "# " in content or "## " in content
+
+        # ── 表格 ──────────────────────────────────────────────────────────
         try:
             for tbl in doc.tables:
                 md = (tbl.export_to_markdown()
@@ -129,9 +146,14 @@ class DoclingParser:
         except Exception:
             pass
 
-        if not has_headings:
-            has_headings = "# " in content or "## " in content
-
+        log.debug(
+            "docling.parsed",
+            path=path.name,
+            pages=page_count,
+            items=len(parts),
+            headings=len(headings),
+            content_len=len(content),
+        )
         return ParsedDocument(
             content=content,
             source=str(path),
@@ -141,7 +163,7 @@ class DoclingParser:
             page_count=page_count,
             headings=headings,
             tables=tables,
-            metadata={"parser": "docling"},
+            metadata={"parser": "docling", "items": len(parts)},
         )
 
     # ── 简单格式直读 ──────────────────────────────────────────────

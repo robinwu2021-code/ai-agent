@@ -105,8 +105,8 @@ vector_store:
     uri: http://192.168.0.209:19530      # Milvus Standalone 服务器地址
     token: root:${MILVUS_PASSWORD}               # 格式：root:密码 或 API key（无鉴权可留空）
     collection: kb_chunks                # collection 名称，同一服务可部署多个项目
-    vector_size: 1536                    # 必须与 embedding 模型输出维度一致
-                                         # qwen3-embedding:8b → 1536
+    vector_size: 4096                    # 必须与 embedding 模型输出维度一致
+                                         # qwen3-embedding:8b → 4096
                                          # text-embedding-3-small → 1536
                                          # text-embedding-3-large → 3072
     index_type: HNSW                     # HNSW（默认，适合 <500万向量）

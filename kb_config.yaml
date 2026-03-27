@@ -23,8 +23,8 @@ knowledge_base:
     rerank_engine:    minimax       # llm.yaml engines[minimax]       → 同上
 
     # Embedding 维度 — 须与 embed_engine 的 embedding_model 输出维度一致
-    # 同时须与 llm.yaml vector_store.milvus.vector_size 保持一致（当前均为 1536）
-    embed_dimensions: 1536          # qwen3-embedding:8b → 1536
+    # 同时须与 llm.yaml vector_store.milvus.vector_size 保持一致（当前均为 4096）
+    embed_dimensions: 4096          # qwen3-embedding:8b → 4096
     embed_batch_size: 32            # 每批次请求数量
 
     # 本地 BGE（仅 embed_engine: bge_local 时生效，不走 llm.yaml）
@@ -50,11 +50,11 @@ knowledge_base:
 
   # ── 分块策略 ─────────────────────────────────────────────────────
   chunker:
-    strategy: structural                 # auto | structural | semantic | sentence | fixed
+    strategy: auto                       # auto | structural | semantic | sentence | fixed
     # auto: 有标题→structural，无标题→semantic
     structural:
       min_size: 100
-      max_size: 1500
+      max_size: 800
       levels: [1, 2, 3]
       include_heading: true
     semantic:
