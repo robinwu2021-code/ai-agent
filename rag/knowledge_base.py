@@ -85,10 +85,38 @@ class DocumentIngester:
         return text.strip()
 
     def _read_pdf(self, path: Path) -> str:
+        """
+        提取 PDF 文本。
+
+        策略（按优先级）：
+        1. pdfplumber — 逐页提取，每页之间用 \\n\\n 分隔，保留段落边界
+        2. pypdf      — 回退，同样按页用 \\n\\n 拼接（避免全文单 \\n 导致无法分块）
+        """
+        # ── 优先用 pdfplumber（段落结构更完整）──────────────────────────
+        try:
+            import pdfplumber
+            pages: list[str] = []
+            with pdfplumber.open(str(path)) as pdf:
+                for page in pdf.pages:
+                    text = page.extract_text() or ""
+                    text = text.strip()
+                    if text:
+                        pages.append(text)
+            if pages:
+                return "\n\n".join(pages)
+        except Exception:
+            pass  # 回退到 pypdf
+
+        # ── 回退：pypdf（页间用 \n\n，避免 \n 拼接导致零分块）──────────
         try:
             import pypdf
             reader = pypdf.PdfReader(str(path))
-            return "\n".join(page.extract_text() or "" for page in reader.pages)
+            pages = []
+            for page in reader.pages:
+                text = (page.extract_text() or "").strip()
+                if text:
+                    pages.append(text)
+            return "\n\n".join(pages)
         except ImportError:
             raise RuntimeError("请安装 pypdf：pip install pypdf")
 
@@ -146,9 +174,61 @@ class TextChunker:
         return chunks
 
     def _split_paragraphs(self, text: str) -> list[str]:
-        # 按空行、标题行、句号+换行分割
-        paras = re.split(r"\n{2,}|(?<=[。！？.!?])\n", text)
-        return [p.strip() for p in paras if p.strip()]
+        """
+        段落识别策略（三级降级）：
+
+        1. 双换行 / 句号+换行 → 段落边界（中英文通用）
+        2. 超出 max_chars 的块：单换行进一步切分（处理英文 PDF 无空行情况）
+        3. 超长单行：按句子边界强制切断
+        """
+        # 第一轮：双换行 + 中英文句尾+换行
+        raw = re.split(r"\n{2,}|(?<=[。！？.!?])\n", text)
+
+        result: list[str] = []
+        for block in raw:
+            block = block.strip()
+            if not block:
+                continue
+
+            if len(block) <= self._max:
+                result.append(block)
+            else:
+                # 第二轮：英文 PDF 段落内只有单换行 → 按 \n 切分
+                lines = [ln.strip() for ln in block.split("\n") if ln.strip()]
+                buf = ""
+                for line in lines:
+                    if len(buf) + len(line) + 1 <= self._max:
+                        buf = (buf + " " + line).strip() if buf else line
+                    else:
+                        if buf:
+                            result.append(buf)
+                        # 第三轮：单行本身超长 → 按句子边界切断
+                        if len(line) > self._max:
+                            result.extend(self._split_long_line(line))
+                            buf = ""
+                        else:
+                            buf = line
+                if buf:
+                    result.append(buf)
+
+        return result
+
+    def _split_long_line(self, line: str) -> list[str]:
+        """将单行超长文本按句子边界切分为不超过 max_chars 的片段。"""
+        parts = re.split(r"(?<=[.!?])\s+", line)
+        chunks: list[str] = []
+        buf = ""
+        for part in parts:
+            candidate = (buf + " " + part).strip() if buf else part
+            if len(candidate) <= self._max:
+                buf = candidate
+            else:
+                if buf:
+                    chunks.append(buf)
+                buf = part if len(part) <= self._max else part[: self._max]
+        if buf:
+            chunks.append(buf)
+        return chunks or [line[: self._max]]
 
     def _make_chunk(self, doc: Document, text: str, idx: int) -> Chunk:
         cid = f"{doc.id}_c{idx:04d}"
