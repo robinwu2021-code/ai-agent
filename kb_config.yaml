@@ -6,9 +6,16 @@
 #   - 向量库连接参数优先使用 llm.yaml vector_store 节，本文件仅做业务层覆盖
 #
 # 切换引擎只需修改此处 alias（llm.yaml 里对应引擎的连接参数保持不变）：
-#   embed_engine: ollama-embed    → llm.yaml engines[ollama-embed]  本地 qwen3-embedding:8b
-#   embed_engine: azure-east      → llm.yaml engines[azure-east]   Azure text-embedding-3-small
-#   embed_engine: bge_local       → 本地 BGE-M3（离线推理，不走 llm.yaml）
+#   embed_engine: ollama-embed      → llm.yaml engines[ollama-embed]     本地 qwen3-embedding:8b  (4096 维)
+#   embed_engine: ollama-embed-4b   → llm.yaml engines[ollama-embed-4b]  本地 qwen3-embedding:4b  (2560 维)
+#   embed_engine: azure-east        → llm.yaml engines[azure-east]       Azure text-embedding-3-small
+#   embed_engine: bge_local         → 本地 BGE-M3（离线推理，不走 llm.yaml）
+#
+# ⚠ 切换 embedding 模型注意事项（8b ↔ 4b 维度不同，不可混用）：
+#   1. 同步修改下方 embed_engine 和 embed_dimensions
+#   2. 同步修改 llm.yaml → vector_store.milvus.vector_size
+#   3. 删除旧 Milvus collection（kb_chunks），否则会出现维度不匹配错误
+#   4. 重新上传所有文档以重建向量索引
 # ─────────────────────────────────────────────────────────────────────
 
 knowledge_base:
@@ -18,14 +25,23 @@ knowledge_base:
   # 连接参数（api_key / base_url / model / timeout）全部在 llm.yaml 中管理
   llm:
     # ▼ 直接引用 llm.yaml engines 中已定义的 alias ▼
-    embed_engine:     ollama-embed  # llm.yaml engines[ollama-embed]  → qwen3-embedding:8b @ 192.168.0.222:11434
-    summarize_engine: minimax       # llm.yaml engines[minimax]       → MiniMax-M2.5 @ api.scnet.cn
-    rerank_engine:    minimax       # llm.yaml engines[minimax]       → 同上
+    #
+    # ── 当前激活的 Embedding 引擎 ──────────────────────────────────────────
+    # 若要切换到轻量 4b 模型，将下面两行改为：
+    #   embed_engine:     ollama-embed-4b
+    #   embed_dimensions: 2560
+    # 并同步修改 llm.yaml vector_store.milvus.vector_size: 2560
+    # 然后删除旧 collection 并重新上传文档
+    embed_engine:     ollama-embed      # qwen3-embedding:8b → 4096 维（高质量，推荐）
+    # embed_engine:   ollama-embed-4b   # qwen3-embedding:4b → 2560 维（轻量，显存<4GB 时使用）
+    summarize_engine: minimax           # llm.yaml engines[minimax] → MiniMax-M2.5
+    rerank_engine:    minimax           # llm.yaml engines[minimax] → 同上
 
     # Embedding 维度 — 须与 embed_engine 的 embedding_model 输出维度一致
-    # 同时须与 llm.yaml vector_store.milvus.vector_size 保持一致（当前均为 4096）
-    embed_dimensions: 4096          # qwen3-embedding:8b → 4096
-    embed_batch_size: 32            # 每批次请求数量
+    # 同时须与 llm.yaml vector_store.milvus.vector_size 保持一致
+    embed_dimensions: 4096              # ollama-embed(8b)    → 4096
+    # embed_dimensions: 2560            # ollama-embed-4b(4b) → 2560
+    embed_batch_size: 32                # 每批次请求数量
 
     # 本地 BGE（仅 embed_engine: bge_local 时生效，不走 llm.yaml）
     bge_local:
