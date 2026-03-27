@@ -1,49 +1,29 @@
 """
-skills/weather.py — 天气查询 Skill（完整生产级实现）
+skills/weather.py — 天气查询 Skill
 
-这是项目中 Skill 实现的规范示例，展示了一个完整 Skill 的所有要素：
-
-  结构要素
-  ─────────
-  ① ToolDescriptor    精确的 JSON Schema，含必填/可选字段和枚举约束
-  ② execute()         真实的业务逻辑（HTTP 请求、数据解析、错误处理）
-  ③ 缓存层            TTL 缓存避免重复请求同一城市
-  ④ 重试逻辑          网络抖动时自动重试
-  ⑤ 单元测试钩子      MockMode 可在离线测试中使用
+  数据源
+  ──────
+  open-meteo   Open-Meteo（默认，完全免费，无需 API Key，全球覆盖）
+               https://open-meteo.com/
+               城市名 → 经纬度：https://geocoding-api.open-meteo.com/v1/search
+               天气预报：https://api.open-meteo.com/v1/forecast
+  mock         离线 Mock（单元测试 / 演示用）
 
   包含的 Skill 类
   ────────────────
-  WeatherCurrentSkill   当前天气（温度、湿度、风速、天气描述）
-  WeatherForecastSkill  多日天气预报（1-7 天）
-  WeatherAlertSkill     气象预警查询（暴雨、大风、高温等）
+  WeatherCurrentSkill   当前天气
+  WeatherForecastSkill  多日天气预报（1-16 天）
+  WeatherAlertSkill     气象预警（open-meteo 不提供，返回空列表）
 
-  支持的数据源（通过 provider 参数切换）
-  ───────────────────────────────────────
-  openweathermap   OpenWeatherMap API（免费，需注册 API Key）
-  wttr.in          wttr.in（完全免费，无需注册）
-  mock             离线 Mock 数据（测试/演示用）
-
-  使用示例
+  工厂函数
   ─────────
-  # 开发模式（无 API Key）
-  skill = WeatherCurrentSkill(provider="mock")
-
-  # 生产模式（OpenWeatherMap）
-  skill = WeatherCurrentSkill(
-      provider="openweathermap",
-      api_key="your_owm_key",
-  )
-
-  # 注册到容器
-  container.skill_registry.register(WeatherCurrentSkill(provider="mock"))
-  container.skill_registry.register(WeatherForecastSkill(provider="mock"))
+  create_weather_skills(provider="open-meteo")   批量创建所有 Skill
 """
 from __future__ import annotations
 
 import asyncio
-import json
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
@@ -60,21 +40,20 @@ log = structlog.get_logger(__name__)
 
 @dataclass
 class WeatherCondition:
-    """标准化天气条件，屏蔽不同数据源的字段差异。"""
     city:        str
     country:     str
-    temperature: float          # 摄氏度
-    feels_like:  float          # 体感温度
-    humidity:    int            # 湿度 %
-    wind_speed:  float          # 风速 m/s
-    wind_dir:    str            # 风向（N/NE/E/SE/S/SW/W/NW）
-    description: str            # 天气描述（晴、多云、小雨……）
-    visibility:  int            # 能见度（米）
-    pressure:    int            # 气压（hPa）
-    uv_index:    float          # 紫外线指数
-    sunrise:     str            # 日出时间 HH:MM
-    sunset:      str            # 日落时间 HH:MM
-    timestamp:   str            # 观测时间 ISO 8601
+    temperature: float
+    feels_like:  float
+    humidity:    int
+    wind_speed:  float
+    wind_dir:    str
+    description: str
+    visibility:  int        # 米
+    pressure:    int        # hPa
+    uv_index:    float
+    sunrise:     str        # HH:MM
+    sunset:      str        # HH:MM
+    timestamp:   str        # ISO 8601
 
     def to_dict(self) -> dict:
         return {
@@ -85,7 +64,8 @@ class WeatherCondition:
             "humidity":    f"{self.humidity}%",
             "wind":        f"{self.wind_speed:.1f} m/s {self.wind_dir}",
             "description": self.description,
-            "visibility":  f"{self.visibility / 1000:.1f} km" if self.visibility >= 1000 else f"{self.visibility} m",
+            "visibility":  (f"{self.visibility / 1000:.1f} km"
+                            if self.visibility >= 1000 else f"{self.visibility} m"),
             "pressure":    f"{self.pressure} hPa",
             "uv_index":    self.uv_index,
             "sunrise":     self.sunrise,
@@ -96,40 +76,38 @@ class WeatherCondition:
 
 @dataclass
 class DailyForecast:
-    """单日预报数据。"""
-    date:         str           # YYYY-MM-DD
-    temp_min:     float
-    temp_max:     float
-    humidity:     int
-    wind_speed:   float
-    description:  str
-    precipitation: float        # 降水概率 %
-    uv_index:     float
+    date:          str
+    temp_min:      float
+    temp_max:      float
+    humidity:      int
+    wind_speed:    float
+    description:   str
+    precipitation: float    # 降水概率 %
+    uv_index:      float
 
     def to_dict(self) -> dict:
         return {
-            "date":         self.date,
-            "temp_range":   f"{self.temp_min:.0f}~{self.temp_max:.0f}°C",
-            "humidity":     f"{self.humidity}%",
-            "wind_speed":   f"{self.wind_speed:.1f} m/s",
-            "description":  self.description,
-            "precipitation":f"{self.precipitation:.0f}%",
-            "uv_index":     self.uv_index,
+            "date":          self.date,
+            "temp_range":    f"{self.temp_min:.0f}~{self.temp_max:.0f}°C",
+            "humidity":      f"{self.humidity}%",
+            "wind_speed":    f"{self.wind_speed:.1f} m/s",
+            "description":   self.description,
+            "precipitation": f"{self.precipitation:.0f}%",
+            "uv_index":      self.uv_index,
         }
 
 
 @dataclass
 class WeatherAlert:
-    """气象预警信息。"""
-    city:       str
-    country:    str
-    event:      str             # 预警事件（暴雨、大风……）
-    severity:   str             # extreme / severe / moderate / minor
-    headline:   str
+    city:        str
+    country:     str
+    event:       str
+    severity:    str
+    headline:    str
     description: str
-    effective:  str             # 生效时间
-    expires:    str             # 失效时间
-    source:     str             # 发布机构
+    effective:   str
+    expires:     str
+    source:      str
 
 
 # ─────────────────────────────────────────────────────────────
@@ -137,15 +115,13 @@ class WeatherAlert:
 # ─────────────────────────────────────────────────────────────
 
 class _TTLCache:
-    """简单 TTL 缓存，避免短时间内重复调用 API。"""
-
     def __init__(self, ttl_sec: int = 600) -> None:
-        self._ttl    = ttl_sec
+        self._ttl   = ttl_sec
         self._store: dict[str, tuple[float, Any]] = {}
 
     def get(self, key: str) -> Any | None:
         entry = self._store.get(key)
-        if entry is None:
+        if not entry:
             return None
         ts, value = entry
         if time.monotonic() - ts > self._ttl:
@@ -156,224 +132,221 @@ class _TTLCache:
     def set(self, key: str, value: Any) -> None:
         self._store[key] = (time.monotonic(), value)
 
-    def invalidate(self, key: str) -> None:
-        self._store.pop(key, None)
-
 
 # ─────────────────────────────────────────────────────────────
-# 数据源适配器
+# 工具函数
 # ─────────────────────────────────────────────────────────────
 
 def _wind_direction(degrees: float) -> str:
-    """将风向角度转为 8 方位缩写。"""
-    dirs = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"]
+    dirs = ["北", "东北", "东", "东南", "南", "西南", "西", "西北"]
     return dirs[round(degrees / 45) % 8]
 
 
-def _ts_to_hhmm(unix_ts: int, offset_sec: int = 0) -> str:
-    """Unix timestamp → HH:MM（含时区偏移）。"""
-    dt = datetime.fromtimestamp(unix_ts + offset_sec, tz=timezone.utc)
-    return dt.strftime("%H:%M")
+# WMO Weather Interpretation Codes → 中文描述
+_WMO_CODE: dict[int, str] = {
+    0: "晴",
+    1: "大部晴朗", 2: "局部多云", 3: "阴",
+    45: "雾", 48: "冻雾",
+    51: "小毛毛雨", 53: "中毛毛雨", 55: "大毛毛雨",
+    56: "小冻毛毛雨", 57: "大冻毛毛雨",
+    61: "小雨", 63: "中雨", 65: "大雨",
+    66: "小冻雨", 67: "大冻雨",
+    71: "小雪", 73: "中雪", 75: "大雪", 77: "雪粒",
+    80: "小阵雨", 81: "中阵雨", 82: "强阵雨",
+    85: "小阵雪", 86: "大阵雪",
+    95: "雷暴", 96: "雷暴伴小冰雹", 99: "雷暴伴大冰雹",
+}
+
+def _wmo_desc(code: int | None) -> str:
+    if code is None:
+        return "未知"
+    return _WMO_CODE.get(int(code), f"天气代码{code}")
 
 
-class OpenWeatherMapAdapter:
-    """OpenWeatherMap API 适配器（免费版支持当前天气和5天预报）。"""
+# ─────────────────────────────────────────────────────────────
+# Open-Meteo 适配器
+# ─────────────────────────────────────────────────────────────
 
-    BASE = "https://api.openweathermap.org/data/2.5"
+class OpenMeteoAdapter:
+    """
+    Open-Meteo 适配器。
 
-    def __init__(self, api_key: str) -> None:
-        self._key = api_key
+    完全免费，无需 API Key，全球城市覆盖，小时/日级预报，最多 16 天。
+    文档：https://open-meteo.com/en/docs
+    """
+
+    GEO_URL     = "https://geocoding-api.open-meteo.com/v1/search"
+    WEATHER_URL = "https://api.open-meteo.com/v1/forecast"
+
+    def __init__(self) -> None:
+        # 城市名 → (lat, lng, country, timezone) 的本地缓存（进程级别，60 分钟 TTL）
+        self._geo_cache = _TTLCache(ttl_sec=3600)
+
+    # ── 地理编码 ──────────────────────────────────────────────
+
+    async def _geocode(self, city: str, client) -> tuple[float, float, str, str]:
+        """城市名 → (latitude, longitude, country, timezone)"""
+        cached = self._geo_cache.get(city)
+        if cached:
+            return cached
+
+        r = await client.get(
+            self.GEO_URL,
+            params={"name": city, "count": 1, "language": "zh", "format": "json"},
+        )
+        r.raise_for_status()
+        d = r.json()
+
+        results = d.get("results") or []
+        if not results:
+            raise ValueError(
+                f"Open-Meteo 找不到城市 {city!r}，"
+                "请尝试英文城市名（如 Shanghai）或 '城市名,国家代码'（如 '广州,CN'）"
+            )
+
+        loc      = results[0]
+        lat      = float(loc["latitude"])
+        lng      = float(loc["longitude"])
+        country  = loc.get("country", "")
+        tz       = loc.get("timezone", "auto")
+
+        self._geo_cache.set(city, (lat, lng, country, tz))
+        return lat, lng, country, tz
+
+    # ── 当前天气 ──────────────────────────────────────────────
 
     async def current(self, city: str, units: str = "metric") -> WeatherCondition:
         import httpx
-        params = {"q": city, "appid": self._key, "units": units, "lang": "zh_cn"}
         async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.get(f"{self.BASE}/weather", params=params)
+            lat, lng, country, tz = await self._geocode(city, client)
+
+            r = await client.get(
+                self.WEATHER_URL,
+                params={
+                    "latitude":  lat,
+                    "longitude": lng,
+                    "timezone":  tz,
+                    "current": ",".join([
+                        "temperature_2m",
+                        "relative_humidity_2m",
+                        "apparent_temperature",
+                        "weather_code",
+                        "wind_speed_10m",
+                        "wind_direction_10m",
+                        "surface_pressure",
+                        "visibility",
+                        "uv_index",
+                        "precipitation",
+                    ]),
+                    # 同时拿今日日出/日落
+                    "daily":     "sunrise,sunset",
+                    "forecast_days": 1,
+                    "wind_speed_unit": "ms",   # m/s
+                },
+            )
             r.raise_for_status()
             d = r.json()
 
-        tz_offset = d.get("timezone", 0)
+        cur = d.get("current", {})
+        daily = d.get("daily", {})
+
+        sunrise = (daily.get("sunrise") or [""])[0]
+        sunset  = (daily.get("sunset")  or [""])[0]
+        # ISO datetime → HH:MM
+        sunrise = sunrise[11:16] if len(sunrise) > 10 else sunrise
+        sunset  = sunset[11:16]  if len(sunset)  > 10 else sunset
+
         return WeatherCondition(
-            city=d["name"],
-            country=d["sys"]["country"],
-            temperature=d["main"]["temp"],
-            feels_like=d["main"]["feels_like"],
-            humidity=d["main"]["humidity"],
-            wind_speed=d["wind"]["speed"],
-            wind_dir=_wind_direction(d["wind"].get("deg", 0)),
-            description=d["weather"][0]["description"],
-            visibility=d.get("visibility", 0),
-            pressure=d["main"]["pressure"],
-            uv_index=0.0,   # 需单独 UV Index 接口
-            sunrise=_ts_to_hhmm(d["sys"]["sunrise"], tz_offset),
-            sunset=_ts_to_hhmm(d["sys"]["sunset"], tz_offset),
-            timestamp=datetime.now(timezone.utc).isoformat(),
+            city        = city,
+            country     = country,
+            temperature = float(cur.get("temperature_2m") or 0),
+            feels_like  = float(cur.get("apparent_temperature") or 0),
+            humidity    = int(cur.get("relative_humidity_2m") or 0),
+            wind_speed  = float(cur.get("wind_speed_10m") or 0),
+            wind_dir    = _wind_direction(float(cur.get("wind_direction_10m") or 0)),
+            description = _wmo_desc(cur.get("weather_code")),
+            visibility  = int(float(cur.get("visibility") or 0)),
+            pressure    = int(float(cur.get("surface_pressure") or 0)),
+            uv_index    = float(cur.get("uv_index") or 0),
+            sunrise     = sunrise,
+            sunset      = sunset,
+            timestamp   = datetime.now(timezone.utc).isoformat(),
         )
+
+    # ── 多日预报 ──────────────────────────────────────────────
 
     async def forecast(self, city: str, days: int, units: str = "metric") -> list[DailyForecast]:
         import httpx
-        params = {"q": city, "appid": self._key, "units": units,
-                  "cnt": min(days * 8, 40), "lang": "zh_cn"}
+        days = max(1, min(16, days))   # Open-Meteo 最多支持 16 天
+
         async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.get(f"{self.BASE}/forecast", params=params)
+            lat, lng, country, tz = await self._geocode(city, client)
+
+            r = await client.get(
+                self.WEATHER_URL,
+                params={
+                    "latitude":       lat,
+                    "longitude":      lng,
+                    "timezone":       tz,
+                    "forecast_days":  days,
+                    "daily": ",".join([
+                        "weather_code",
+                        "temperature_2m_max",
+                        "temperature_2m_min",
+                        "precipitation_probability_max",
+                        "precipitation_sum",
+                        "wind_speed_10m_max",
+                        "uv_index_max",
+                        "relative_humidity_2m_max",
+                    ]),
+                    "wind_speed_unit": "ms",
+                },
+            )
             r.raise_for_status()
             d = r.json()
 
-        # 按日期聚合 3 小时数据
-        by_date: dict[str, list] = {}
-        for item in d["list"]:
-            date = item["dt_txt"][:10]
-            by_date.setdefault(date, []).append(item)
+        daily = d.get("daily", {})
+        dates  = daily.get("time") or []
+        codes  = daily.get("weather_code") or []
+        t_max  = daily.get("temperature_2m_max") or []
+        t_min  = daily.get("temperature_2m_min") or []
+        precip = daily.get("precipitation_probability_max") or []
+        wind   = daily.get("wind_speed_10m_max") or []
+        uv     = daily.get("uv_index_max") or []
+        hum    = daily.get("relative_humidity_2m_max") or []
 
         result = []
-        for date, items in sorted(by_date.items())[:days]:
-            temps  = [i["main"]["temp"] for i in items]
-            precip = max((i.get("pop", 0) * 100) for i in items)
+        for i, date in enumerate(dates[:days]):
+            def _v(lst, idx, default=0):
+                try:
+                    v = lst[idx]
+                    return v if v is not None else default
+                except IndexError:
+                    return default
+
             result.append(DailyForecast(
-                date=date,
-                temp_min=min(temps),
-                temp_max=max(temps),
-                humidity=round(sum(i["main"]["humidity"] for i in items) / len(items)),
-                wind_speed=max(i["wind"]["speed"] for i in items),
-                description=items[len(items) // 2]["weather"][0]["description"],
-                precipitation=precip,
-                uv_index=0.0,
+                date          = date,
+                temp_max      = float(_v(t_max, i)),
+                temp_min      = float(_v(t_min, i)),
+                humidity      = int(_v(hum, i)),
+                wind_speed    = float(_v(wind, i)),
+                description   = _wmo_desc(_v(codes, i, None)),
+                precipitation = float(_v(precip, i)),
+                uv_index      = float(_v(uv, i)),
             ))
         return result
 
+    # ── 预警（Open-Meteo 不提供，返回空列表）──────────────────
+
     async def alerts(self, city: str) -> list[WeatherAlert]:
-        # 免费版 OWM 不提供预警，返回空列表
         return []
 
 
-class WttrInAdapter:
-    """wttr.in 适配器，完全免费，无需注册，支持中文城市名。"""
-
-    BASE = "https://wttr.in"
-
-    @staticmethod
-    def _ampm_to_hhmm(s: str) -> str:
-        """将 wttr.in 返回的 '07:03 AM' / '07:18 PM' 转为 24 小时 'HH:MM'。"""
-        s = s.strip()
-        try:
-            dt = datetime.strptime(s, "%I:%M %p")
-            return dt.strftime("%H:%M")
-        except ValueError:
-            # 已经是 HH:MM 或格式未知，原样返回
-            return s
-
-    @staticmethod
-    def _desc(node: dict) -> str:
-        """优先使用 lang_zh（中文），回退到 weatherDesc（英文）。"""
-        zh = node.get("lang_zh")
-        if zh and isinstance(zh, list) and zh[0].get("value"):
-            return zh[0]["value"]
-        en = node.get("weatherDesc")
-        if en and isinstance(en, list):
-            return en[0].get("value", "")
-        return ""
-
-    async def current(self, city: str, units: str = "metric") -> WeatherCondition:
-        import httpx
-        url = f"{self.BASE}/{city}"
-        # lang=zh 使 wttr.in 在 lang_zh 字段中返回中文天气描述
-        params = {"format": "j1", "lang": "zh"}
-        async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.get(url, params=params)
-            r.raise_for_status()
-            d = r.json()
-
-        cur  = d["current_condition"][0]
-        area = d["nearest_area"][0]
-        country = area["country"][0]["value"]
-        # Bug fix #1: areaName 返回地图 tile 名（如 "Pihsien"），直接用查询城市名
-        city_name = city
-
-        temp_c   = float(cur["temp_C"])
-        feels_c  = float(cur["FeelsLikeC"])
-        humidity = int(cur["humidity"])
-        wind_ms  = float(cur["windspeedKmph"]) / 3.6
-        wind_deg = float(cur["winddirDegree"])
-        # Bug fix #2: 优先取中文描述（lang_zh），无则退回英文
-        desc     = self._desc(cur)
-        vis_m    = int(cur["visibility"]) * 1000
-        pressure = int(cur["pressure"])
-        uv       = float(cur.get("uvIndex", 0))
-
-        # Bug fix #3: 日出日落由 "07:03 AM" 格式转为 24 小时 "07:03"
-        today  = d["weather"][0]
-        astro  = today.get("astronomy", [{}])[0]
-        sunrise = self._ampm_to_hhmm(astro.get("sunrise", "--:--"))
-        sunset  = self._ampm_to_hhmm(astro.get("sunset",  "--:--"))
-
-        return WeatherCondition(
-            city=city_name,
-            country=country,
-            temperature=temp_c,
-            feels_like=feels_c,
-            humidity=humidity,
-            wind_speed=round(wind_ms, 1),
-            wind_dir=_wind_direction(wind_deg),
-            description=desc,
-            visibility=vis_m,
-            pressure=pressure,
-            uv_index=uv,
-            sunrise=sunrise,
-            sunset=sunset,
-            timestamp=datetime.now(timezone.utc).isoformat(),
-        )
-
-    async def forecast(self, city: str, days: int, units: str = "metric") -> list[DailyForecast]:
-        import httpx
-        url = f"{self.BASE}/{city}"
-        params = {"format": "j1", "lang": "zh"}
-        async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.get(url, params=params)
-            r.raise_for_status()
-            d = r.json()
-
-        if not d or not isinstance(d, dict):
-            raise ValueError(f"wttr.in 返回了无效响应：{str(d)[:200]}")
-
-        weather_days = d.get("weather") or []
-        if not weather_days:
-            raise ValueError(f"wttr.in 未返回预报数据，城市可能无法识别：{city!r}")
-
-        result = []
-        for day in weather_days[:days]:
-            if not day:
-                continue
-            hourly  = day.get("hourly") or []
-            precip  = max((float(h.get("chanceofrain") or 0) for h in hourly), default=0.0) if hourly else 0.0
-            wind_ms = max((float(h.get("windspeedKmph") or 0) for h in hourly), default=0.0) / 3.6 if hourly else 0.0
-            mid     = hourly[len(hourly) // 2] if hourly else {}
-            desc    = self._desc(mid)
-            uv      = float(day.get("uvIndex") or 0)
-
-            result.append(DailyForecast(
-                date        = day.get("date", ""),
-                temp_min    = float(day.get("mintempC") or 0),
-                temp_max    = float(day.get("maxtempC") or 0),
-                humidity    = round(sum(int(h.get("humidity") or 0) for h in hourly) / max(len(hourly), 1)) if hourly else 0,
-                wind_speed  = round(wind_ms, 1),
-                description = desc,
-                precipitation = precip,
-                uv_index    = uv,
-            ))
-        return result
-
-    async def alerts(self, city: str) -> list[WeatherAlert]:
-        # wttr.in 不提供预警数据
-        return []
-
+# ─────────────────────────────────────────────────────────────
+# Mock 适配器（离线测试用）
+# ─────────────────────────────────────────────────────────────
 
 class MockWeatherAdapter:
-    """
-    离线 Mock 适配器，无需网络，用于测试和演示。
-    数据基于城市名做哈希以产生稳定但不同的结果。
-    """
-
-    # 天气描述池
     _CONDITIONS = ["晴", "多云", "阴", "小雨", "中雨", "阵雨", "雷阵雨", "小雪", "多云转晴"]
     _ALERTS     = ["暴雨橙色预警", "大风蓝色预警", "高温黄色预警", ""]
 
@@ -381,233 +354,66 @@ class MockWeatherAdapter:
         return sum(ord(c) for c in city) % 100
 
     async def current(self, city: str, units: str = "metric") -> WeatherCondition:
-        seed = self._seed(city)
+        s = self._seed(city)
         return WeatherCondition(
             city=city, country="CN",
-            temperature=15.0 + seed * 0.2,
-            feels_like=14.0 + seed * 0.2,
-            humidity=50 + seed % 40,
-            wind_speed=2.0 + seed * 0.05,
-            wind_dir=["N", "NE", "E", "SE", "S", "SW", "W", "NW"][seed % 8],
-            description=self._CONDITIONS[seed % len(self._CONDITIONS)],
-            visibility=10000 - seed * 50,
-            pressure=1013 + seed % 20,
-            uv_index=round(1.0 + seed * 0.08, 1),
-            sunrise="06:15",
-            sunset="18:45",
+            temperature=15.0 + s * 0.2, feels_like=14.0 + s * 0.2,
+            humidity=50 + s % 40, wind_speed=2.0 + s * 0.05,
+            wind_dir=["北","东北","东","东南","南","西南","西","西北"][s % 8],
+            description=self._CONDITIONS[s % len(self._CONDITIONS)],
+            visibility=10000 - s * 50, pressure=1013 + s % 20,
+            uv_index=round(1.0 + s * 0.08, 1),
+            sunrise="06:15", sunset="18:45",
             timestamp=datetime.now(timezone.utc).isoformat(),
         )
 
     async def forecast(self, city: str, days: int, units: str = "metric") -> list[DailyForecast]:
         from datetime import date, timedelta
-        seed = self._seed(city)
-        result = []
-        for i in range(days):
-            d = (date.today() + timedelta(days=i)).isoformat()
-            result.append(DailyForecast(
-                date=d,
-                temp_min=10.0 + seed * 0.1 + i * 0.5,
-                temp_max=20.0 + seed * 0.1 + i * 0.3,
-                humidity=55 + (seed + i * 7) % 35,
-                wind_speed=2.5 + (seed + i) * 0.1,
-                description=self._CONDITIONS[(seed + i) % len(self._CONDITIONS)],
-                precipitation=float((seed + i * 11) % 80),
-                uv_index=round(2.0 + (seed + i) * 0.1, 1),
-            ))
-        return result
+        s = self._seed(city)
+        return [
+            DailyForecast(
+                date          = (date.today() + timedelta(days=i)).isoformat(),
+                temp_min      = 10.0 + s * 0.1 + i * 0.5,
+                temp_max      = 20.0 + s * 0.1 + i * 0.3,
+                humidity      = 55 + (s + i * 7) % 35,
+                wind_speed    = 2.5 + (s + i) * 0.1,
+                description   = self._CONDITIONS[(s + i) % len(self._CONDITIONS)],
+                precipitation = float((s + i * 11) % 80),
+                uv_index      = round(2.0 + (s + i) * 0.1, 1),
+            )
+            for i in range(days)
+        ]
 
     async def alerts(self, city: str) -> list[WeatherAlert]:
-        seed = self._seed(city)
-        event = self._ALERTS[seed % len(self._ALERTS)]
+        s = self._seed(city)
+        event = self._ALERTS[s % len(self._ALERTS)]
         if not event:
             return []
-        severity_map = {"暴雨橙色预警": "severe", "大风蓝色预警": "moderate",
-                        "高温黄色预警": "moderate"}
+        sev = {"暴雨橙色预警": "severe", "大风蓝色预警": "moderate", "高温黄色预警": "moderate"}
         return [WeatherAlert(
-            city=city, country="CN",
-            event=event,
-            severity=severity_map.get(event, "minor"),
+            city=city, country="CN", event=event,
+            severity=sev.get(event, "minor"),
             headline=f"{city} 发布{event}",
-            description=f"预计未来 24 小时 {city} 将出现强{event[:2]}，请注意防范。",
+            description=f"预计未来 24 小时将出现强{event[:2]}，请注意防范。",
             effective=datetime.now(timezone.utc).isoformat(),
             expires=datetime.now(timezone.utc).replace(hour=23, minute=59).isoformat(),
             source="Mock 气象局",
         )]
 
 
-class QWeatherAdapter:
-    """
-    和风天气（QWeather）适配器。
+# ─────────────────────────────────────────────────────────────
+# 工厂
+# ─────────────────────────────────────────────────────────────
 
-    免费版支持：实时天气、3 日预报、气象预警。
-    注册地址：https://dev.qweather.com/
-    免费配额：1000 次/天（商业版更高）
-
-    城市查询流程：
-      1. GeoAPI 用城市名换取 location_id
-      2. 用 location_id 调实时天气 / 预报 / 预警接口
-    """
-
-    GEO_BASE     = "https://geoapi.qweather.com/v2/city/lookup"
-    WEATHER_BASE = "https://devapi.qweather.com/v7"
-
-    # 和风天气状态码 → 中文天气描述（部分常用）
-    _CODE_DESC: dict[str, str] = {
-        "100": "晴", "101": "多云", "102": "少云", "103": "晴间多云",
-        "104": "阴", "150": "晴（夜）", "151": "多云（夜）",
-        "300": "阵雨", "301": "强阵雨", "302": "雷阵雨", "303": "强雷阵雨",
-        "304": "雷阵雨伴有冰雹", "305": "小雨", "306": "中雨", "307": "大雨",
-        "308": "极端降雨", "309": "毛毛雨/细雨", "310": "暴雨",
-        "311": "大暴雨", "312": "特大暴雨", "313": "冻雨",
-        "314": "小到中雨", "315": "中到大雨", "316": "大到暴雨",
-        "317": "暴雨到大暴雨", "318": "大暴雨到特大暴雨",
-        "399": "雨", "400": "小雪", "401": "中雪", "402": "大雪",
-        "403": "暴雪", "404": "雨夹雪", "405": "雨雪天气",
-        "406": "阵雨夹雪", "407": "阵雪", "408": "小到中雪",
-        "409": "中到大雪", "410": "大到暴雪", "499": "雪",
-        "500": "薄雾", "501": "雾", "502": "霾", "503": "扬沙",
-        "504": "浮尘", "507": "沙尘暴", "508": "强沙尘暴",
-        "509": "浓雾", "510": "强浓雾", "511": "中度霾",
-        "512": "重度霾", "513": "严重霾", "514": "大雾",
-        "515": "特强浓雾", "900": "热", "901": "冷", "999": "未知",
-    }
-
-    def __init__(self, api_key: str) -> None:
-        if not api_key:
-            raise ValueError("QWeather 需要 api_key，请前往 https://dev.qweather.com/ 免费注册")
-        self._key = api_key
-
-    async def _get_location_id(self, city: str, client) -> str:
-        """城市名 → QWeather location_id。"""
-        r = await client.get(
-            self.GEO_BASE,
-            params={"location": city, "key": self._key, "number": 1},
-        )
-        r.raise_for_status()
-        d = r.json()
-        if d.get("code") != "200" or not d.get("location"):
-            raise ValueError(
-                f"和风天气找不到城市 {city!r}，"
-                f"返回码：{d.get('code')}，建议用拼音或英文城市名"
-            )
-        return d["location"][0]["id"]
-
-    def _icon_to_desc(self, icon: str) -> str:
-        return self._CODE_DESC.get(str(icon), f"天气代码{icon}")
-
-    async def current(self, city: str, units: str = "metric") -> WeatherCondition:
-        import httpx
-        async with httpx.AsyncClient(timeout=10) as client:
-            loc_id = await self._get_location_id(city, client)
-
-            r = await client.get(
-                f"{self.WEATHER_BASE}/weather/now",
-                params={"location": loc_id, "key": self._key},
-            )
-            r.raise_for_status()
-            d = r.json()
-
-        if d.get("code") != "200":
-            raise ValueError(f"和风天气实时接口错误：{d.get('code')}")
-
-        now = d["now"]
-        return WeatherCondition(
-            city        = city,
-            country     = "CN",
-            temperature = float(now["temp"]),
-            feels_like  = float(now["feelsLike"]),
-            humidity    = int(now["humidity"]),
-            wind_speed  = float(now["windSpeed"]),
-            wind_dir    = now.get("windDir", ""),
-            description = self._icon_to_desc(now.get("icon", "999")),
-            visibility  = int(float(now.get("vis", 0)) * 1000),   # km → m
-            pressure    = int(now.get("pressure", 0)),
-            uv_index    = 0.0,   # now 接口不含UV，通过 indices 接口单独获取
-            sunrise     = "--:--",
-            sunset      = "--:--",
-            timestamp   = datetime.now(timezone.utc).isoformat(),
-        )
-
-    async def forecast(self, city: str, days: int, units: str = "metric") -> list[DailyForecast]:
-        import httpx
-        # 免费版最多 3 日，付费版可用 7d / 10d / 15d 端点
-        endpoint = "3d" if days <= 3 else "7d"
-        async with httpx.AsyncClient(timeout=10) as client:
-            loc_id = await self._get_location_id(city, client)
-
-            r = await client.get(
-                f"{self.WEATHER_BASE}/weather/{endpoint}",
-                params={"location": loc_id, "key": self._key},
-            )
-            r.raise_for_status()
-            d = r.json()
-
-        if d.get("code") != "200":
-            raise ValueError(f"和风天气预报接口错误：{d.get('code')}")
-
-        result = []
-        for day in (d.get("daily") or [])[:days]:
-            result.append(DailyForecast(
-                date          = day.get("fxDate", ""),
-                temp_min      = float(day.get("tempMin", 0)),
-                temp_max      = float(day.get("tempMax", 0)),
-                humidity      = int(day.get("humidity", 0)),
-                wind_speed    = float(day.get("windSpeedDay", 0)),
-                description   = self._icon_to_desc(day.get("iconDay", "999")),
-                precipitation = float(day.get("precip", 0)),
-                uv_index      = float(day.get("uvIndex", 0)),
-            ))
-        return result
-
-    async def alerts(self, city: str) -> list[WeatherAlert]:
-        import httpx
-        async with httpx.AsyncClient(timeout=10) as client:
-            loc_id = await self._get_location_id(city, client)
-
-            r = await client.get(
-                f"{self.WEATHER_BASE}/warning/now",
-                params={"location": loc_id, "key": self._key},
-            )
-            r.raise_for_status()
-            d = r.json()
-
-        # code=204 表示无预警，正常情况
-        if d.get("code") not in ("200", "204"):
-            raise ValueError(f"和风天气预警接口错误：{d.get('code')}")
-
-        result = []
-        for w in d.get("warning") or []:
-            result.append(WeatherAlert(
-                city        = city,
-                country     = "CN",
-                event       = w.get("typeName", ""),
-                severity    = w.get("level", "minor").lower(),
-                headline    = w.get("title", ""),
-                description = w.get("text", ""),
-                effective   = w.get("pubTime", ""),
-                expires     = w.get("endTime", ""),
-                source      = w.get("sender", "气象局"),
-            ))
-        return result
-
-
-def _build_adapter(provider: str, api_key: str | None) -> Any:
-    """按 provider 名称实例化对应的适配器。"""
-    if provider == "qweather":
-        if not api_key:
-            raise ValueError("provider='qweather' 需要 api_key。"
-                             "免费注册：https://dev.qweather.com/")
-        return QWeatherAdapter(api_key)
-    if provider == "openweathermap":
-        if not api_key:
-            raise ValueError("provider='openweathermap' 需要 api_key。"
-                             "免费注册：https://home.openweathermap.org/users/sign_up")
-        return OpenWeatherMapAdapter(api_key)
-    if provider == "wttr.in":
-        return WttrInAdapter()
+def _build_adapter(provider: str, api_key: str | None = None) -> Any:
+    if provider in ("open-meteo", "open_meteo", "openmeteo"):
+        return OpenMeteoAdapter()
     if provider == "mock":
         return MockWeatherAdapter()
-    raise ValueError(f"未知 provider: {provider!r}，可选 qweather / openweathermap / wttr.in / mock")
+    raise ValueError(
+        f"未知 provider: {provider!r}，可选值：open-meteo / mock\n"
+        "Open-Meteo 完全免费且无需 API Key：https://open-meteo.com/"
+    )
 
 
 # ─────────────────────────────────────────────────────────────
@@ -617,27 +423,22 @@ def _build_adapter(provider: str, api_key: str | None) -> Any:
 class WeatherCurrentSkill:
     """
     当前天气查询 Skill。
-
-    返回字段：城市、国家、温度、体感温度、湿度、风速风向、
-              天气描述、能见度、气压、紫外线指数、日出/日落。
-
-    缓存：相同城市 10 分钟内复用结果（可配置）。
-    重试：网络失败时最多重试 2 次，每次间隔 1 秒。
+    使用 Open-Meteo 免费 API，无需 Key，全球覆盖。
     """
 
     def __init__(
         self,
-        provider:   str         = "mock",
-        api_key:    str | None  = None,
-        units:      str         = "metric",   # metric | imperial
-        cache_ttl:  int         = 600,        # 缓存秒数，0=不缓存
+        provider:    str        = "open-meteo",
+        api_key:     str | None = None,
+        units:       str        = "metric",
+        cache_ttl:   int        = 600,
         max_retries: int        = 2,
     ) -> None:
         self._adapter   = _build_adapter(provider, api_key)
         self._units     = units
         self._cache     = _TTLCache(cache_ttl) if cache_ttl > 0 else None
         self._max_retry = max_retries
-        log.info("weather_current.init", provider=provider, units=units, cache_ttl=cache_ttl)
+        log.info("weather_current.init", provider=provider)
 
     @property
     def descriptor(self) -> ToolDescriptor:
@@ -653,7 +454,10 @@ class WeatherCurrentSkill:
                 "properties": {
                     "city": {
                         "type": "string",
-                        "description": "城市名，支持中文（如「北京」）或英文（如「Beijing」）",
+                        "description": (
+                            "城市名，支持中文（如「上海」）或英文（如「Shanghai」）；"
+                            "若中文找不到，可尝试拼音或英文"
+                        ),
                     },
                     "units": {
                         "type": "string",
@@ -673,65 +477,57 @@ class WeatherCurrentSkill:
     async def execute(self, arguments: dict[str, Any]) -> dict[str, Any]:
         city  = arguments["city"].strip()
         units = arguments.get("units", self._units)
+        key   = f"current:{city}:{units}"
 
-        # 缓存命中
-        cache_key = f"current:{city}:{units}"
         if self._cache:
-            cached = self._cache.get(cache_key)
+            cached = self._cache.get(key)
             if cached is not None:
-                log.debug("weather_current.cache_hit", city=city)
                 return {**cached, "_cached": True}
 
-        # 带重试的网络请求
         last_exc: Exception | None = None
         for attempt in range(self._max_retry + 1):
             try:
-                condition = await self._adapter.current(city, units)
-                result = condition.to_dict()
+                cond   = await self._adapter.current(city, units)
+                result = cond.to_dict()
                 if self._cache:
-                    self._cache.set(cache_key, result)
+                    self._cache.set(key, result)
                 log.info("weather_current.success", city=city, attempt=attempt)
                 return result
             except Exception as exc:
                 last_exc = exc
                 if attempt < self._max_retry:
-                    wait = 1.0 * (attempt + 1)
+                    await asyncio.sleep(1.0 * (attempt + 1))
                     log.warning("weather_current.retry",
-                                city=city, attempt=attempt, wait=wait, error=str(exc))
-                    await asyncio.sleep(wait)
+                                city=city, attempt=attempt, error=str(exc))
 
-        # 所有重试耗尽
         log.error("weather_current.failed", city=city, error=str(last_exc))
         raise RuntimeError(f"无法获取 {city!r} 的天气数据：{last_exc}") from last_exc
 
 
 class WeatherForecastSkill:
     """
-    多日天气预报 Skill（1-7 天）。
-
-    每一天返回：日期、最低/最高温度、湿度、风速、天气描述、
-                降水概率、紫外线指数。
+    多日天气预报 Skill（1-16 天，Open-Meteo 免费支持最多 16 天）。
     """
 
     def __init__(
         self,
-        provider:    str        = "mock",
+        provider:    str        = "open-meteo",
         api_key:     str | None = None,
         units:       str        = "metric",
-        cache_ttl:   int        = 1800,   # 预报缓存 30 分钟
+        cache_ttl:   int        = 1800,
         max_retries: int        = 2,
     ) -> None:
-        self._adapter    = _build_adapter(provider, api_key)
-        self._units      = units
-        self._cache      = _TTLCache(cache_ttl) if cache_ttl > 0 else None
-        self._max_retry  = max_retries
+        self._adapter   = _build_adapter(provider, api_key)
+        self._units     = units
+        self._cache     = _TTLCache(cache_ttl) if cache_ttl > 0 else None
+        self._max_retry = max_retries
 
     @property
     def descriptor(self) -> ToolDescriptor:
         return ToolDescriptor(
             name="weather_forecast",
             description=(
-                "查询城市未来 1-7 天的天气预报。返回每天的温度区间、"
+                "查询城市未来 1-16 天的天气预报。返回每天的温度区间、"
                 "降水概率、风速、天气描述和紫外线指数。"
                 "适合回答「这周XX天气怎么样」「周末适合去XX吗」等问题。"
             ),
@@ -745,9 +541,9 @@ class WeatherForecastSkill:
                     "days": {
                         "type": "integer",
                         "minimum": 1,
-                        "maximum": 7,
+                        "maximum": 16,
                         "default": 3,
-                        "description": "预报天数（1-7 天）",
+                        "description": "预报天数（1-16 天，默认 3 天）",
                     },
                     "units": {
                         "type": "string",
@@ -765,12 +561,12 @@ class WeatherForecastSkill:
 
     async def execute(self, arguments: dict[str, Any]) -> dict[str, Any]:
         city  = arguments["city"].strip()
-        days  = max(1, min(7, int(arguments.get("days", 3))))
+        days  = max(1, min(16, int(arguments.get("days", 3))))
         units = arguments.get("units", self._units)
+        key   = f"forecast:{city}:{days}:{units}"
 
-        cache_key = f"forecast:{city}:{days}:{units}"
         if self._cache:
-            cached = self._cache.get(cache_key)
+            cached = self._cache.get(key)
             if cached is not None:
                 return {**cached, "_cached": True}
 
@@ -782,52 +578,34 @@ class WeatherForecastSkill:
                     "city":     city,
                     "days":     days,
                     "forecast": [f.to_dict() for f in forecasts],
-                    "summary":  self._summarize(forecasts),
+                    "summary":  _summarize_forecast(forecasts),
                 }
                 if self._cache:
-                    self._cache.set(cache_key, result)
+                    self._cache.set(key, result)
                 log.info("weather_forecast.success", city=city, days=days, attempt=attempt)
                 return result
             except Exception as exc:
                 last_exc = exc
                 if attempt < self._max_retry:
                     await asyncio.sleep(1.0 * (attempt + 1))
+                    log.warning("weather_forecast.retry",
+                                city=city, attempt=attempt, error=str(exc))
 
         raise RuntimeError(f"无法获取 {city!r} 的预报数据：{last_exc}") from last_exc
-
-    @staticmethod
-    def _summarize(forecasts: list[DailyForecast]) -> str:
-        """生成人类可读的预报摘要。"""
-        if not forecasts:
-            return "暂无预报数据"
-        rainy = [f for f in forecasts if f.precipitation >= 50]
-        sunny = [f for f in forecasts if f.precipitation < 20 and "晴" in f.description]
-        parts = []
-        if rainy:
-            dates = "/".join(f.date[5:] for f in rainy)
-            parts.append(f"{dates} 降水概率较高")
-        if sunny:
-            dates = "/".join(f.date[5:] for f in sunny)
-            parts.append(f"{dates} 晴好")
-        temps = [f.temp_max for f in forecasts]
-        parts.append(f"最高温 {min(temps):.0f}~{max(temps):.0f}°C")
-        return "，".join(parts) if parts else "天气平稳"
 
 
 class WeatherAlertSkill:
     """
     气象预警查询 Skill。
-
-    查询指定城市是否有当前有效的气象预警（暴雨、大风、高温等），
-    返回预警等级、描述、生效时间和发布机构。
-    无预警时返回空列表。
+    Open-Meteo 不提供官方预警接口，始终返回空列表（无预警）。
+    如需真实预警数据，请配置和风天气（QWeather）并切换 provider。
     """
 
     def __init__(
         self,
-        provider:    str        = "mock",
+        provider:    str        = "open-meteo",
         api_key:     str | None = None,
-        cache_ttl:   int        = 300,    # 预警缓存 5 分钟
+        cache_ttl:   int        = 300,
         max_retries: int        = 2,
     ) -> None:
         self._adapter   = _build_adapter(provider, api_key)
@@ -840,17 +618,13 @@ class WeatherAlertSkill:
             name="weather_alert",
             description=(
                 "查询城市当前生效的气象预警信息。"
-                "返回预警事件名称、严重程度（extreme/severe/moderate/minor）、"
-                "详细描述和有效时段。无预警时返回空列表。"
-                "适合回答「XX现在有没有暴雨预警」「出行安全吗」等问题。"
+                "返回预警事件名称、严重程度、详细描述和有效时段。"
+                "无预警时返回空列表。"
             ),
             input_schema={
                 "type": "object",
                 "properties": {
-                    "city": {
-                        "type": "string",
-                        "description": "城市名",
-                    },
+                    "city": {"type": "string", "description": "城市名"},
                 },
                 "required": ["city"],
             },
@@ -862,10 +636,10 @@ class WeatherAlertSkill:
 
     async def execute(self, arguments: dict[str, Any]) -> dict[str, Any]:
         city = arguments["city"].strip()
+        key  = f"alert:{city}"
 
-        cache_key = f"alert:{city}"
         if self._cache:
-            cached = self._cache.get(cache_key)
+            cached = self._cache.get(key)
             if cached is not None:
                 return {**cached, "_cached": True}
 
@@ -891,8 +665,8 @@ class WeatherAlertSkill:
                     ],
                 }
                 if self._cache:
-                    self._cache.set(cache_key, result)
-                log.info("weather_alert.success", city=city, alerts=len(alerts), attempt=attempt)
+                    self._cache.set(key, result)
+                log.info("weather_alert.success", city=city, alerts=len(alerts))
                 return result
             except Exception as exc:
                 last_exc = exc
@@ -903,20 +677,39 @@ class WeatherAlertSkill:
 
 
 # ─────────────────────────────────────────────────────────────
+# 辅助：预报摘要
+# ─────────────────────────────────────────────────────────────
+
+def _summarize_forecast(forecasts: list[DailyForecast]) -> str:
+    if not forecasts:
+        return "暂无预报数据"
+    rainy = [f for f in forecasts if f.precipitation >= 50]
+    sunny = [f for f in forecasts if f.precipitation < 20 and "晴" in f.description]
+    parts = []
+    if rainy:
+        parts.append(f"{'/'.join(f.date[5:] for f in rainy)} 降水概率较高")
+    if sunny:
+        parts.append(f"{'/'.join(f.date[5:] for f in sunny)} 晴好")
+    temps = [f.temp_max for f in forecasts]
+    parts.append(f"最高温 {min(temps):.0f}~{max(temps):.0f}°C")
+    return "，".join(parts) if parts else "天气平稳"
+
+
+# ─────────────────────────────────────────────────────────────
 # 便捷工厂
 # ─────────────────────────────────────────────────────────────
 
 def create_weather_skills(
-    provider:  str        = "mock",
+    provider:  str        = "open-meteo",
     api_key:   str | None = None,
     units:     str        = "metric",
     cache_ttl: int        = 600,
 ) -> list:
     """
-    一次性创建所有天气 Skill，便于批量注册到 SkillRegistry。
+    一次性创建全部天气 Skill，批量注册到 SkillRegistry。
 
-    用法：
-        for skill in create_weather_skills(provider="mock"):
+    示例：
+        for skill in create_weather_skills():
             registry.register(skill)
     """
     return [

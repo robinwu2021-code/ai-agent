@@ -289,20 +289,13 @@ def _build_container(engine_alias: str | None = None):
 
     # Skill 注册表：内置 Skill
     from skills.loader import SkillLoader
-    import os as _os_w
-    # 天气 provider 优先级：qweather（国内稳定）> wttr.in（免费无需注册）> mock
-    _qweather_key = _os_w.environ.get("QWEATHER_API_KEY", "").strip()
-    if _qweather_key:
-        _wx_provider, _wx_key = "qweather", _qweather_key
-        log.info("server.weather_provider", provider="qweather")
-    else:
-        _wx_provider, _wx_key = "wttr.in", None
-        log.info("server.weather_provider", provider="wttr.in",
-                 hint="设置 QWEATHER_API_KEY 可切换为国内和风天气（更稳定）")
+    # 天气使用 Open-Meteo：完全免费，无需 API Key，全球覆盖，最多 16 天预报
+    log.info("server.weather_provider", provider="open-meteo",
+             note="免费无需 Key，https://open-meteo.com/")
 
     skill_registry = LocalSkillRegistry()
     for builtin in [
-        *create_weather_skills(provider=_wx_provider, api_key=_wx_key),
+        *create_weather_skills(provider="open-meteo"),
         CalculatorSkill(),
         HttpRequestSkill(),
     ]:
