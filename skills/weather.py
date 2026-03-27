@@ -326,32 +326,39 @@ class WttrInAdapter:
     async def forecast(self, city: str, days: int, units: str = "metric") -> list[DailyForecast]:
         import httpx
         url = f"{self.BASE}/{city}"
-        # Bug fix #2: 同样加 lang=zh 以获取中文天气描述
         params = {"format": "j1", "lang": "zh"}
         async with httpx.AsyncClient(timeout=10) as client:
             r = await client.get(url, params=params)
             r.raise_for_status()
             d = r.json()
 
+        if not d or not isinstance(d, dict):
+            raise ValueError(f"wttr.in 返回了无效响应：{str(d)[:200]}")
+
+        weather_days = d.get("weather") or []
+        if not weather_days:
+            raise ValueError(f"wttr.in 未返回预报数据，城市可能无法识别：{city!r}")
+
         result = []
-        for day in d["weather"][:days]:
-            hourly  = day.get("hourly", [])
-            precip  = max(float(h.get("chanceofrain", 0)) for h in hourly) if hourly else 0
-            wind_ms = max(float(h.get("windspeedKmph", 0)) for h in hourly) / 3.6 if hourly else 0
-            # Bug fix #2: 中日预报描述也取中文
+        for day in weather_days[:days]:
+            if not day:
+                continue
+            hourly  = day.get("hourly") or []
+            precip  = max((float(h.get("chanceofrain") or 0) for h in hourly), default=0.0) if hourly else 0.0
+            wind_ms = max((float(h.get("windspeedKmph") or 0) for h in hourly), default=0.0) / 3.6 if hourly else 0.0
             mid     = hourly[len(hourly) // 2] if hourly else {}
             desc    = self._desc(mid)
-            uv      = float(day.get("uvIndex", 0))
+            uv      = float(day.get("uvIndex") or 0)
 
             result.append(DailyForecast(
-                date=day["date"],
-                temp_min=float(day["mintempC"]),
-                temp_max=float(day["maxtempC"]),
-                humidity=round(sum(int(h.get("humidity", 0)) for h in hourly) / max(len(hourly), 1)),
-                wind_speed=round(wind_ms, 1),
-                description=desc,
-                precipitation=precip,
-                uv_index=uv,
+                date        = day.get("date", ""),
+                temp_min    = float(day.get("mintempC") or 0),
+                temp_max    = float(day.get("maxtempC") or 0),
+                humidity    = round(sum(int(h.get("humidity") or 0) for h in hourly) / max(len(hourly), 1)) if hourly else 0,
+                wind_speed  = round(wind_ms, 1),
+                description = desc,
+                precipitation = precip,
+                uv_index    = uv,
             ))
         return result
 
@@ -428,8 +435,169 @@ class MockWeatherAdapter:
         )]
 
 
+class QWeatherAdapter:
+    """
+    和风天气（QWeather）适配器。
+
+    免费版支持：实时天气、3 日预报、气象预警。
+    注册地址：https://dev.qweather.com/
+    免费配额：1000 次/天（商业版更高）
+
+    城市查询流程：
+      1. GeoAPI 用城市名换取 location_id
+      2. 用 location_id 调实时天气 / 预报 / 预警接口
+    """
+
+    GEO_BASE     = "https://geoapi.qweather.com/v2/city/lookup"
+    WEATHER_BASE = "https://devapi.qweather.com/v7"
+
+    # 和风天气状态码 → 中文天气描述（部分常用）
+    _CODE_DESC: dict[str, str] = {
+        "100": "晴", "101": "多云", "102": "少云", "103": "晴间多云",
+        "104": "阴", "150": "晴（夜）", "151": "多云（夜）",
+        "300": "阵雨", "301": "强阵雨", "302": "雷阵雨", "303": "强雷阵雨",
+        "304": "雷阵雨伴有冰雹", "305": "小雨", "306": "中雨", "307": "大雨",
+        "308": "极端降雨", "309": "毛毛雨/细雨", "310": "暴雨",
+        "311": "大暴雨", "312": "特大暴雨", "313": "冻雨",
+        "314": "小到中雨", "315": "中到大雨", "316": "大到暴雨",
+        "317": "暴雨到大暴雨", "318": "大暴雨到特大暴雨",
+        "399": "雨", "400": "小雪", "401": "中雪", "402": "大雪",
+        "403": "暴雪", "404": "雨夹雪", "405": "雨雪天气",
+        "406": "阵雨夹雪", "407": "阵雪", "408": "小到中雪",
+        "409": "中到大雪", "410": "大到暴雪", "499": "雪",
+        "500": "薄雾", "501": "雾", "502": "霾", "503": "扬沙",
+        "504": "浮尘", "507": "沙尘暴", "508": "强沙尘暴",
+        "509": "浓雾", "510": "强浓雾", "511": "中度霾",
+        "512": "重度霾", "513": "严重霾", "514": "大雾",
+        "515": "特强浓雾", "900": "热", "901": "冷", "999": "未知",
+    }
+
+    def __init__(self, api_key: str) -> None:
+        if not api_key:
+            raise ValueError("QWeather 需要 api_key，请前往 https://dev.qweather.com/ 免费注册")
+        self._key = api_key
+
+    async def _get_location_id(self, city: str, client) -> str:
+        """城市名 → QWeather location_id。"""
+        r = await client.get(
+            self.GEO_BASE,
+            params={"location": city, "key": self._key, "number": 1},
+        )
+        r.raise_for_status()
+        d = r.json()
+        if d.get("code") != "200" or not d.get("location"):
+            raise ValueError(
+                f"和风天气找不到城市 {city!r}，"
+                f"返回码：{d.get('code')}，建议用拼音或英文城市名"
+            )
+        return d["location"][0]["id"]
+
+    def _icon_to_desc(self, icon: str) -> str:
+        return self._CODE_DESC.get(str(icon), f"天气代码{icon}")
+
+    async def current(self, city: str, units: str = "metric") -> WeatherCondition:
+        import httpx
+        async with httpx.AsyncClient(timeout=10) as client:
+            loc_id = await self._get_location_id(city, client)
+
+            r = await client.get(
+                f"{self.WEATHER_BASE}/weather/now",
+                params={"location": loc_id, "key": self._key},
+            )
+            r.raise_for_status()
+            d = r.json()
+
+        if d.get("code") != "200":
+            raise ValueError(f"和风天气实时接口错误：{d.get('code')}")
+
+        now = d["now"]
+        return WeatherCondition(
+            city        = city,
+            country     = "CN",
+            temperature = float(now["temp"]),
+            feels_like  = float(now["feelsLike"]),
+            humidity    = int(now["humidity"]),
+            wind_speed  = float(now["windSpeed"]),
+            wind_dir    = now.get("windDir", ""),
+            description = self._icon_to_desc(now.get("icon", "999")),
+            visibility  = int(float(now.get("vis", 0)) * 1000),   # km → m
+            pressure    = int(now.get("pressure", 0)),
+            uv_index    = 0.0,   # now 接口不含UV，通过 indices 接口单独获取
+            sunrise     = "--:--",
+            sunset      = "--:--",
+            timestamp   = datetime.now(timezone.utc).isoformat(),
+        )
+
+    async def forecast(self, city: str, days: int, units: str = "metric") -> list[DailyForecast]:
+        import httpx
+        # 免费版最多 3 日，付费版可用 7d / 10d / 15d 端点
+        endpoint = "3d" if days <= 3 else "7d"
+        async with httpx.AsyncClient(timeout=10) as client:
+            loc_id = await self._get_location_id(city, client)
+
+            r = await client.get(
+                f"{self.WEATHER_BASE}/weather/{endpoint}",
+                params={"location": loc_id, "key": self._key},
+            )
+            r.raise_for_status()
+            d = r.json()
+
+        if d.get("code") != "200":
+            raise ValueError(f"和风天气预报接口错误：{d.get('code')}")
+
+        result = []
+        for day in (d.get("daily") or [])[:days]:
+            result.append(DailyForecast(
+                date          = day.get("fxDate", ""),
+                temp_min      = float(day.get("tempMin", 0)),
+                temp_max      = float(day.get("tempMax", 0)),
+                humidity      = int(day.get("humidity", 0)),
+                wind_speed    = float(day.get("windSpeedDay", 0)),
+                description   = self._icon_to_desc(day.get("iconDay", "999")),
+                precipitation = float(day.get("precip", 0)),
+                uv_index      = float(day.get("uvIndex", 0)),
+            ))
+        return result
+
+    async def alerts(self, city: str) -> list[WeatherAlert]:
+        import httpx
+        async with httpx.AsyncClient(timeout=10) as client:
+            loc_id = await self._get_location_id(city, client)
+
+            r = await client.get(
+                f"{self.WEATHER_BASE}/warning/now",
+                params={"location": loc_id, "key": self._key},
+            )
+            r.raise_for_status()
+            d = r.json()
+
+        # code=204 表示无预警，正常情况
+        if d.get("code") not in ("200", "204"):
+            raise ValueError(f"和风天气预警接口错误：{d.get('code')}")
+
+        result = []
+        for w in d.get("warning") or []:
+            result.append(WeatherAlert(
+                city        = city,
+                country     = "CN",
+                event       = w.get("typeName", ""),
+                severity    = w.get("level", "minor").lower(),
+                headline    = w.get("title", ""),
+                description = w.get("text", ""),
+                effective   = w.get("pubTime", ""),
+                expires     = w.get("endTime", ""),
+                source      = w.get("sender", "气象局"),
+            ))
+        return result
+
+
 def _build_adapter(provider: str, api_key: str | None) -> Any:
     """按 provider 名称实例化对应的适配器。"""
+    if provider == "qweather":
+        if not api_key:
+            raise ValueError("provider='qweather' 需要 api_key。"
+                             "免费注册：https://dev.qweather.com/")
+        return QWeatherAdapter(api_key)
     if provider == "openweathermap":
         if not api_key:
             raise ValueError("provider='openweathermap' 需要 api_key。"
@@ -439,7 +607,7 @@ def _build_adapter(provider: str, api_key: str | None) -> Any:
         return WttrInAdapter()
     if provider == "mock":
         return MockWeatherAdapter()
-    raise ValueError(f"未知 provider: {provider!r}，可选 openweathermap / wttr.in / mock")
+    raise ValueError(f"未知 provider: {provider!r}，可选 qweather / openweathermap / wttr.in / mock")
 
 
 # ─────────────────────────────────────────────────────────────

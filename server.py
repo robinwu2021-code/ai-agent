@@ -210,7 +210,7 @@ def _build_container(engine_alias: str | None = None):
     from memory.stores import InMemoryShortTermMemory, InMemoryLongTermMemory
     from mcp.hub import DefaultMCPHub
     from skills.registry import LocalSkillRegistry
-    from skills.weather import WeatherCurrentSkill, WeatherForecastSkill
+    from skills.weather import WeatherCurrentSkill, WeatherForecastSkill, WeatherAlertSkill, create_weather_skills
     from skills.builtins import CalculatorSkill, HttpRequestSkill
     from skills.registry import PythonExecutorSkill, WebSearchSkill
     from utils.llm_config import load_from_yaml
@@ -289,10 +289,20 @@ def _build_container(engine_alias: str | None = None):
 
     # Skill 注册表：内置 Skill
     from skills.loader import SkillLoader
+    import os as _os_w
+    # 天气 provider 优先级：qweather（国内稳定）> wttr.in（免费无需注册）> mock
+    _qweather_key = _os_w.environ.get("QWEATHER_API_KEY", "").strip()
+    if _qweather_key:
+        _wx_provider, _wx_key = "qweather", _qweather_key
+        log.info("server.weather_provider", provider="qweather")
+    else:
+        _wx_provider, _wx_key = "wttr.in", None
+        log.info("server.weather_provider", provider="wttr.in",
+                 hint="设置 QWEATHER_API_KEY 可切换为国内和风天气（更稳定）")
+
     skill_registry = LocalSkillRegistry()
     for builtin in [
-        WeatherCurrentSkill(provider="wttr.in"),
-        WeatherForecastSkill(provider="wttr.in"),
+        *create_weather_skills(provider=_wx_provider, api_key=_wx_key),
         CalculatorSkill(),
         HttpRequestSkill(),
     ]:
