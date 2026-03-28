@@ -35,6 +35,7 @@ from rag.files.models import OperatorContext
 from rag.files.store import KBFileStore
 from rag.permissions.manager import PermissionManager
 from rag.permissions.models import DirectoryType, PermissionLevel, PermissionRole
+from rag.permissions.security_models import SecurityLevel
 from rag.pipeline.ingestion import IngestionPipeline
 from rag.pipeline.query import QueryPipeline, QueryResult
 
@@ -53,8 +54,10 @@ class KBManager:
             kb_id="kb_finance",
             directory_id="dir_01",
             operator=OperatorContext(user_id="alice"),
+            security_level="INTERNAL",           # 可选，默认 INTERNAL
         )
-        result = await mgr.query("上周销售额是多少？", kb_id="kb_finance")
+        result = await mgr.query("上周销售额是多少？", kb_id="kb_finance",
+                                  user_id="alice")   # user_id 用于权限过滤
         print(result.context)
     """
 
@@ -64,11 +67,13 @@ class KBManager:
         query_pipeline: QueryPipeline,
         file_manager: KBFileManager,
         permission_manager: PermissionManager,
+        security_manager=None,   # rag.permissions.SecurityManager | None
     ) -> None:
         self._ingestion = ingestion
         self._query = query_pipeline
         self._files = file_manager
         self._perms = permission_manager
+        self._sec = security_manager   # 多维度安全权限管理器（可选）
 
     # ── 工厂方法 ──────────────────────────────────────────────────────
 
@@ -127,8 +132,22 @@ class KBManager:
             keep_versions=fm_cfg.storage.keep_versions,
         )
 
-        # ── 权限管理 ───────────────────────────────────────────────
+        # ── 权限管理（目录级）─────────────────────────────────────────
         perm_manager = PermissionManager(db_url=fm_cfg.db_url)
+
+        # ── 多维度安全权限管理器（文档级四层安全）────────────────────
+        sec_manager = None
+        try:
+            sec_cfg = getattr(cfg.permissions, "multi_dim", None)
+            if sec_cfg and getattr(sec_cfg, "enabled", False):
+                from rag.permissions import init_security_manager
+                db_path = getattr(sec_cfg, "db_path", "./data/security.db")
+                prefix  = getattr(sec_cfg, "personal_collection_prefix", "kb_personal")
+                sec_manager = init_security_manager(db_path=db_path,
+                                                    personal_collection_prefix=prefix)
+                log.info("kb_manager.security_manager_ready", db_path=db_path)
+        except Exception as exc:
+            log.warning("kb_manager.security_manager_init_failed", error=str(exc))
 
         # ── Reranker ───────────────────────────────────────────────
         reranker = cls._create_reranker(cfg, llm_fn) if cfg.reranker.enabled else None
@@ -190,6 +209,7 @@ class KBManager:
             query_pipeline=query_pipeline,
             file_manager=file_manager,
             permission_manager=perm_manager,
+            security_manager=sec_manager,
         )
 
     # ── 文件操作（委托给 KBFileManager + IngestionPipeline）──────────
@@ -202,8 +222,18 @@ class KBManager:
         directory_id: str,
         operator: OperatorContext,
         change_description: str = "",
+        security_level: str | SecurityLevel | None = None,
+        org_unit_ids: list[str] | None = None,
     ):
-        """上传文件并触发异步索引流水线。"""
+        """
+        上传文件并触发异步索引流水线。
+
+        Args:
+            security_level: 文档安全级别（PUBLIC/INTERNAL/CONFIDENTIAL/PERSONAL）。
+                            为 None 时采用 kb_config.yaml 中的 default_level（默认 INTERNAL）。
+            org_unit_ids:   INTERNAL 级别时生效；指定可访问的组织单元 ID 列表。
+                            空列表表示全员内部可见。
+        """
         kb_file = await self._files.upload(
             file_path=file_path,
             workspace_id=workspace_id,
@@ -212,12 +242,48 @@ class KBManager:
             operator=operator,
             change_description=change_description,
         )
+
+        # ── 多维度安全权限登记 ──────────────────────────────────────
+        effective_collection = kb_id   # 默认使用标准 collection
+        if self._sec is not None:
+            try:
+                # 解析安全级别
+                if security_level is None:
+                    sec_lvl = SecurityLevel.INTERNAL
+                elif isinstance(security_level, SecurityLevel):
+                    sec_lvl = security_level
+                else:
+                    sec_lvl = SecurityLevel(str(security_level).upper())
+
+                await self._sec.set_document_permission(
+                    doc_id=kb_file.id,
+                    kb_id=kb_id,
+                    owner_id=operator.user_id,
+                    security_level=sec_lvl,
+                    org_unit_ids=org_unit_ids or [],
+                    operator_id=operator.user_id,
+                )
+
+                # PERSONAL 新上传 → 物理路由到独立 collection
+                if sec_lvl == SecurityLevel.PERSONAL:
+                    effective_collection = (
+                        f"{self._sec._prefix}_{operator.user_id}_{kb_id}"
+                    )
+                    log.info(
+                        "kb_manager.personal_collection_routed",
+                        doc_id=kb_file.id,
+                        collection=effective_collection,
+                    )
+            except Exception as exc:
+                log.warning("kb_manager.set_doc_permission_failed",
+                            doc_id=kb_file.id, error=str(exc))
+
         import asyncio
         asyncio.create_task(self._ingestion.ingest(
             file_path=file_path,
             file_id=kb_file.id,
             version_id=kb_file.current_version_id or "",
-            kb_id=kb_id,
+            kb_id=effective_collection,   # PERSONAL 时使用独立 collection
             change_type="created",
         ))
         return kb_file
@@ -273,12 +339,73 @@ class KBManager:
         user_id: str | None = None,
         directory_id: str | None = None,
     ) -> QueryResult:
-        return await self._query.query(
+        """
+        执行知识库检索查询。
+
+        多维度安全权限过滤（若 SecurityManager 已启用）：
+          1. build_retrieval_context()  — 预计算用户可见范围
+          2. 向量检索（获取比 top_k 更多的候选）
+          3. filter_chunks()           — 后检索二次过滤（纵深防御）
+          4. 截断到 top_k 后返回
+        """
+        # ── 无安全管理器 → 直接检索 ─────────────────────────────────
+        if self._sec is None or not user_id:
+            return await self._query.query(
+                query_text=query_text,
+                kb_id=kb_id,
+                top_k=top_k,
+                doc_ids=doc_ids,
+            )
+
+        # ── 构建检索权限上下文 ──────────────────────────────────────
+        retrieval_ctx = None
+        try:
+            retrieval_ctx = await self._sec.build_retrieval_context(
+                user_id=user_id, kb_id=kb_id
+            )
+        except Exception as exc:
+            log.warning("kb_manager.build_retrieval_ctx_failed",
+                        user_id=user_id, kb_id=kb_id, error=str(exc))
+
+        # ── 向量检索（放宽 top_k 以确保过滤后仍有足够结果）──────────
+        fetch_k = max(top_k * 3, top_k + 20) if retrieval_ctx else top_k
+        result = await self._query.query(
             query_text=query_text,
             kb_id=kb_id,
-            top_k=top_k,
+            top_k=fetch_k,
             doc_ids=doc_ids,
         )
+
+        # ── 后检索二次权限过滤（纵深防御）──────────────────────────
+        if retrieval_ctx is not None and result.chunks:
+            try:
+                filtered = await self._sec.filter_chunks(
+                    chunks=result.chunks,
+                    ctx=retrieval_ctx,
+                )
+                before_count = len(result.chunks)
+                after_count  = len(filtered[:top_k])
+                # 截断到请求的 top_k
+                result = QueryResult(
+                    query=result.query,
+                    kb_id=kb_id,
+                    chunks=filtered[:top_k],
+                    context="\n\n".join(c.text for c in filtered[:top_k]),
+                )
+                log.debug(
+                    "kb_manager.query_filtered",
+                    user_id=user_id,
+                    before=before_count,
+                    after=after_count,
+                )
+            except Exception as exc:
+                log.warning("kb_manager.filter_chunks_failed",
+                            user_id=user_id, error=str(exc))
+                # 过滤失败时安全降级：返回空结果而非未过滤结果
+                result = QueryResult(chunks=[], context="", query=result.query,
+                                     kb_id=kb_id)
+
+        return result
 
     # ── 文件查询 ──────────────────────────────────────────────────────
 

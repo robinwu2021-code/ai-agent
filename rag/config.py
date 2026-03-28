@@ -311,10 +311,23 @@ class PermissionsDBConfig:
     backend: str = "sqlite"
     url: str = "./data/workspace.db"
 
+
+@dataclass
+class MultiDimPermissionsConfig:
+    """多维度文档安全权限（四层：PUBLIC / INTERNAL / CONFIDENTIAL / PERSONAL）配置。"""
+    enabled: bool = False
+    db_path: str = "./data/security.db"
+    personal_collection_prefix: str = "kb_personal"
+    default_level: str = "INTERNAL"
+    vector_filter_strict: bool = False
+    audit_retention_days: int = 0
+
+
 @dataclass
 class PermissionsConfig:
     enabled: bool = True
     db: PermissionsDBConfig = field(default_factory=PermissionsDBConfig)
+    multi_dim: MultiDimPermissionsConfig = field(default_factory=MultiDimPermissionsConfig)
 
 
 # ── 文件管理配置 ──────────────────────────────────────────────────────────────

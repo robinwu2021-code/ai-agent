@@ -2058,6 +2058,48 @@ async def kg_reindex_document(doc_id: str, kb_id: str = "global"):
 
 _evolution_module = None   # 全局进化模块实例
 
+# ══════════════════════════════════════════════════════════════════════
+# 多维度安全权限 REST API  /api/permissions/*  /api/kb/*
+# ══════════════════════════════════════════════════════════════════════
+
+def _try_register_permission_router() -> None:
+    """
+    尝试注册权限管理路由。
+    依赖：
+      - kb_config.yaml permissions.multi_dim.enabled = true
+      - SecurityStore SQLite 可初始化
+    失败时仅打印警告，不阻断主服务启动。
+    """
+    try:
+        from rag.config import get_kb_config as _get_kb_cfg
+        _kb_cfg = _get_kb_cfg()
+        _sec_cfg = getattr(getattr(_kb_cfg, "permissions", None), "multi_dim", None)
+        if _sec_cfg is None or not getattr(_sec_cfg, "enabled", False):
+            log.info("server.permission_router_skipped",
+                     reason="kb_config permissions.multi_dim.enabled=false")
+            return
+
+        # 初始化全局 SecurityManager
+        from rag.permissions import init_security_manager
+        _db_path = getattr(_sec_cfg, "db_path", "./data/security.db")
+        _prefix  = getattr(_sec_cfg, "personal_collection_prefix", "kb_personal")
+        _sm = init_security_manager(db_path=_db_path,
+                                    personal_collection_prefix=_prefix)
+
+        # 注册路由
+        from rag.permissions.router import router as _perm_router
+        app.include_router(_perm_router, prefix="/api")
+
+        log.info("server.permission_router_registered",
+                 prefix="/api",
+                 db_path=_db_path,
+                 personal_prefix=_prefix)
+    except Exception as _exc:
+        log.warning("server.permission_router_register_failed", error=str(_exc))
+
+
+_try_register_permission_router()
+
 
 @app.on_event("startup")
 async def _startup():

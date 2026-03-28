@@ -210,6 +210,31 @@ knowledge_base:
       backend: sqlite
       url: ./data/workspace.db
 
+    # ── 多维度安全权限（四层）────────────────────────────────────────
+    # 与上方 db.url 共享同一个 SQLite 数据库
+    # 四层安全级别：PUBLIC | INTERNAL | CONFIDENTIAL | PERSONAL
+    #   PUBLIC       任何人（含匿名）可访问
+    #   INTERNAL     认证用户 + 指定组织单元（部门/项目），空 org_unit_ids = 全员内部可见
+    #   CONFIDENTIAL 显式点名授权用户（永久有效，手动撤销）
+    #   PERSONAL     仅所有者，新上传文档物理隔离到独立 Milvus collection
+    #
+    # 组织单元层级继承规则：
+    #   成员：子部门成员可读父部门文档（向上继承访问权）
+    #   管理员：父部门 ADMIN 可读所有子部门文档（向下管理权）
+    #
+    # 安全级别降级（INTERNAL→PUBLIC / CONFIDENTIAL→PUBLIC/INTERNAL）
+    # 需要 SYSTEM_ADMIN 角色执行，防止信息意外扩散
+    multi_dim:
+      enabled: true
+      db_path: ./data/security.db           # 安全权限专用 SQLite（与 workspace.db 分离）
+      personal_collection_prefix: kb_personal  # PERSONAL 隔离 collection 前缀
+                                               # 完整 collection 名：{prefix}_{user_id}_{kb_id}
+      default_level: INTERNAL               # 新上传文档的默认安全级别
+                                            # PUBLIC | INTERNAL | CONFIDENTIAL | PERSONAL
+      vector_filter_strict: false           # true: 向量检索时只拉取精确级别；
+                                            # false(默认): 拉取可能可见的宽泛集合，由应用层二次过滤
+      audit_retention_days: 0              # 0=永久保留审计日志（不可删除）
+
   # ── 文件管理 ─────────────────────────────────────────────────────
   file_management:
     db_url: ./data/kb_files.db
