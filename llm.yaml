@@ -13,7 +13,7 @@ engines:
   # ── MiniMax M2.5（默认主力引擎，OpenAI 兼容接口）────────────────
   - alias: minimax
     sdk: openai_compatible
-    api_key: sk-MzIyLTExODExODU5MjA4LTE3NzQ1MjM5ODg0NjM=
+    api_key: ${MINIMAX_API_KEY}
     base_url: https://api.scnet.cn/api/llm/v1
     model: MiniMax-M2.5
     max_tokens: 8192
