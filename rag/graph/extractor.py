@@ -8,31 +8,54 @@ from typing import Any, Callable
 
 import structlog
 
-from rag.graph.models import NodeType, Triple
+from rag.graph.models import NodeType, Triple, RelationType
+
+_VALID_RELATION_TYPES = {r.value for r in RelationType}
 
 logger = structlog.get_logger(__name__)
 
 _EXTRACT_PROMPT_TEMPLATE = """\
-你是知识图谱专家。从以下文本中抽取实体和关系三元组。
+你是知识图谱专家。从以下文本中抽取实体和关系三元组，重点捕捉业务逻辑、规则约束和流程关联。
 
-实体类型：PERSON(人物)/ORG(组织/公司)/PRODUCT(产品)/CONCEPT(概念/技术)/EVENT(事件)/LOCATION(地点)/OTHER(其他)
+【实体类型（必须从以下选择）】
+PERSON=人物, ORG=组织/公司/部门, PRODUCT=产品/系统/平台, CONCEPT=概念/技术/方法论,
+EVENT=事件/活动, LOCATION=地点/区域, PROCESS=业务流程/操作步骤,
+RULE=业务规则/判断条件/策略, METRIC=量化指标/阈值/参数(如"成功率≥99.9%"),
+DOCUMENT_SECTION=文档章节/条款(如"第3章"/"4.2.1"), CONSTRAINT=约束条件/限制,
+STANDARD=标准/规范编号(如"ISO 27001"), OTHER=其他
+
+【关系类型（relation_type 必须从以下选择）】
+层级: IS_A(是一种/属于), PART_OF(是…的组成部分), HAS_PART(包含)
+因果: CAUSES(导致), PREVENTS(防止), DEPENDS_ON(依赖于)
+定义: DEFINED_AS(定义为/是指), SIMILAR_TO(类似于), CONTRADICTS(与…冲突)
+流程: PRECEDES(前置步骤), FOLLOWS(后续步骤), TRIGGERS(触发)
+业务: REQUIRES(要求/必须), GOVERNS(适用于/规定), IMPLEMENTS(实现/落实)
+约束: CONSTRAINED_BY(受约束于), THRESHOLD(阈值为), INVOLVES(涉及)
 
 要求：
-1. 只抽取文本中明确提到的关系，不要推断
-2. 关系用简洁的中文动词短语（如"创立于"/"竞争对手"/"属于"/"发布"/"位于"）
-3. 每个三元组给出置信度(0-1)和原文证据片段
-4. 同一实体在不同地方可能有不同写法，尽量统一
+1. 优先提取有明确业务含义的关系，不抽取模糊关联
+2. relation_type 从上方选择，relation_label 写原文中的具体描述词（2-6字）
+3. confidence（0-1），evidence 必须是原文中的具体句子（不要改写）
+4. 重点关注：流程步骤顺序、规则触发条件、指标阈值、章节从属关系
+5. 章节编号（如"4.2.1"）作为 DOCUMENT_SECTION 类型实体
 
 文本：
 {text}
 
-以JSON格式输出（严格遵守格式）：
+严格按以下 JSON 格式输出：
 {{
   "entities": [
-    {{"name": "实体名", "type": "ORG", "description": "一句话描述"}}
+    {{"name": "实体名", "type": "PROCESS", "description": "一句话描述"}}
   ],
   "triples": [
-    {{"src": "实体A", "relation": "关系", "dst": "实体B", "confidence": 0.9, "evidence": "原文片段"}}
+    {{
+      "src": "实体A",
+      "relation_type": "REQUIRES",
+      "relation_label": "必须通过",
+      "dst": "实体B",
+      "confidence": 0.9,
+      "evidence": "原文中的具体句子"
+    }}
   ]
 }}
 """
@@ -101,7 +124,7 @@ class TripleExtractor:
         min_confidence: 过滤低置信度三元组的阈值（默认 0.3）。
     """
 
-    def __init__(self, llm_engine: Any, min_confidence: float = 0.3) -> None:
+    def __init__(self, llm_engine: Any, min_confidence: float = 0.5) -> None:
         self._llm = llm_engine
         self._min_confidence = min_confidence
 
@@ -272,7 +295,15 @@ class TripleExtractor:
             relation = str(item.get("relation", "")).strip()
             evidence = str(item.get("evidence", "")).strip()
 
-            if not src_name or not dst_name or not relation:
+            relation_type  = str(item.get("relation_type", "")).strip().upper()
+            relation_label = str(item.get("relation_label", "")).strip()
+            # Validate relation_type against known types; fall back gracefully
+            if relation_type not in _VALID_RELATION_TYPES:
+                relation_type = ""
+
+            # For new-format prompts, relation may be empty; use relation_label as fallback
+            effective_relation = relation or relation_label
+            if not src_name or not dst_name or not effective_relation:
                 continue
 
             # Lookup entity info
@@ -283,12 +314,14 @@ class TripleExtractor:
                 src_name=src_name,
                 src_type=src_type,
                 src_desc=src_desc,
-                relation=relation,
+                relation=relation_label or relation,   # human-readable label, fallback to raw relation text
                 dst_name=dst_name,
                 dst_type=dst_type,
                 dst_desc=dst_desc,
                 confidence=confidence,
                 evidence=evidence,
+                relation_type=relation_type,
+                relation_label=relation_label,
             )
             results.append(triple)
 

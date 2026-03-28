@@ -97,7 +97,8 @@ knowledge_base:
       chunk_size: 512
       chunk_overlap: 64
     contextual_enhancement:
-      enabled: false               # 开启后 LLM 为每个 chunk 生成上下文描述
+      enabled: true                # Phase 1 开启：LLM 为每个 chunk 生成上下文描述
+                                   # ⚠ 会增加 LLM 调用次数（每 chunk 调用一次），首次索引较慢
       use_prompt_cache: true
       batch_size: 10
       prompt: "请用1-2句话描述以下片段的主题和关键信息，不要复述原文：\n{chunk_text}"
@@ -107,9 +108,10 @@ knowledge_base:
     # 摘要向量单独存入 Milvus dense_vec_summary 字段，检索时覆盖更多语义角度。
     # ⚠ 首次启用前须删除旧 collection（新 schema 含 dense_vec_summary + summary 字段）
     chunk_summary:
-      enabled: false               # true = 开启（会增加 LLM 调用次数）
-      max_chars: 800               # 送入 LLM 的 chunk 最大字符数（超出截断）
-      concurrency: 8               # LLM 并发调用数（避免触发 429 限流）
+      enabled: true                # Phase 1 开启：每个 chunk 生成摘要向量，扩大语义覆盖
+                                   # ⚠ 会增加 LLM 调用次数，首次启用前须删除旧 collection（schema 变更）
+      max_chars: 800
+      concurrency: 8
 
   # ── 向量存储 ─────────────────────────────────────────────────────
   # use_global=true 时优先使用 llm.yaml vector_store 节的连接参数
@@ -132,6 +134,12 @@ knowledge_base:
 
   # ── 关键词检索（BM25）───────────────────────────────────────────
   keyword_store:
+    # ── 关键词检索后端 ───────────────────────────────────────────────────────
+    # memory: 内存 BM25（默认，无需额外服务）
+    # elasticsearch: ES 增强检索（多字段加权 + 短语匹配，推荐生产使用）
+    #   切换步骤：1. 启动 ES 服务  2. 将 backend 改为 elasticsearch  3. 重新索引文档
+    #   ES 安装：docker run -d -p 9200:9200 -e "discovery.type=single-node" elasticsearch:8.13.0
+    #   中文分词：安装 analysis-ik 插件后 analyzer 改为 ik_max_word
     backend: memory                # elasticsearch | opensearch | memory
     elasticsearch:
       url: http://localhost:9200
@@ -151,8 +159,10 @@ knowledge_base:
   # ── 知识图谱 ─────────────────────────────────────────────────────
   graph:
     enabled: true
-    per_document: true             # 每个文档构建独立子图
-    workspace_level: true          # 整个 workspace 构建汇总图
+    per_document: true
+    workspace_level: true
+    # Phase 2: 三元组抽取最低置信度（0.5 过滤低质量关系，原为 0.3）
+    # 对应 TripleExtractor(min_confidence=0.5)，提高图谱质量
     store:
       backend: sqlite              # neo4j | sqlite | memory
       neo4j:
@@ -188,9 +198,9 @@ knowledge_base:
     fusion: rrf                    # rrf（Reciprocal Rank Fusion）| weighted
     rrf_k: 60
     weights:
-      vector: 0.5
-      keyword: 0.3
-      graph: 0.2
+      vector: 0.45                 # Phase 1 调整：向量检索权重（原 0.5）
+      keyword: 0.35                # Phase 1 调整：关键词检索权重（原 0.3）
+      graph: 0.20                  # 知识图谱权重（不变）
     enable_graph_retrieval: true
 
   # ── 权限管理 ─────────────────────────────────────────────────────

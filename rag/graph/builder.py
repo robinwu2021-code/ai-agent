@@ -189,22 +189,33 @@ class GraphBuilder:
                 )
                 continue
 
+            # Phase 2: 使用结构化关系类型作为 edge.relation，人类可读描述存入 context
+            edge_relation = triple.relation_type if triple.relation_type else triple.relation
             edge_id = str(
                 uuid.uuid5(
                     uuid.NAMESPACE_DNS,
-                    f"{kb_id}:{src_id}:{triple.relation}:{dst_id}",
+                    f"{kb_id}:{src_id}:{edge_relation}:{dst_id}",
                 )
             )
+            # context 格式: "{relation_label} || {evidence}"（用 edge.relation_label / edge.evidence 属性解析）
+            context_parts = []
+            if triple.relation_label:
+                context_parts.append(triple.relation_label)
+            evidence_text = triple.evidence[:480] if triple.evidence else ""
+            if evidence_text:
+                context_parts.append(evidence_text)
+            edge_context = " || ".join(context_parts)
+
             edge = Edge(
                 id=edge_id,
                 kb_id=kb_id,
                 src_id=src_id,
                 dst_id=dst_id,
-                relation=triple.relation,
+                relation=edge_relation,
                 weight=triple.confidence,
                 doc_id=doc_id,
                 chunk_id="",
-                context=triple.evidence[:500] if triple.evidence else "",
+                context=edge_context[:500],
                 created_at=time.time(),
             )
             await self._store.upsert_edge(edge)

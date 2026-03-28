@@ -480,9 +480,15 @@ class GraphRetriever:
                 dst_name = id_to_node.get(edge.dst_id, Node(
                     id=edge.dst_id, kb_id="", name=edge.dst_id
                 )).name
-                line = f"- {src_name} --[{edge.relation}]--> {dst_name}"
-                if edge.context:
-                    line += f'  [证据: "{edge.context[:80]}"]'
+                # 优先显示人类可读标签，如 "REQUIRES: 必须通过"
+                if edge.relation_label:
+                    rel_display = f"{edge.relation}: {edge.relation_label}"
+                else:
+                    rel_display = edge.relation
+                line = f"- {src_name} --[{rel_display}]--> {dst_name}"
+                evidence_text = edge.evidence
+                if evidence_text:
+                    line += f'  [证据: "{evidence_text[:80]}"]'
                 parts.append(line)
             parts.append("")
 
@@ -595,8 +601,9 @@ class GraphRetriever:
                 {
                     "src": src_name,
                     "relation": edge.relation,
+                    "relation_label": edge.relation_label,
                     "dst": dst_name,
-                    "evidence": edge.context,
+                    "evidence": edge.evidence,
                 }
             )
         return chain
