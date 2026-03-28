@@ -1,6 +1,25 @@
 evolution:
   enabled: true
-  db_path: "./data/evolution.db"
+  db_path: "./data/evolution.db"   # 兼容旧配置，storage.sqlite_path 优先
+
+  # ── 存储后端配置 ──────────────────────────────────────────────────────────
+  # backend 可选值：
+  #   sqlite   — 全部数据存入 SQLite（默认，向后兼容）
+  #   markdown — 画像/模板/Q&A/配置 → Markdown 文件；信号/Chunk → 轻量 SQLite
+  #   hybrid   — SQLite 处理全部 + Markdown 同步镜像画像类数据（推荐）
+  #
+  # hybrid 模式文件结构（markdown_dir/）：
+  #   bi_profiles/{bra_id}.md      — 门店数据画像（无数据日期、数据范围等）
+  #   qa_pairs/pending/{date}.md   — 待注入知识库的 Q&A 对
+  #   qa_pairs/injected/{date}.md  — 已注入的 Q&A 对
+  #   bi_templates/{bra_id}.md     — BI 成功查询模板
+  #   config/{key}.md              — 动态配置（调优参数、门店 Prompt 上下文）
+  #   actions.md                   — 进化动作日志（追加）
+  storage:
+    backend: hybrid                         # sqlite | markdown | hybrid ← 修改此处切换
+    sqlite_path: "./data/evolution.db"      # SQLite 全量库路径
+    markdown_dir: "./data/evolution"        # Markdown 根目录
+    signals_db_path: "./data/evolution_signals.db"  # markdown 模式下的信号专用库
 
   signal:
     rag_enabled: true

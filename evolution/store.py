@@ -409,3 +409,52 @@ class EvolutionStore:
         conn = self._get_conn()
         rows = conn.execute(sql, args).fetchall()
         return [dict(r) for r in rows]
+
+    async def all_store_profiles(self) -> list[dict]:
+        """返回所有门店画像（bra_id → dict）的列表。"""
+        rows = await asyncio.to_thread(
+            self._fetchall,
+            "SELECT * FROM bi_store_profile WHERE metric='*'",
+            (),
+        )
+        for r in rows:
+            if isinstance(r.get("no_data_dates"), str):
+                try:
+                    r["no_data_dates"] = json.loads(r["no_data_dates"])
+                except Exception:
+                    r["no_data_dates"] = []
+        return rows
+
+
+# ── 工厂函数 ──────────────────────────────────────────────────────────────────
+
+def create_store(config: "EvolutionConfig | None" = None):  # type: ignore[name-defined]
+    """
+    根据 storage.backend 配置创建对应的存储后端实例。
+
+    backend 取值：
+      sqlite   → EvolutionStore（全部数据存 SQLite，默认）
+      markdown → MarkdownEvolutionStore（画像数据存 Markdown，信号存轻量 SQLite）
+      hybrid   → HybridEvolutionStore（SQLite 全量 + Markdown 镜像画像数据）
+    """
+    if config is None:
+        return EvolutionStore()
+
+    backend = (config.storage.backend or "sqlite").lower()
+    sqlite_path = config.storage.sqlite_path or config.db_path
+
+    if backend == "sqlite":
+        return EvolutionStore(sqlite_path)
+
+    from evolution.store_markdown import HybridEvolutionStore, MarkdownEvolutionStore
+
+    md_store = MarkdownEvolutionStore(
+        markdown_dir=config.storage.markdown_dir,
+        signals_db_path=config.storage.signals_db_path,
+    )
+    if backend == "markdown":
+        return md_store
+
+    # hybrid：SQLite 全量 + Markdown 镜像
+    sq_store = EvolutionStore(sqlite_path)
+    return HybridEvolutionStore(sq_store, md_store)

@@ -49,9 +49,31 @@ class ActorConfig:
 
 
 @dataclass
+class StorageConfig:
+    """
+    存储后端配置。
+
+    backend 可选值：
+      sqlite   — 全部数据存入 SQLite（默认，向后兼容）
+      markdown — 画像/模板/Q&A/配置 → Markdown 文件；信号/Chunk → 轻量 SQLite
+      hybrid   — SQLite 处理全部 + Markdown 同步镜像画像类数据（推荐）
+
+    切换说明：
+      - sqlite  → hybrid：无需迁移，现有 evolution.db 继续使用，新增 Markdown 输出
+      - sqlite  → markdown：信号历史会丢失（仅保留新产生信号），慎用
+      - hybrid  → markdown：同上
+    """
+    backend:         str  = "sqlite"                  # sqlite | markdown | hybrid
+    sqlite_path:     str  = "./data/evolution.db"     # SQLite 数据库路径
+    markdown_dir:    str  = "./data/evolution"        # Markdown 根目录
+    signals_db_path: str  = "./data/evolution_signals.db"  # markdown 模式下的信号库
+
+
+@dataclass
 class EvolutionConfig:
     enabled:   bool             = True
-    db_path:   str              = "./data/evolution.db"
+    db_path:   str              = "./data/evolution.db"   # 兼容旧配置，storage.sqlite_path 优先
+    storage:   StorageConfig    = field(default_factory=StorageConfig)
     signal:    SignalConfig     = field(default_factory=SignalConfig)
     scheduler: SchedulerConfig  = field(default_factory=SchedulerConfig)
     analyzer:  AnalyzerConfig   = field(default_factory=AnalyzerConfig)
@@ -85,6 +107,15 @@ class EvolutionConfig:
             enabled = d.get("enabled", True),
             db_path = d.get("db_path", "./data/evolution.db"),
         )
+        if "storage" in d:
+            cfg.storage = _merge(StorageConfig, d["storage"])
+            # db_path 向后兼容：若 storage.sqlite_path 未自定义，使用旧 db_path
+            if cfg.storage.sqlite_path == "./data/evolution.db" and cfg.db_path != "./data/evolution.db":
+                cfg.storage.sqlite_path = cfg.db_path
+        else:
+            # 没有 storage 节时，用旧 db_path 作为 sqlite_path
+            cfg.storage.sqlite_path = cfg.db_path
+
         if "signal" in d:
             cfg.signal = _merge(SignalConfig, d["signal"])
         if "scheduler" in d:

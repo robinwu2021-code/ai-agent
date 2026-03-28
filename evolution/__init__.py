@@ -33,7 +33,7 @@ from evolution.bus import EventBus
 from evolution.config import EvolutionConfig
 from evolution.models import BiQueryEvent, FeedbackEvent, RagQueryEvent
 from evolution.scheduler import EvolutionScheduler
-from evolution.store import EvolutionStore
+from evolution.store import EvolutionStore, create_store
 
 log = structlog.get_logger("evolution")
 
@@ -57,7 +57,7 @@ class EvolutionModule:
     def __init__(self, config: EvolutionConfig | None = None) -> None:
         self._config    = config or EvolutionConfig()
         self._bus       = EventBus()
-        self._store     = EvolutionStore(self._config.db_path)
+        self._store     = create_store(self._config)
         self._scheduler = EvolutionScheduler(
             hour     = self._config.scheduler.daily_job_hour,
             minute   = self._config.scheduler.daily_job_minute,
