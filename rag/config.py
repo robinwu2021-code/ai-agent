@@ -123,6 +123,15 @@ class KBLLMBGEConfig:
     batch_size: int = 16
 
 @dataclass
+class KBLLMQwen3LocalConfig:
+    """本地 Qwen3-Embedding 直接 Python 推理（不走 llm.yaml / Ollama HTTP）。"""
+    model: str = "Qwen/Qwen3-Embedding-4B"  # HuggingFace ID 或本地路径
+    device: str = "cpu"
+    batch_size: int = 16
+    max_length: int = 512
+    dimensions: int = 2560                   # qwen3-embedding:4b 输出维度
+
+@dataclass
 class KBLLMConfig:
     """
     KB 组件使用的 LLM / Embedding 引擎配置。
@@ -132,9 +141,10 @@ class KBLLMConfig:
     此处不重复定义。
 
     切换引擎只需修改 alias（llm.yaml 连接参数不动）：
-      embed_engine: ollama-embed    → llm.yaml engines[ollama-embed]  本地 qwen3-embedding:8b
+      embed_engine: ollama-embed    → llm.yaml engines[ollama-embed]  qwen3-embedding:8b（远程 Ollama）
       embed_engine: azure-east      → llm.yaml engines[azure-east]   Azure text-embedding-3-small
-      embed_engine: bge_local       → 本地 BGE-M3（离线推理，不走 llm.yaml）
+      embed_engine: bge_local       → 本地 BGE-M3（Python 直接推理，不走 llm.yaml）
+      embed_engine: qwen3_local     → 本地 Qwen3-Embedding-4B（Python 直接推理，不走 llm.yaml）
       summarize_engine: claude-fast → llm.yaml engines[claude-fast]  云端 Claude Haiku
 
     留空规则（不推荐）：
@@ -146,11 +156,14 @@ class KBLLMConfig:
     rerank_engine:    str = ""   # 推荐显式填写，如 "vllm-qwen3"
 
     # ── Embedding 通用参数（须与引擎输出维度及 llm.yaml vector_store.*.vector_size 一致）
-    embed_dimensions: int = 1536 # qwen3-embedding:8b → 1536，text-embedding-3-small → 1536
+    embed_dimensions: int = 1536 # qwen3-embedding:8b → 4096，text-embedding-3-small → 1536
     embed_batch_size: int = 32   # 每批次请求数量
 
     # ── 本地 BGE 专项配置（embed_engine="bge_local" 时生效，不走 llm.yaml）
     bge_local: KBLLMBGEConfig = field(default_factory=KBLLMBGEConfig)
+
+    # ── 本地 Qwen3 专项配置（embed_engine="qwen3_local" 时生效，不走 llm.yaml）
+    qwen3_local: KBLLMQwen3LocalConfig = field(default_factory=KBLLMQwen3LocalConfig)
 
 
 # ── 向量存储配置 ──────────────────────────────────────────────────────────────

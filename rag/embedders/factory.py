@@ -76,19 +76,44 @@ class EmbedderFactory:
         return BGELocalEmbedder(model=cfg.model, device=cfg.device, batch_size=cfg.batch_size)
 
     @staticmethod
+    def create_qwen3_local(cfg: "KBLLMQwen3LocalConfig") -> BaseEmbedder:  # type: ignore[name-defined]
+        """创建本地 Qwen3-Embedding Embedder（Python 直接推理，不走 llm.yaml / Ollama）。"""
+        from rag.embedders.qwen3_local_embedder import Qwen3LocalEmbedder
+        log.info(
+            "embedder_factory.qwen3_local",
+            model=cfg.model,
+            device=cfg.device,
+            dimensions=cfg.dimensions,
+        )
+        return Qwen3LocalEmbedder(
+            model=cfg.model,
+            device=cfg.device,
+            batch_size=cfg.batch_size,
+            max_length=cfg.max_length,
+            dimensions=cfg.dimensions,
+        )
+
+    @staticmethod
     def create_from_kb_config(kb_llm: "KBLLMConfig") -> BaseEmbedder:
         """
         从 KBLLMConfig 解析并创建 Embedder（完整流程）。
 
         解析顺序：
-          1. embed_engine == "bge_local" → 本地 BGE（离线）
-          2. embed_engine 非空 → 从 llm.yaml engines 中查找对应 alias
-          3. embed_engine 为空 → 使用 llm.yaml router.embed 的引擎
-          4. llm.yaml 中找不到 supports_embed=True 的引擎 → OpenAIEmbedder 兜底
+          1. embed_engine == "bge_local"   → 本地 BGE（Python 直接推理）
+          2. embed_engine == "qwen3_local" → 本地 Qwen3-Embedding（Python 直接推理）
+          3. embed_engine 非空 → 从 llm.yaml engines 中查找对应 alias
+          4. embed_engine 为空 → 使用 llm.yaml router.embed 的引擎
+          5. llm.yaml 中找不到 supports_embed=True 的引擎 → OpenAIEmbedder 兜底
         """
+        engine_key = kb_llm.embed_engine.lower().strip()
+
         # 特殊情况：本地 BGE
-        if kb_llm.embed_engine.lower() == "bge_local":
+        if engine_key == "bge_local":
             return EmbedderFactory.create_bge_local(kb_llm.bge_local)
+
+        # 特殊情况：本地 Qwen3-Embedding（Python 直接推理）
+        if engine_key == "qwen3_local":
+            return EmbedderFactory.create_qwen3_local(kb_llm.qwen3_local)
 
         # 从 llm.yaml 解析引擎
         try:
