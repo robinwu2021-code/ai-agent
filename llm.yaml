@@ -106,8 +106,17 @@ vector_store:
   backend: milvus
 
   milvus:
-    uri: http://192.168.0.209:19530      # Milvus Standalone 服务器地址
-    token: root:${MILVUS_PASSWORD}               # 格式：root:密码 或 API key（无鉴权可留空）
+    # ── 默认：Milvus Lite（本地文件，无需部署任何服务）─────────────────────
+    # 依赖：pip install "pymilvus>=2.4.0"
+    # 数据目录会自动创建；首次启动无需任何初始化操作。
+    uri: ./data/milvus.db                # Lite 模式：本地 .db 文件（推荐，零运维）
+    token: ""                            # Lite 模式无需鉴权，留空即可
+
+    # ── 切换到 Standalone / Distributed（生产）─────────────────────────────
+    # 取消注释并填写以下两行，同时注释上方 uri / token：
+    # uri: http://192.168.0.209:19530    # Standalone 服务器地址
+    # token: root:${MILVUS_PASSWORD}     # 格式：root:密码 或 API key
+
     collection: kb_chunks                # collection 名称，同一服务可部署多个项目
     vector_size: 4096                    # 必须与 embedding 模型输出维度一致
                                          # qwen3-embedding:8b  → 4096  (embed_engine: ollama-embed)

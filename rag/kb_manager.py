@@ -537,12 +537,14 @@ class KBManager:
                 uri = c.uri if c.mode == "lite" else f"http://{c.host}:{c.port}"
                 store = MilvusVectorStore(
                     uri=uri,
+                    token=getattr(c, "token", ""),
                     collection=collection_override or "kb_chunks",
                     vector_size=cfg.llm.embed_dimensions,
                     summary_enabled=cfg.chunker.chunk_summary.enabled,
                 )
                 await store.initialize()
-                log.info("kb_manager.vector_store_milvus", uri=uri)
+                log.info("kb_manager.vector_store_milvus",
+                         uri=uri, mode=c.mode)
                 return store
             except Exception as exc:
                 log.warning("kb_manager.milvus_init_failed", error=str(exc))

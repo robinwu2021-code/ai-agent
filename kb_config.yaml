@@ -120,14 +120,16 @@ knowledge_base:
     use_global: true               # true = 优先使用 llm.yaml vector_store 配置
     collection: kb_chunks          # 覆盖 llm.yaml 的 collection（留空则用 llm.yaml 原值）
     # ── 以下配置仅在 use_global=false 或 llm.yaml 无 vector_store 时生效 ──
-    backend: qdrant                # qdrant | milvus | chroma
+    # ⚠ 默认 backend 已切换为 milvus（Lite 模式），无需部署任何服务
+    backend: milvus                # milvus（默认） | qdrant | chroma
+    milvus:
+      mode: lite                   # lite（本地 .db 文件，默认）| standalone（服务器）
+      uri: ./data/milvus.db        # Lite 模式文件路径；standalone 时填 http://host:19530
+      token: ""                    # Lite 模式留空；standalone 填 root:密码 或 API key
     qdrant:
       mode: embedded               # embedded | server
       path: ./data/qdrant
       url: http://localhost:6333
-    milvus:
-      mode: lite                   # lite(本地文件) | standalone(服务器)
-      uri: ./data/milvus.db
     chroma:
       mode: persistent
       path: ./data/chroma

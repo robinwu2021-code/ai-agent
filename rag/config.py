@@ -180,7 +180,8 @@ class VectorStoreQdrantConfig:
 @dataclass
 class VectorStoreMilvusConfig:
     mode: str = "lite"                  # lite | standalone
-    uri: str = "./data/milvus.db"
+    uri: str = "./data/milvus.db"       # lite: 本地文件路径；standalone: http://host:port
+    token: str = ""                     # lite 模式留空；standalone 填 root:密码 或 API key
     host: str = "localhost"
     port: int = 19530
 
@@ -193,7 +194,7 @@ class VectorStoreChromaConfig:
 class VectorStoreConfig:
     use_global: bool = True             # True = 优先使用 llm.yaml vector_store 配置
     collection: str = "kb_chunks"       # 可覆盖 llm.yaml 中的 collection 名称
-    backend: str = "qdrant"             # use_global=False 时生效: qdrant | milvus | chroma
+    backend: str = "milvus"             # use_global=False 时生效: milvus（默认）| qdrant | chroma
     qdrant: VectorStoreQdrantConfig = field(default_factory=VectorStoreQdrantConfig)
     milvus: VectorStoreMilvusConfig = field(default_factory=VectorStoreMilvusConfig)
     chroma: VectorStoreChromaConfig = field(default_factory=VectorStoreChromaConfig)
