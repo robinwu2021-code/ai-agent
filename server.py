@@ -21,6 +21,13 @@ import pathlib
 import uuid
 from typing import AsyncIterator
 
+# 最优先加载 .env，确保后续所有 ${VAR} 占位符均可展开
+try:
+    from dotenv import load_dotenv
+    load_dotenv(override=False)
+except ImportError:
+    pass
+
 import structlog
 import uvicorn
 from fastapi import FastAPI, HTTPException

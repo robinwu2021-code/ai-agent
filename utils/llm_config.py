@@ -759,6 +759,14 @@ def load_from_yaml(
       FileNotFoundError  文件不存在
       ValueError         yaml 结构不符合预期
     """
+    # 确保 .env 已加载（llm.yaml 中 ${VAR} 占位符依赖 os.environ）
+    # override=False：不覆盖已经存在的系统环境变量
+    try:
+        from dotenv import load_dotenv as _load_dotenv
+        _load_dotenv(override=False)
+    except ImportError:
+        pass  # python-dotenv 未安装时忽略，依赖系统环境变量
+
     try:
         import yaml
     except ImportError:

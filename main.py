@@ -16,6 +16,13 @@ from __future__ import annotations
 import asyncio
 import sys
 
+# 最优先加载 .env，确保 ${VAR} 占位符在 llm.yaml 等配置中可正确展开
+try:
+    from dotenv import load_dotenv
+    load_dotenv(override=False)
+except ImportError:
+    pass
+
 
 # ─────────────────────────────────────────────────────────────────
 # Demo helpers
