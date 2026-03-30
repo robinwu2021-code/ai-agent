@@ -112,3 +112,6 @@ all = [
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+markers = [
+    "integration: 需要真实模型文件 / 网络的集成测试（pytest -m integration）",
+]

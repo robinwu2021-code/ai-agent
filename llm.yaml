@@ -191,14 +191,14 @@ memory:
 
     # ── LLM 引擎：引用 engines 节 alias，无需重复配置 ──────────
     llm_engine:   minimax           # 用于 mem0 内部记忆提取/去重判断
-    embed_engine: ollama-embed      # 用于向量化存储与语义检索
+    embed_engine: qwen3-embed-local  # 用于向量化存储与语义检索（本地 transformers 直推）
 
     # ── 切换示例（取消注释即生效）─────────────────────────────
-    # llm_engine: vllm-qwen3        # 改为本地 vLLM
-    # llm_engine: ollama-qwen3      # 改为本地 Ollama
-    # llm_engine: claude-fast       # 改为云端 Claude Haiku（质量更高）
-    # llm_engine: claude-smart      # 改为旗舰模型（成本高，质量最好）
-    # embed_engine: ollama-embed    # 本地 qwen3-embedding:8b（默认）
+    # llm_engine: vllm-qwen3         # 改为本地 vLLM
+    # llm_engine: ollama-qwen3       # 改为本地 Ollama
+    # llm_engine: claude-fast        # 改为云端 Claude Haiku（质量更高）
+    # llm_engine: claude-smart       # 改为旗舰模型（成本高，质量最好）
+    # embed_engine: ollama-embed     # 备选：via Ollama HTTP API
 
     # ── 向量库（复用顶层 vector_store 节，独立 collection）─────
     use_global_vector_store: true   # true → 复用本文件 vector_store: 节配置
