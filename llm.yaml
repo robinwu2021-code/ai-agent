@@ -42,7 +42,7 @@ engines:
   # 输出维度：4096（高质量，推荐生产使用）
   # 对应 kb_config.yaml: embed_engine: ollama-embed, embed_dimensions: 4096
   # 对应 llm.yaml vector_store.milvus.vector_size: 4096
-  - alias: ollama-embed
+  - alias: ollama-embed-aaaaaa
     sdk: openai_compatible
     base_url: http://192.168.0.222:11434/v1
     model: qwen3-embedding:8b        # 主模型字段（有些 Ollama 版本兼容）
