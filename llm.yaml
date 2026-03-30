@@ -104,8 +104,8 @@ router:
   plan:        minimax         # Plan-Execute 规划阶段
   summarize:   minimax         # 文本摘要/上下文裁剪
   consolidate: minimax         # 记忆固化提炼
-  embed:       ollama-embed    # 向量化 → 本地 qwen3-embedding:8b via Ollama（HTTP API）
-  # embed:  qwen3-embed-local # 向量化 → 本地 qwen3-embedding:8b via transformers（纯 Python，零 HTTP）
+  embed:       qwen3-embed-local  # 向量化 → 本地 qwen3-embedding:8b via transformers（纯 Python，零 HTTP）
+  # embed: ollama-embed          # 备选：via Ollama HTTP API（需要 Ollama 服务在 192.168.0.222:11434）
   # eval:      minimax         # LLM-as-judge 打分
   # route:     minimax         # Multi-Agent 路由决策
 
