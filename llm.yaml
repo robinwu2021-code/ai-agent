@@ -42,7 +42,7 @@ engines:
   # 输出维度：4096（高质量，推荐生产使用）
   # 对应 kb_config.yaml: embed_engine: ollama-embed, embed_dimensions: 4096
   # 对应 llm.yaml vector_store.milvus.vector_size: 4096
-  - alias: ollama-embed-aaaaaa
+  - alias: ollama-embed
     sdk: openai_compatible
     base_url: http://192.168.0.222:11434/v1
     model: qwen3-embedding:8b        # 主模型字段（有些 Ollama 版本兼容）
@@ -53,6 +53,18 @@ engines:
     supports_tools: false
     supports_embed: true
     tags: [local, embed, qwen, 8b]
+
+  - alias: ollama-embed-remote
+    sdk: openai_compatible
+    base_url: http://26.tcp.cpolar.top:11774/v1
+    model: qwen3-embedding:8b        # 主模型字段（有些 Ollama 版本兼容）
+    embedding_model: qwen3-embedding:8b
+    max_tokens: 4096
+    timeout_sec: 60.0
+    cost_tier: 0
+    supports_tools: false
+    supports_embed: true
+    tags: [ local, embed, qwen, 8b ]
 
 
   # ── 本地 Python 直接推理（Qwen3-Embedding-8B，零 HTTP 依赖）────────────
@@ -107,8 +119,9 @@ router:
   plan:        minimax         # Plan-Execute 规划阶段
   summarize:   minimax         # 文本摘要/上下文裁剪
   consolidate: minimax         # 记忆固化提炼
-  embed:       qwen3-embed-local  # 向量化 → 本地 qwen3-embedding:8b via transformers（纯 Python，零 HTTP）
-  # embed: ollama-embed          # 备选：via Ollama HTTP API（需要 Ollama 服务在 192.168.0.222:11434）
+  embed:       ollama-embed-remote  # 向量化 → 远程 Ollama HTTP API（26.tcp.cpolar.top:11774）
+  # embed: qwen3-embed-local       # 备选：本地 sentence-transformers 直推（零 HTTP，离线可用）
+  # embed: ollama-embed            # 备选：局域网 Ollama（192.168.0.222:11434）
   # eval:      minimax         # LLM-as-judge 打分
   # route:     minimax         # Multi-Agent 路由决策
 
@@ -194,7 +207,7 @@ memory:
 
     # ── LLM 引擎：引用 engines 节 alias，无需重复配置 ──────────
     llm_engine:   minimax           # 用于 mem0 内部记忆提取/去重判断
-    embed_engine: qwen3-embed-local  # 用于向量化存储与语义检索（本地 transformers 直推）
+    embed_engine: ollama-embed-remote  # 用于向量化存储与语义检索（远程 Ollama HTTP API）
 
     # ── 切换示例（取消注释即生效）─────────────────────────────
     # llm_engine: vllm-qwen3         # 改为本地 vLLM
