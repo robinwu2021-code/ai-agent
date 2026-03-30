@@ -64,34 +64,57 @@ class TestQwen3LocalEmbedderUnit:
             dimensions=dims,
         )
 
-    def _patch_model(self, embedder, dims: int = 4096):
-        """给 embedder 注入 mock tokenizer + model，绕过真实加载。"""
-        import torch
+    def _patch_model(self, embedder, dims: int = 4096, use_st: bool = True):
+        """
+        给 embedder 注入 mock 模型，绕过真实加载。
 
-        # tokenizer 按实际 batch size 返回正确形状的张量
-        def fake_tokenize(texts, **kwargs):
-            batch_size = len(texts) if isinstance(texts, list) else 1
-            return {
-                "input_ids":      torch.ones(batch_size, 10, dtype=torch.long),
-                "attention_mask": torch.ones(batch_size, 10, dtype=torch.long),
-            }
+        use_st=True  → 模拟 sentence-transformers 路径（默认，与 Qwen3-Embedding-8B 一致）
+        use_st=False → 模拟 transformers AutoModel 路径（回退路径）
+        """
+        import math
+        import numpy as np
 
-        mock_tokenizer = MagicMock(side_effect=fake_tokenize)
+        if use_st:
+            # sentence-transformers SentenceTransformer.encode() 路径
+            def fake_encode(texts, normalize_embeddings=True, batch_size=8,
+                            show_progress_bar=False, convert_to_numpy=True, **kw):
+                n = len(texts) if isinstance(texts, list) else 1
+                vecs = np.random.randn(n, dims).astype("float32")
+                if normalize_embeddings:
+                    norms = np.linalg.norm(vecs, axis=1, keepdims=True) + 1e-9
+                    vecs = vecs / norms
+                return vecs
 
-        # model(**inputs) 返回带 last_hidden_state 的对象
-        def fake_forward(**inputs):
-            batch = inputs["input_ids"].shape[0]
-            out = MagicMock()
-            out.last_hidden_state = torch.randn(batch, 10, dims)
-            return out
+            mock_model = MagicMock()
+            mock_model.encode = MagicMock(side_effect=fake_encode)
+            mock_model.get_sentence_embedding_dimension = MagicMock(return_value=dims)
+            embedder._model = mock_model
+            embedder._use_st = True
+            embedder._dims = dims
+        else:
+            # transformers AutoModel 路径
+            import torch
 
-        mock_model = MagicMock(side_effect=fake_forward)
-        mock_model.config = MagicMock()
-        mock_model.config.hidden_size = dims
+            def fake_tokenize(texts, **kwargs):
+                batch_size = len(texts) if isinstance(texts, list) else 1
+                return {
+                    "input_ids":      torch.ones(batch_size, 10, dtype=torch.long),
+                    "attention_mask": torch.ones(batch_size, 10, dtype=torch.long),
+                }
 
-        embedder._tokenizer = mock_tokenizer
-        embedder._model = mock_model
-        embedder._dims = dims
+            def fake_forward(**inputs):
+                batch = inputs["input_ids"].shape[0]
+                out = MagicMock()
+                out.last_hidden_state = torch.randn(batch, 10, dims)
+                return out
+
+            mock_model = MagicMock(side_effect=fake_forward)
+            mock_model.config = MagicMock()
+            mock_model.config.hidden_size = dims
+            embedder._tokenizer = MagicMock(side_effect=fake_tokenize)
+            embedder._model = mock_model
+            embedder._use_st = False
+            embedder._dims = dims
 
     @pytest.mark.asyncio
     async def test_embed_returns_correct_length(self):
@@ -143,6 +166,16 @@ class TestQwen3LocalEmbedderUnit:
         with patch.object(embedder, "_load", return_value=False):
             vecs = await embedder.embed_batch(["hello", "world"])
         assert vecs == [[], []]
+
+    @pytest.mark.asyncio
+    async def test_transformers_fallback_path(self):
+        """transformers AutoModel 回退路径也能返回正确维度向量。"""
+        embedder = self._make_embedder(dims=4096)
+        self._patch_model(embedder, dims=4096, use_st=False)
+
+        vecs = await embedder.embed_batch(["回退路径测试"])
+        assert len(vecs) == 1
+        assert len(vecs[0]) == 4096
 
     @pytest.mark.asyncio
     async def test_vectors_are_normalized(self):

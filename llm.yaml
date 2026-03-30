@@ -55,31 +55,34 @@ engines:
     tags: [local, embed, qwen, 8b]
 
 
-  # ── 本地 Python 直接推理（qwen3-embedding:8b，零 HTTP 依赖）──────────
-  # 通过 transformers 库直接加载模型，无需 Ollama 服务，完全离线可用。
-  # 适合 GPU 资源在本机、不希望额外启动 Ollama 的场景。
-  #
-  # 前置步骤：
-  #   pip install transformers torch
-  #   huggingface-cli download Qwen/Qwen3-Embedding --local-dir D:\work\ai\models\huggingface\Qwen\Qwen3-Embedding
-  #   （或设置 HF_HOME=D:\work\ai\models\huggingface 后直接填写 HuggingFace ID）
-  #
+  # ── 本地 Python 直接推理（Qwen3-Embedding-8B，零 HTTP 依赖）────────────
+  # 通过 sentence-transformers 库加载官方 HuggingFace 模型，无需 Ollama 服务。
+  # 模型：https://huggingface.co/Qwen/Qwen3-Embedding-8B
+  # 格式：sentence-transformers（library_name=sentence-transformers）
   # 输出维度：4096（须与 vector_store.milvus.vector_size 保持一致）
-  # 切换到此引擎：router.embed: qwen3-embed-local  或 kb_config.yaml embed_engine: qwen3-embed-local
+  #
+  # 前置步骤（仅首次）：
+  #   pip install sentence-transformers torch
+  #   python -c "
+  #     from huggingface_hub import snapshot_download
+  #     snapshot_download('Qwen/Qwen3-Embedding-8B',
+  #                       local_dir=r'D:/work/ai/models/huggingface/Qwen/Qwen3-Embedding-8B',
+  #                       local_dir_use_symlinks=False)
+  #   "
   - alias: qwen3-embed-local
     sdk: local_transformers
-    model: D:\work\ai\models\huggingface\Qwen\Qwen3-Embedding        # 本地模型目录（或 HuggingFace ID: Qwen/Qwen3-Embedding）
-    embedding_model: D:\work\ai\models\huggingface\Qwen\Qwen3-Embedding
+    model: D:\work\ai\models\huggingface\Qwen\Qwen3-Embedding-8B     # 本地模型目录
+    embedding_model: D:\work\ai\models\huggingface\Qwen\Qwen3-Embedding-8B
     device: cpu                   # cpu | cuda | cuda:0 | mps（有 GPU 时改为 cuda 显著提速）
     local_batch_size: 4           # 推理批次（GPU 显存充足时可增至 16-32）
-    local_max_length: 512         # 最大输入 token（原生支持 32k，日常 512 够用）
-    local_dimensions: 4096        # qwen3-embedding:8b 输出维度（从 model.config 也可自动推断）
+    local_max_length: 512         # 最大输入 token（原生支持 32768，日常 512 够用）
+    local_dimensions: 4096        # Qwen3-Embedding-8B 输出维度
     max_tokens: 0                 # 纯 embedding 引擎，无需推理 token 预算
-    timeout_sec: 300.0            # 首次加载模型较慢，设置宽裕超时
+    timeout_sec: 300.0            # 首次加载模型权重较慢，宽裕超时
     cost_tier: 0
     supports_tools: false
     supports_embed: true
-    tags: [local, embed, qwen, 8b, transformers, offline]
+    tags: [local, embed, qwen, 8b, sentence-transformers, offline]
 
 
   # ── LM Studio / vLLM 本地（Qwen3.5-35B-A3B-FP8，OpenAI 兼容接口）─────

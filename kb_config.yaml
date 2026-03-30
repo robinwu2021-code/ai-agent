@@ -27,7 +27,7 @@ knowledge_base:
     # ▼ 直接引用 llm.yaml engines 中已定义的 alias ▼
     #
     # ── 当前激活的 Embedding 引擎 ──────────────────────────────────────────
-    embed_engine:     qwen3-embed-local  # qwen3-embedding:8b → 4096 维（本机 transformers 直推，零 HTTP）
+    embed_engine:     qwen3-embed-local  # Qwen3-Embedding-8B → 4096 维（本机 sentence-transformers 直推，零 HTTP）
     # embed_engine:   ollama-embed       # 备选：via Ollama HTTP API（需要 Ollama 服务）
     # embed_engine:   qwen3_local        # qwen3-embedding:4b → 2560 维（本机 Python 直接推理）
     # embed_engine:   bge_local          # BGE-M3 → 1024 维（本机 Python 直接推理）
