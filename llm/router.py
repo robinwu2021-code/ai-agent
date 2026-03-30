@@ -348,10 +348,11 @@ class LLMRouter:
 
     async def embed(self, text: str) -> list[float]:
         chain = self._task_router.resolve("embed")
-        # 优先找 supports_embed=True 的引擎
-        embed_spec = self._registry.find_embed()
-        if embed_spec and embed_spec.alias not in chain:
-            chain.insert(0, embed_spec.alias)
+        # chain 为空时才用 find_embed() 兜底（不插队，不覆盖 router.embed 配置）
+        if not chain:
+            embed_spec = self._registry.find_embed()
+            if embed_spec:
+                chain = [embed_spec.alias]
         return await self._call_chain(
             chain, "embed",
             lambda eng: eng.embed(text),
