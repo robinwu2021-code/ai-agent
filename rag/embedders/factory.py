@@ -59,14 +59,12 @@ class EmbedderFactory:
                 base_url=llm_cfg.base_url or "",
             )
 
-        # anthropic 无 embedding API → 降级日志后返回 hash embedder
-        log.warning(
-            "embedder_factory.anthropic_no_embed",
-            alias=llm_cfg.alias,
-            hint="Anthropic SDK 无原生 Embedding，切换 embed_engine 到 openai_compatible 引擎",
+        # anthropic 无 embedding API，直接报错
+        raise RuntimeError(
+            f"[{llm_cfg.alias}] Anthropic SDK 不支持 Embedding API。"
+            "请在 kb_config.yaml 中将 embed_engine 设为 openai_compatible 类引擎"
+            "（如 ollama-embed / ollama-embed-4b）。"
         )
-        from rag.embedders.openai_embedder import OpenAIEmbedder
-        return OpenAIEmbedder(model="", dimensions=dimensions, batch_size=batch_size)
 
     @staticmethod
     def create_bge_local(cfg: "KBLLMBGEConfig") -> BaseEmbedder:  # type: ignore[name-defined]
@@ -133,16 +131,14 @@ class EmbedderFactory:
                     dimensions=kb_llm.embed_dimensions,
                     batch_size=kb_llm.embed_batch_size,
                 )
-            log.warning("embedder_factory.no_embed_engine_found",
-                        embed_engine=kb_llm.embed_engine,
-                        router_embed=router.embed or "(none)")
+            raise RuntimeError(
+                f"在 llm.yaml 中找不到 embed engine：alias={kb_llm.embed_engine!r}，"
+                f"router.embed={router.embed or '(未配置)'}。"
+                "请在 kb_config.yaml embed_engine 中指定有效的引擎 alias，"
+                "并确保该引擎在 llm.yaml 中配置了 embedding_model 且 supports_embed: true。"
+            )
         except Exception as exc:
-            log.warning("embedder_factory.llm_yaml_load_failed", error=str(exc))
-
-        # 兜底：OpenAIEmbedder（可通过环境变量 OPENAI_API_KEY / OPENAI_BASE_URL 配置）
-        log.warning("embedder_factory.fallback_openai_embedder")
-        from rag.embedders.openai_embedder import OpenAIEmbedder
-        return OpenAIEmbedder(
-            dimensions=kb_llm.embed_dimensions,
-            batch_size=kb_llm.embed_batch_size,
-        )
+            raise RuntimeError(
+                f"加载 llm.yaml embed engine 失败：{exc}。"
+                "请检查 llm.yaml 配置和 embed_engine 设置。"
+            ) from exc

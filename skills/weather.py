@@ -173,10 +173,19 @@ class OpenMeteoAdapter:
 
     完全免费，无需 API Key，全球城市覆盖，小时/日级预报，最多 16 天。
     文档：https://open-meteo.com/en/docs
+
+    ⚠ 国内网络注意事项：
+      open-meteo.com 在部分国内网络环境下访问不稳定或被墙。
+      如遇超时，解决方案：
+        1. 配置 HTTP 代理（.env 中设置 LLM_HTTP_PROXY=http://127.0.0.1:7890）
+        2. 申请和风天气免费 API（https://dev.qweather.com/），
+           并设置环境变量 QWEATHER_API_KEY，系统将自动切换到国内数据源
     """
 
     GEO_URL     = "https://geocoding-api.open-meteo.com/v1/search"
     WEATHER_URL = "https://api.open-meteo.com/v1/forecast"
+    # 超时（秒）：国内网络延迟较高，适当放大
+    TIMEOUT_SEC = 20
 
     def __init__(self) -> None:
         # 城市名 → (lat, lng, country, timezone) 的本地缓存（进程级别，60 分钟 TTL）
@@ -217,7 +226,7 @@ class OpenMeteoAdapter:
 
     async def current(self, city: str, units: str = "metric") -> WeatherCondition:
         import httpx
-        async with httpx.AsyncClient(timeout=10) as client:
+        async with httpx.AsyncClient(timeout=self.TIMEOUT_SEC) as client:
             lat, lng, country, tz = await self._geocode(city, client)
 
             r = await client.get(
@@ -279,7 +288,7 @@ class OpenMeteoAdapter:
         import httpx
         days = max(1, min(16, days))   # Open-Meteo 最多支持 16 天
 
-        async with httpx.AsyncClient(timeout=10) as client:
+        async with httpx.AsyncClient(timeout=self.TIMEOUT_SEC) as client:
             lat, lng, country, tz = await self._geocode(city, client)
 
             r = await client.get(
@@ -501,7 +510,7 @@ class WeatherCurrentSkill:
                                 city=city, attempt=attempt, error=str(exc))
 
         log.error("weather_current.failed", city=city, error=str(last_exc))
-        raise RuntimeError(f"无法获取 {city!r} 的天气数据：{last_exc}") from last_exc
+        _raise_weather_error(city, last_exc)
 
 
 class WeatherForecastSkill:
@@ -591,7 +600,7 @@ class WeatherForecastSkill:
                     log.warning("weather_forecast.retry",
                                 city=city, attempt=attempt, error=str(exc))
 
-        raise RuntimeError(f"无法获取 {city!r} 的预报数据：{last_exc}") from last_exc
+        _raise_weather_error(city, last_exc)
 
 
 class WeatherAlertSkill:
@@ -673,7 +682,30 @@ class WeatherAlertSkill:
                 if attempt < self._max_retry:
                     await asyncio.sleep(1.0 * (attempt + 1))
 
-        raise RuntimeError(f"无法获取 {city!r} 的预警数据：{last_exc}") from last_exc
+        _raise_weather_error(city, last_exc)
+
+
+# ─────────────────────────────────────────────────────────────
+# 辅助：统一错误提示
+# ─────────────────────────────────────────────────────────────
+
+def _raise_weather_error(city: str, exc: Exception) -> None:
+    """将底层异常转换为带明确提示的 RuntimeError，不做任何降级。"""
+    import httpx
+    err_str = str(exc)
+    if isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout,
+                        httpx.ReadTimeout, httpx.TimeoutException)):
+        msg = (
+            f"无法连接天气服务（open-meteo.com），城市={city!r}：{err_str}\n"
+            "可能原因：国内网络访问 open-meteo.com 被限制。\n"
+            "解决方案：\n"
+            "  1. 配置 HTTP 代理：在 .env 中添加 LLM_HTTP_PROXY=http://127.0.0.1:7890\n"
+            "  2. 申请和风天气 API（https://dev.qweather.com/ 免费 1000次/天），\n"
+            "     设置环境变量 QWEATHER_API_KEY 后重启服务"
+        )
+    else:
+        msg = f"无法获取 {city!r} 的天气数据：{err_str}"
+    raise RuntimeError(msg) from exc
 
 
 # ─────────────────────────────────────────────────────────────

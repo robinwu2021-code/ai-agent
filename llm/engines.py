@@ -347,10 +347,14 @@ class OpenAIEngine:
                     arguments=json.loads(tc.function.arguments or "{}"),
                 ))
 
+        # openai SDK v2: usage 在部分兼容接口中可能为 None
+        usage = resp.usage
         result = LLMResponse(
             content=choice.content, tool_calls=tool_calls,
-            usage={"prompt_tokens":     resp.usage.prompt_tokens,
-                   "completion_tokens": resp.usage.completion_tokens},
+            usage={
+                "prompt_tokens":     getattr(usage, "prompt_tokens", 0) if usage else 0,
+                "completion_tokens": getattr(usage, "completion_tokens", 0) if usage else 0,
+            },
             model=resp.model,
         )
         clog.log_response("openai", self._alias, model, "chat", t0, result)
@@ -377,6 +381,9 @@ class OpenAIEngine:
                 stream=True,
             )
             async for chunk in stream:
+                # openai SDK v2: 最后一个 chunk 的 choices 可能为空列表
+                if not chunk.choices:
+                    continue
                 delta = chunk.choices[0].delta.content
                 if delta:
                     total_chars += len(delta)
@@ -389,24 +396,15 @@ class OpenAIEngine:
                                  t0, total_chars)
 
     async def embed(self, text: str) -> list[float]:
-        import hashlib
         import time
 
-        def _hash_fallback() -> list[float]:
-            """当无真实 embedding 模型时用 MD5 哈希填充 1536 维向量（仅供检索降级）。"""
-            h = hashlib.md5(text.encode()).digest()
-            base = [b / 255.0 for b in h]          # 16 维
-            return (base * 96)[:1536]               # 复制到 1536 维
-
         if not self._embedding_model:
-            log.warning(
-                "openai_engine.embed.no_model_hash_fallback",
-                text_len=len(text),
-                text_preview=text[:80],
+            raise RuntimeError(
+                f"[{self._alias}] embed_engine 未配置 embedding_model。"
+                "请在 llm.yaml 对应引擎中设置 embedding_model 字段，"
+                "或在 kb_config.yaml 中指定 embed_engine。"
             )
-            return _hash_fallback()
 
-        # ── 请求日志 ──────────────────────────────────────────────────
         t0 = time.perf_counter()
         log.debug(
             "openai_engine.embed.request",
@@ -421,33 +419,26 @@ class OpenAIEngine:
             )
             elapsed_ms = (time.perf_counter() - t0) * 1000
             vec = resp.data[0].embedding
-
-            # ── 响应日志 ──────────────────────────────────────────────
             log.debug(
                 "openai_engine.embed.response",
                 model=self._embedding_model,
                 dims=len(vec),
                 elapsed_ms=round(elapsed_ms, 1),
                 usage_tokens=getattr(resp.usage, "total_tokens", None),
-                vec_preview=[round(v, 6) for v in vec[:6]],  # 前 6 维供核查
+                vec_preview=[round(v, 6) for v in vec[:6]],
             )
             return vec
 
         except Exception as exc:
             elapsed_ms = (time.perf_counter() - t0) * 1000
-            # ── 异常日志 ──────────────────────────────────────────────
-            # 模型不存在（Ollama 404）或网络错误时降级到 hash fallback
-            # 向量相似度失效，检索退化为 BM25-only，但不阻断请求
-            log.warning(
-                "openai_engine.embed.failed_hash_fallback",
+            log.error(
+                "openai_engine.embed.failed",
                 model=self._embedding_model,
                 elapsed_ms=round(elapsed_ms, 1),
                 error=str(exc),
                 error_type=type(exc).__name__,
-                text_len=len(text),
-                text_preview=text[:80],
             )
-            return _hash_fallback()
+            raise
 
     async def summarize(self, text: str, max_tokens: int) -> str:
         resp = await self._client.chat.completions.create(

@@ -563,9 +563,11 @@ class KBManager:
             except Exception as exc:
                 log.warning("kb_manager.chroma_init_failed", error=str(exc))
 
-        # ── 最终兜底：内存向量存储 ────────────────────────────────
-        log.warning("kb_manager.using_memory_vector_store")
-        return _MemVectorStore()
+        raise RuntimeError(
+            "向量存储初始化失败：所有配置的后端均无法连接。"
+            f"当前配置：use_global={vs_cfg.use_global}，backend={vs_cfg.backend}。"
+            "请检查 llm.yaml vector_store 或 kb_config.yaml vector_store 配置。"
+        )
 
     @staticmethod
     async def _create_graph(cfg: KBConfig, embedder, llm_fn):
@@ -602,8 +604,8 @@ class KBManager:
 
             return _GraphBuilderWrapper(), _GraphRetriever()
         except Exception as exc:
-            log.warning("kb_manager.graph_init_failed", error=str(exc))
-            return None, None
+            log.error("kb_manager.graph_init_failed", error=str(exc))
+            raise RuntimeError(f"知识图谱初始化失败：{exc}") from exc
 
     @staticmethod
     def _create_reranker(cfg: KBConfig, llm_fn):
@@ -628,20 +630,14 @@ class KBManager:
 
             return _LLMWrapper()
         if backend == "bge":
-            try:
-                from rag.rerankers.bge_reranker import BGEReranker
-                return BGEReranker(model=cfg.reranker.bge.model, device=cfg.reranker.bge.device)
-            except Exception as exc:
-                log.warning("kb_manager.bge_reranker_failed", error=str(exc))
+            from rag.rerankers.bge_reranker import BGEReranker
+            return BGEReranker(model=cfg.reranker.bge.model, device=cfg.reranker.bge.device)
         if backend == "cohere":
-            try:
-                from rag.rerankers.cohere_reranker import CohereReranker
-                return CohereReranker(
-                    model=cfg.reranker.cohere.model,
-                    api_key=cfg.reranker.cohere.api_key,
-                )
-            except Exception as exc:
-                log.warning("kb_manager.cohere_reranker_failed", error=str(exc))
+            from rag.rerankers.cohere_reranker import CohereReranker
+            return CohereReranker(
+                model=cfg.reranker.cohere.model,
+                api_key=cfg.reranker.cohere.api_key,
+            )
         return None
 
 
