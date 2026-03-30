@@ -184,22 +184,22 @@ class TestLocalTransformersFactory:
             cost_tier        = 0,
         )
 
-    def test_create_from_llm_config_returns_qwen3_embedder(self):
+    def test_create_from_llm_config_returns_local_engine(self):
         from rag.embedders.factory import EmbedderFactory
-        from rag.embedders.qwen3_local_embedder import Qwen3LocalEmbedder
+        from llm.engines import LocalTransformersEngine
 
         cfg = self._make_llm_config()
         embedder = EmbedderFactory.create_from_llm_config(cfg, dimensions=4096)
-        assert isinstance(embedder, Qwen3LocalEmbedder)
+        assert isinstance(embedder, LocalTransformersEngine)
 
     def test_create_uses_device_field(self):
         from rag.embedders.factory import EmbedderFactory
-        from rag.embedders.qwen3_local_embedder import Qwen3LocalEmbedder
+        from llm.engines import LocalTransformersEngine
 
         cfg = self._make_llm_config()
         cfg.device = "cpu"
         embedder = EmbedderFactory.create_from_llm_config(cfg, dimensions=4096)
-        assert isinstance(embedder, Qwen3LocalEmbedder)
+        assert isinstance(embedder, LocalTransformersEngine)
         assert embedder._device == "cpu"
 
     def test_create_uses_local_dimensions(self):
@@ -241,17 +241,30 @@ class TestLocalTransformersFactory:
         assert cfg.local_batch_size == 8
         assert cfg.local_dimensions == 4096
 
-    def test_build_engine_raises_for_local_transformers(self):
-        """local_transformers 仅做 embedding，调 build_engine() 应抛出明确错误。"""
+    def test_build_engine_returns_local_transformers_engine(self):
+        """sdk=local_transformers 的 build_engine() 应返回 LocalTransformersEngine 实例。"""
         from utils.llm_config import LLMConfig
+        from llm.engines import LocalTransformersEngine
 
         cfg = LLMConfig(
             alias="qwen3-embed-local",
             sdk="local_transformers",   # type: ignore[arg-type]
             model="Qwen/Qwen3-Embedding",
+            local_dimensions=4096,
         )
+        engine = cfg.build_engine()
+        assert isinstance(engine, LocalTransformersEngine)
+        assert engine._model_path == "Qwen/Qwen3-Embedding"
+
+    def test_build_engine_chat_raises_for_local_transformers(self):
+        """LocalTransformersEngine.chat() 应抛出明确错误（不支持推理）。"""
+        from llm.engines import LocalTransformersEngine
+
+        engine = LocalTransformersEngine(model="Qwen/Qwen3-Embedding", alias="test")
         with pytest.raises(RuntimeError, match="仅支持 Embedding"):
-            cfg.build_engine()
+            asyncio.get_event_loop().run_until_complete(
+                engine.chat([], tools=None, config=None)
+            )
 
     def test_llm_yaml_router_embed_resolves_to_local(self):
         """llm.yaml 中 router.embed=qwen3-embed-local 能解析到 local_transformers 引擎。"""

@@ -532,12 +532,29 @@ class LLMConfig:
                 alias             = self.alias,   # pass alias for call logging
             )
 
-        # local_transformers 无推理引擎（仅做 embedding），调用 build_engine() 时报明确错误
         if self.sdk == "local_transformers":
-            raise RuntimeError(
-                f"[{self.alias}] sdk=local_transformers 仅支持 Embedding，"
-                "不能用于 LLM 推理（chat / stream_chat）。"
-                "请将 embed_engine 指向此 alias，路由器的 chat/plan/summarize 应使用其他引擎。"
+            from llm.engines import LocalTransformersEngine
+            model_path = self.embedding_model or self.model or ""
+            if not model_path:
+                raise RuntimeError(
+                    f"[{self.alias}] sdk=local_transformers 必须在 llm.yaml 中设置 model 路径，"
+                    "例如：\n  model: D:\\work\\ai\\models\\huggingface\\Qwen\\Qwen3-Embedding\n"
+                    "  model: Qwen/Qwen3-Embedding"
+                )
+            log.info(
+                "llm_config.build_engine",
+                alias  = self.alias,
+                sdk    = self.sdk,
+                model  = model_path,
+                device = self.device,
+            )
+            return LocalTransformersEngine(
+                model      = model_path,
+                device     = self.device,
+                batch_size = self.local_batch_size,
+                max_length = self.local_max_length,
+                dimensions = self.local_dimensions,
+                alias      = self.alias,
             )
 
         raise ValueError(

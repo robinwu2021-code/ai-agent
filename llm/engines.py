@@ -480,3 +480,90 @@ class MockLLMEngine:
 
     async def summarize(self, text: str, max_tokens: int) -> str:
         return text[:max_tokens * 3]
+
+
+# ─────────────────────────────────────────────
+# LocalTransformersEngine — 本地 Python 推理（仅 Embedding）
+# ─────────────────────────────────────────────
+
+class LocalTransformersEngine:
+    """
+    通过 transformers 库在本地 Python 进程中直接推理 Embedding 模型。
+
+    仅实现 embed()，chat / stream_chat / summarize 均报错（该引擎不支持推理）。
+    由 LLMConfig(sdk="local_transformers").build_engine() 实例化。
+
+    首次调用 embed() 时懒加载模型（触发 transformers AutoModel.from_pretrained），
+    后续调用复用已加载的模型权重，无额外 IO 开销。
+    """
+
+    def __init__(
+        self,
+        model:      str,
+        device:     str = "cpu",
+        batch_size: int = 8,
+        max_length: int = 512,
+        dimensions: int = 0,
+        alias:      str = "local-transformers",
+    ) -> None:
+        self._alias      = alias
+        self._model_path = model
+        self._device     = device
+        self._batch_size = batch_size
+        self._max_length = max_length
+        self._dimensions = dimensions
+        self._embedder   = None   # 懒加载，首次 embed() 时初始化
+
+    @property
+    def dimensions(self) -> int:
+        """向量维度（配置值；模型加载后由 Qwen3LocalEmbedder 自动修正）。"""
+        if self._embedder is not None:
+            return self._embedder.dimensions
+        return self._dimensions
+
+    def _get_embedder(self):
+        if self._embedder is None:
+            from rag.embedders.qwen3_local_embedder import Qwen3LocalEmbedder
+            log.info(
+                "local_transformers_engine.loading",
+                alias      = self._alias,
+                model      = self._model_path,
+                device     = self._device,
+                dimensions = self._dimensions,
+            )
+            self._embedder = Qwen3LocalEmbedder(
+                model      = self._model_path,
+                device     = self._device,
+                batch_size = self._batch_size,
+                max_length = self._max_length,
+                dimensions = self._dimensions,
+            )
+        return self._embedder
+
+    async def embed(self, text: str) -> list[float]:
+        return await self._get_embedder().embed(text)
+
+    async def embed_batch(self, texts: list[str]) -> list[list[float]]:
+        return await self._get_embedder().embed_batch(texts)
+
+    # ── 以下方法仅给出明确错误，不做任何降级 ──────────────────────
+
+    async def chat(self, messages, tools=None, config=None) -> LLMResponse:
+        raise RuntimeError(
+            f"[{self._alias}] sdk=local_transformers 仅支持 Embedding，"
+            "不能用于 chat 推理。请在 router.chat 中使用其他引擎（如 minimax / ollama-qwen3）。"
+        )
+
+    async def stream_chat(self, messages, tools=None, config=None) -> AsyncIterator[str]:
+        raise RuntimeError(
+            f"[{self._alias}] sdk=local_transformers 仅支持 Embedding，"
+            "不能用于 stream_chat 推理。"
+        )
+        # 让 Python 识别为 AsyncGenerator
+        yield  # type: ignore[misc]  # pragma: no cover
+
+    async def summarize(self, text: str, max_tokens: int = 512) -> str:
+        raise RuntimeError(
+            f"[{self._alias}] sdk=local_transformers 仅支持 Embedding，"
+            "不能用于 summarize。"
+        )

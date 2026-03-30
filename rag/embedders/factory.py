@@ -60,16 +60,17 @@ class EmbedderFactory:
             )
 
         if llm_cfg.sdk == "local_transformers":
-            from rag.embedders.qwen3_local_embedder import Qwen3LocalEmbedder
+            # LocalTransformersEngine 内部已持有 Qwen3LocalEmbedder，直接复用
+            # 避免二次加载模型权重（build_engine 已创建一个实例）
+            from llm.engines import LocalTransformersEngine
             model_path = embed_model or llm_cfg.model or ""
             if not model_path:
                 raise RuntimeError(
                     f"[{llm_cfg.alias}] sdk=local_transformers 必须在 llm.yaml 中设置 "
                     "model（本地路径或 HuggingFace ID），如：\n"
-                    "  model: D:\\work\\ai\\models\\huggingface\\Qwen3-Embedding\n"
+                    "  model: D:\\work\\ai\\models\\huggingface\\Qwen\\Qwen3-Embedding\n"
                     "  model: Qwen/Qwen3-Embedding"
                 )
-            # local_dimensions=0 表示由 Qwen3LocalEmbedder 从 model.config 自动推断
             effective_dims = getattr(llm_cfg, "local_dimensions", 0) or dimensions
             log.info(
                 "embedder_factory.local_transformers",
@@ -78,13 +79,18 @@ class EmbedderFactory:
                 device=getattr(llm_cfg, "device", "cpu"),
                 dimensions=effective_dims,
             )
-            return Qwen3LocalEmbedder(
+            # 返回 LocalTransformersEngine 自身作为 embedder
+            # 它实现了 embed(text) / embed_batch(texts) 接口，与 BaseEmbedder 兼容
+            engine = LocalTransformersEngine(
                 model      = model_path,
                 device     = getattr(llm_cfg, "device", "cpu"),
                 batch_size = getattr(llm_cfg, "local_batch_size", 8),
                 max_length = getattr(llm_cfg, "local_max_length", 512),
                 dimensions = effective_dims,
+                alias      = llm_cfg.alias,
             )
+            engine._dims = effective_dims  # 供 dimensions property 使用
+            return engine
 
         # anthropic 无 embedding API，直接报错
         raise RuntimeError(
