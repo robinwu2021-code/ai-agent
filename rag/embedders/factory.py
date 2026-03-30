@@ -59,11 +59,38 @@ class EmbedderFactory:
                 base_url=llm_cfg.base_url or "",
             )
 
+        if llm_cfg.sdk == "local_transformers":
+            from rag.embedders.qwen3_local_embedder import Qwen3LocalEmbedder
+            model_path = embed_model or llm_cfg.model or ""
+            if not model_path:
+                raise RuntimeError(
+                    f"[{llm_cfg.alias}] sdk=local_transformers 必须在 llm.yaml 中设置 "
+                    "model（本地路径或 HuggingFace ID），如：\n"
+                    "  model: D:\\work\\ai\\models\\huggingface\\Qwen3-Embedding\n"
+                    "  model: Qwen/Qwen3-Embedding"
+                )
+            # local_dimensions=0 表示由 Qwen3LocalEmbedder 从 model.config 自动推断
+            effective_dims = getattr(llm_cfg, "local_dimensions", 0) or dimensions
+            log.info(
+                "embedder_factory.local_transformers",
+                alias=llm_cfg.alias,
+                model=model_path,
+                device=getattr(llm_cfg, "device", "cpu"),
+                dimensions=effective_dims,
+            )
+            return Qwen3LocalEmbedder(
+                model      = model_path,
+                device     = getattr(llm_cfg, "device", "cpu"),
+                batch_size = getattr(llm_cfg, "local_batch_size", 8),
+                max_length = getattr(llm_cfg, "local_max_length", 512),
+                dimensions = effective_dims,
+            )
+
         # anthropic 无 embedding API，直接报错
         raise RuntimeError(
             f"[{llm_cfg.alias}] Anthropic SDK 不支持 Embedding API。"
-            "请在 kb_config.yaml 中将 embed_engine 设为 openai_compatible 类引擎"
-            "（如 ollama-embed / ollama-embed-4b）。"
+            "请在 kb_config.yaml 中将 embed_engine 设为 openai_compatible 或 "
+            "local_transformers 类引擎。"
         )
 
     @staticmethod

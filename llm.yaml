@@ -55,6 +55,33 @@ engines:
     tags: [local, embed, qwen, 8b]
 
 
+  # ── 本地 Python 直接推理（qwen3-embedding:8b，零 HTTP 依赖）──────────
+  # 通过 transformers 库直接加载模型，无需 Ollama 服务，完全离线可用。
+  # 适合 GPU 资源在本机、不希望额外启动 Ollama 的场景。
+  #
+  # 前置步骤：
+  #   pip install transformers torch
+  #   huggingface-cli download Qwen/Qwen3-Embedding --local-dir D:\work\ai\models\huggingface\Qwen\Qwen3-Embedding
+  #   （或设置 HF_HOME=D:\work\ai\models\huggingface 后直接填写 HuggingFace ID）
+  #
+  # 输出维度：4096（须与 vector_store.milvus.vector_size 保持一致）
+  # 切换到此引擎：router.embed: qwen3-embed-local  或 kb_config.yaml embed_engine: qwen3-embed-local
+  - alias: qwen3-embed-local
+    sdk: local_transformers
+    model: D:\work\ai\models\huggingface\Qwen\Qwen3-Embedding        # 本地模型目录（或 HuggingFace ID: Qwen/Qwen3-Embedding）
+    embedding_model: D:\work\ai\models\huggingface\Qwen\Qwen3-Embedding
+    device: cpu                   # cpu | cuda | cuda:0 | mps（有 GPU 时改为 cuda 显著提速）
+    local_batch_size: 4           # 推理批次（GPU 显存充足时可增至 16-32）
+    local_max_length: 512         # 最大输入 token（原生支持 32k，日常 512 够用）
+    local_dimensions: 4096        # qwen3-embedding:8b 输出维度（从 model.config 也可自动推断）
+    max_tokens: 0                 # 纯 embedding 引擎，无需推理 token 预算
+    timeout_sec: 300.0            # 首次加载模型较慢，设置宽裕超时
+    cost_tier: 0
+    supports_tools: false
+    supports_embed: true
+    tags: [local, embed, qwen, 8b, transformers, offline]
+
+
   # ── LM Studio / vLLM 本地（Qwen3.5-35B-A3B-FP8，OpenAI 兼容接口）─────
   - alias: vllm-qwen3
     sdk: openai_compatible
@@ -77,7 +104,8 @@ router:
   plan:        minimax         # Plan-Execute 规划阶段
   summarize:   minimax         # 文本摘要/上下文裁剪
   consolidate: minimax         # 记忆固化提炼
-  embed:       ollama-embed    # 向量化 → 本地 qwen3-embedding:8b（离线可用，0成本）
+  embed:       ollama-embed    # 向量化 → 本地 qwen3-embedding:8b via Ollama（HTTP API）
+  # embed:  qwen3-embed-local # 向量化 → 本地 qwen3-embedding:8b via transformers（纯 Python，零 HTTP）
   # eval:      minimax         # LLM-as-judge 打分
   # route:     minimax         # Multi-Agent 路由决策
 

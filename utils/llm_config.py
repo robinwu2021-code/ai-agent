@@ -383,7 +383,7 @@ class MemoryConfig:
 
 
 # ── SDK 类型 ──────────────────────────────────────────────────────
-SdkType = Literal["anthropic", "openai_compatible"]
+SdkType = Literal["anthropic", "openai_compatible", "local_transformers"]
 
 # ── SDK 级技术默认值（与厂商无关，仅在实例未指定 model 时回落）────
 SDK_DEFAULTS: dict[str, dict[str, str]] = {
@@ -398,6 +398,10 @@ SDK_DEFAULTS: dict[str, dict[str, str]] = {
         #   实例若需 embedding，应在 LLMConfig.embedding_model 或 llm.yaml 中
         #   显式声明（如 qwen3-embedding:8b / text-embedding-3-small）。
         #   未声明时 embed() 退化为 hash-fallback，检索仍可用（BM25 兜底）。
+        "embedding_model": "",
+    },
+    "local_transformers": {
+        "default_model":   "",   # 本地模型路径或 HuggingFace ID，必须在引擎中显式指定
         "embedding_model": "",
     },
 }
@@ -459,6 +463,12 @@ class LLMConfig:
     # ── Azure 专用 ────────────────────────────────────────────────
     is_azure:          bool = False
     azure_api_version: str  = "2024-02-01"
+
+    # ── local_transformers 专用参数（其他 sdk 忽略）─────────────
+    device:           str = "cpu"   # 推理设备：cpu | cuda | cuda:0 | mps
+    local_batch_size: int = 8       # 推理批次大小（GPU 显存允许时可增大）
+    local_max_length: int = 512     # 最大输入 token 长度
+    local_dimensions: int = 0       # 输出向量维度（0 = 从模型 config 自动推断）
 
     # ── 路由元信息（供 ModelRegistry 使用）──────────────────────
     cost_tier:      int       = 2    # 1=最便宜 3=最贵，用于自动降级排序
@@ -522,9 +532,17 @@ class LLMConfig:
                 alias             = self.alias,   # pass alias for call logging
             )
 
+        # local_transformers 无推理引擎（仅做 embedding），调用 build_engine() 时报明确错误
+        if self.sdk == "local_transformers":
+            raise RuntimeError(
+                f"[{self.alias}] sdk=local_transformers 仅支持 Embedding，"
+                "不能用于 LLM 推理（chat / stream_chat）。"
+                "请将 embed_engine 指向此 alias，路由器的 chat/plan/summarize 应使用其他引擎。"
+            )
+
         raise ValueError(
             f"[{self.alias}] 未知 sdk 类型: {self.sdk!r}，"
-            f"支持: anthropic | openai_compatible"
+            f"支持: anthropic | openai_compatible | local_transformers"
         )
 
     @classmethod
@@ -537,9 +555,10 @@ class LLMConfig:
 
         alias   = d.get("alias", "")
         sdk_raw = d.get("sdk", "anthropic")
-        if sdk_raw not in ("anthropic", "openai_compatible"):
+        _VALID_SDKS = ("anthropic", "openai_compatible", "local_transformers")
+        if sdk_raw not in _VALID_SDKS:
             raise ValueError(
-                f"[{alias}] sdk 必须是 anthropic | openai_compatible，"
+                f"[{alias}] sdk 必须是 {' | '.join(_VALID_SDKS)}，"
                 f"得到: {sdk_raw!r}"
             )
 
@@ -562,6 +581,11 @@ class LLMConfig:
             supports_embed    = bool(d.get("supports_embed", False)),
             supports_tools    = bool(d.get("supports_tools", True)),
             tags              = list(d.get("tags", [])),
+            # local_transformers 专用字段
+            device            = str(d.get("device", "cpu")),
+            local_batch_size  = int(d.get("local_batch_size", 8)),
+            local_max_length  = int(d.get("local_max_length", 512)),
+            local_dimensions  = int(d.get("local_dimensions", 0)),
         )
 
     @classmethod
@@ -577,9 +601,10 @@ class LLMConfig:
             return os.environ.get(f"{prefix}_{key}", default)
 
         sdk_raw = _get("SDK") or "anthropic"
-        if sdk_raw not in ("anthropic", "openai_compatible"):
+        _VALID_SDKS = ("anthropic", "openai_compatible", "local_transformers")
+        if sdk_raw not in _VALID_SDKS:
             raise ValueError(
-                f"[{alias}] {prefix}_SDK 必须是 anthropic | openai_compatible，"
+                f"[{alias}] {prefix}_SDK 必须是 {' | '.join(_VALID_SDKS)}，"
                 f"得到: {sdk_raw!r}"
             )
 
